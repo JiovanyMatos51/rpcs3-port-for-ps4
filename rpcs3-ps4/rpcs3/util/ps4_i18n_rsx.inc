@@ -1,0 +1,15 @@
+// RSX and Vulkan strings: out-of-memory stop notices (VRAM_*), toasts of the RSX and Vulkan code (TOAST_*).
+// I18N(id, pt-BR, en, es, ar); "" = not translated yet (falls back to English, then pt-BR). Rules in ps4_i18n.hpp.
+// UTF-8 without BOM, LF line ends.
+
+// VRAM_ - util/ps4_vram_policy.hpp
+I18N(VRAM_MEMORIA_VIDEO_ESGOTADA_JOGO_FOI, "Memória de vídeo esgotada: o jogo foi fechado e vai usar menos memória", "Video memory exhausted: the game was closed and will use less memory", "Memoria de vídeo agotada: el juego se cerró y usará menos memoria", "نفدت ذاكرة الفيديو: تم إغلاق اللعبة وستستخدم ذاكرة أقل")
+I18N(VRAM_MEMORIA_EMULADOR_ESGOTADA_JOGO_FOI, "Memória do emulador esgotada: o jogo foi fechado", "Emulator memory exhausted: the game was closed", "Memoria del emulador agotada: el juego se cerró", "نفدت ذاكرة المحاكي: تم إغلاق اللعبة")
+I18N(VRAM_GPU_PAROU_RESPONDER_JOGO_FOI, "A GPU parou de responder: o jogo foi fechado", "The GPU stopped responding: the game was closed", "La GPU dejó de responder: el juego se cerró", "توقفت GPU عن الاستجابة: تم إغلاق اللعبة")
+I18N(VRAM_VIDEO_JOGO_PAROU_DEAD_FIFO, "O vídeo do jogo parou (Dead FIFO): o jogo foi fechado", "The game's video stopped (Dead FIFO): the game was closed", "El vídeo del juego se detuvo (Dead FIFO): el juego se cerró", "توقف الفيديو (Dead FIFO): تم إغلاق اللعبة")
+
+// TOAST_ - Emu/RSX/Common/simple_array.hpp, Emu/RSX/VK/vkutils/memory.cpp, Emu/RSX/VK/vkutils/sync.cpp
+I18N(TOAST_RPCS3_MEMORIA_EMULADOR_ESGOTADA_JOGO, "RPCS3: memória do emulador esgotada. O jogo será fechado e você volta ao menu.", "RPCS3: emulator memory exhausted. The game will close and you return to the menu.", "RPCS3: memoria del emulador agotada. El juego se cerrará y volverás al menú.", "RPCS3: نفدت ذاكرة المحاكي. سيتم إغلاق اللعبة والعودة إلى القائمة.")
+I18N(TOAST_RPCS3_MEMORIA_VIDEO_ESGOTADA_JOGO, "RPCS3: memória de vídeo esgotada. O jogo será fechado e você volta ao menu.", "RPCS3: video memory exhausted. The game will close and you return to the menu.", "RPCS3: memoria de vídeo agotada. El juego se cerrará y volverás al menú.", "RPCS3: نفدت ذاكرة الفيديو. سيتم إغلاق اللعبة والعودة إلى القائمة.")
+I18N(TOAST_RPCS3_GPU_PAROU_RESPONDER_JOGO, "RPCS3: a GPU parou de responder. O jogo será fechado e você volta ao menu.", "RPCS3: the GPU stopped responding. The game will close and you return to the menu.", "RPCS3: la GPU dejó de responder. El juego se cerrará y volverás al menú.", "RPCS3: توقفت GPU عن الاستجابة. سيتم إغلاق اللعبة والعودة إلى القائمة.")
+I18N(TOAST_RPCS3_GPU_NAO_RESPONDE_HA, "RPCS3: a GPU nao responde ha 10 s. Aguardando; se o jogo nao voltar, segure o botao PS e feche o aplicativo.", "RPCS3: the GPU has not responded for 10 s. Waiting; if the game does not come back, hold the PS button and close the application.", "RPCS3: la GPU no responde desde hace 10 s. Esperando; si el juego no vuelve, mantén pulsado el botón PS y cierra la aplicación.", "RPCS3: لا تستجيب GPU منذ 10 ثوان. جار الانتظار؛ إذا لم تعد اللعبة، اضغط مطولا على زر PS وأغلق التطبيق.")

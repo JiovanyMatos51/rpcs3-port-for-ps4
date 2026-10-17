@@ -1,0 +1,42 @@
+#pragma once
+
+// The libc++ shipped by the current OpenOrbis SDK predates C++20
+// source_location. Clang can still provide the call-site information through
+// these builtins. Keep this compatibility header ahead of the SDK headers.
+#if defined(__has_include_next) && __has_include_next(<source_location>)
+#include_next <source_location>
+#else
+namespace std
+{
+class source_location
+{
+    const char* m_file = "";
+    const char* m_function = "";
+    unsigned m_line = 0;
+    unsigned m_column = 0;
+
+    constexpr source_location(const char* file, const char* function,
+        unsigned line, unsigned column) noexcept
+        : m_file(file), m_function(function), m_line(line), m_column(column)
+    {
+    }
+
+public:
+    constexpr source_location() noexcept = default;
+
+    static constexpr source_location current(
+        const char* file = __builtin_FILE(),
+        const char* function = __builtin_FUNCTION(),
+        unsigned line = __builtin_LINE(),
+        unsigned column = __builtin_COLUMN()) noexcept
+    {
+        return source_location(file, function, line, column);
+    }
+
+    constexpr const char* file_name() const noexcept { return m_file; }
+    constexpr const char* function_name() const noexcept { return m_function; }
+    constexpr unsigned line() const noexcept { return m_line; }
+    constexpr unsigned column() const noexcept { return m_column; }
+};
+}
+#endif

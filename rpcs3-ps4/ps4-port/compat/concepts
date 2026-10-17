@@ -1,0 +1,53 @@
+#pragma once
+
+// OpenOrbis libc++ 11 declares only std::same_as from the C++20 concepts
+// header. Supply the language-only concepts needed by RPCS3 until the PS4
+// runtime is upgraded; all predicates are evaluated by the compiler.
+#include_next <concepts>
+#include <type_traits>
+#include <utility>
+
+#if _LIBCPP_VERSION == 11000
+namespace std
+{
+template<class From, class To>
+concept convertible_to = is_convertible_v<From, To> &&
+    requires(add_rvalue_reference_t<From> (&source)())
+    {
+        static_cast<To>(source());
+    };
+
+template<class T>
+concept integral = is_integral_v<T>;
+
+template<class T>
+concept signed_integral = integral<T> && is_signed_v<T>;
+
+template<class T>
+concept unsigned_integral = integral<T> && !signed_integral<T>;
+
+template<class T>
+concept floating_point = is_floating_point_v<T>;
+
+template<class F, class... Args>
+concept invocable = is_invocable_v<F, Args...>;
+
+template<class F, class... Args>
+concept regular_invocable = invocable<F, Args...>;
+
+template<class F, class... Args>
+concept predicate = regular_invocable<F, Args...> &&
+    is_convertible_v<invoke_result_t<F, Args...>, bool>;
+
+template<class Enum>
+constexpr underlying_type_t<Enum> to_underlying(Enum value) noexcept
+{
+    return static_cast<underlying_type_t<Enum>>(value);
+}
+
+[[noreturn]] inline void unreachable() noexcept
+{
+    __builtin_unreachable();
+}
+}
+#endif

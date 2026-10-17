@@ -1,0 +1,2664 @@
+RPCS3 PORT FOR PS4 - by Roberix Studio & Mifi Studios
+Versão 0.39 - TITLE_ID RPCS30010 - APP_VER 00.39
+
+0.39 = tudo da 0.38 + correções que valem para todos os jogos: o crash
+do intérprete de shaders depois de alguns minutos de jogo (o "Erro no
+emulador" mais comum dos logs), a causa provável do congelamento do
+GTA IV, as threads que o PS4 recusava (jogos sem som ou que voltavam ao
+menu), a GPU que para de responder (agora volta para a XMB) e o som
+picotado (áudio contínuo automático, reserva de 64 ms). Discos e ISOs:
+uma ISO nunca é tratada como disco (nunca pede o disco no leitor), ISO
+criptografada abre sem chave manual (a chave é buscada sozinha), ISO
+incompleta é avisada na lista, o disco tirado durante o jogo pausa o
+jogo em vez de fechar. Pastas criadas pelo FTP são consertadas sozinhas ao abrir o
+RPCS3 (com o FTP do GoldHEN ligado). Novo: a XMB em Português,
+English, Español e العربية (árabe), escolhida sozinha pelo idioma do
+PS4, e o "Idioma dos jogos". Cache de shaders do driver de vídeo
+ligado (a segunda abertura de um jogo compila bem menos) e OpenGL mais
+leve. Os ajustes por jogo do RPCS3 de PC (config_database.dat) vêm
+dentro do pacote. Cheats (códigos Artemis/NetCheat): R2 sobre um jogo
+(novidade 14). Configurações do RPCS3 com todas as opções do PC, em
+páginas como as do PS3, e o arquivo de cada jogo só com o que você mudou
+(novidade 15). Os testes estão em "TESTE NO CONSOLE DA 0.39".
+As novidades da 0.38 e anteriores continuam valendo.
+
+0.38 = tudo da 0.37 + memória: nenhum jogo deve fechar por falta de
+memória. A compilação do código SPU usa memória limitada (o FIFA 14
+fechou na 0.37 com a memória esgotada no meio dela); a memória direta
+do PS4 é medida e cada parte do emulador fica no seu limite; os
+shaders, a memória de vídeo, os vídeos dos jogos, as fontes, os patches
+e o savestate têm limite e devolvem memória antes de faltar. Também: o
+jogo instalado do disco fecha e volta para a XMB quando o disco sai do
+leitor, como no PS3; as telas de instalação, de disco, de update e os
+avisos são as janelas de sistema do PS3 (com as imagens do firmware do
+PS3 instalado no console); e, depois de um erro no emulador, a XMB pede
+para fechar e abrir o aplicativo antes do próximo jogo. Os testes estão
+em "TESTE NO CONSOLE DA 0.38".
+As novidades da 0.37 e anteriores continuam valendo.
+
+0.37 = tudo da 0.36 + correções que valem para todos os jogos: o
+congelamento do Mortal Kombat Komplete na intro (uma thread do jogo ficava
+presa numa trava interna do emulador sem avisar o escalonador; o mesmo
+defeito existia em mais 7 lugares, como o áudio, os controles no fim do
+jogo e o PlayStation Move); três falhas do RPCS3 original no "acordar" dos
+SPUs (God of War e todos os jogos que usam SPURS); configuração igual à do
+RPCS3 de PC (shaders com intérprete, sem desenhos jogados fora; ZCULL com
+os valores do PC); o timer de alta resolução ligado por padrão; o download
+de patches (curl 27) e a importação de patches; as pastas que o FTP não
+conseguia gravar; e a instalação de updates em PKG ("Instalar mesmo
+assim", motivo exato de cada recusa, aviso de "ainda copiando"). Novo: o
+jogo de PS3 no leitor do PS4 é instalado direto do disco, com a chave
+do disco buscada sozinha (item 12 das novidades). Também traz ganhos de
+velocidade que não mudam o que o jogo vê (estimativa, a medir nos testes:
++6 a 12% nas cenas limitadas pela GPU emulada; quase nada nas limitadas
+pelo PPU).
+As novidades da 0.36 e anteriores continuam valendo.
+Baseado no emulador RPCS3 (https://rpcs3.net), licença GPL-2.0.
+
+==========================================================================
+INSTALAÇÃO (suas configurações e caches são preservados)
+==========================================================================
+1. Feche o emulador pelo botão PS > Fechar aplicativo.
+2. Copie o arquivo .pkg para /data/pkg e instale pelo GoldHEN
+   (Debug Settings > Package Installer). Ele atualiza só o emulador;
+   não mexe no sistema do PS4.
+3. Não apague /data/rpcs3/cache: o cache dos jogos é reaproveitado.
+
+==========================================================================
+JOGOS E FIRMWARE
+==========================================================================
+- Pastas em /data/rpcs3/games/NOME (PS3_GAME/USRDIR/EBOOT.BIN), ISO em
+  /data/rpcs3/games ou USB:/PS3ISO, PKG de PS3 em /data/rpcs3/pkgs.
+  Também são lidas /data/rpcs3/PS3ISO, pkg, packages, iso e gamez
+  (maiúsculas ou minúsculas tanto faz).
+- Jogo de disco em pasta: games/Nome/PS3_GAME/... E games/Nome/PS3_DISC.SFB
+  (sem o PS3_DISC.SFB o jogo não abre). Jogo da PSN em pasta: a pasta
+  com o nome do TITLE_ID (games/NPUB30554/PARAM.SFO + USRDIR/EBOOT.BIN).
+  Cada jogo na sua subpasta: nunca o conteúdo direto em games/.
+- Licenças: <CONTENT_ID>.rap (16 bytes) em /data/rpcs3/raps ou USB:/raps,
+  depois "Importar licenças .rap".
+- PKG: deixe livre no PS4 o dobro do tamanho do PKG. Update que pede uma
+  versão que você não tem: "Deseja instalar mesmo assim?" (X Sim instala,
+  Círculo Não cancela; para desfazer, apague dev_hdd0/game/<TITLE_ID> pelo
+  FTP). PKG ainda copiando: X avisa "ainda copiando" e não instala.
+- FTP (0.37): depois que o emulador abre uma vez, as pastas games, pkgs,
+  raps, import, patches, custom_configs, data, data/redump, data/disc-lock
+  e exdata de /data/rpcs3 aceitam arquivos (startup.log "folders: 10
+  ready for FTP").
+- FTP (0.39): abra o RPCS3 uma vez ANTES de mandar arquivos. Pastas
+  criadas pelo FileZilla (ou um dev_hdd0 inteiro copiado pelo FTP) ficam
+  bloqueadas para o emulador; com o FTP do GoldHEN LIGADO, o RPCS3
+  conserta isso sozinho ao abrir (NOVIDADES DA 0.39, item 7).
+- ISO (0.39): uma ISO nunca pede o disco no leitor; ISO criptografada
+  abre sem .dkey manual (a chave é buscada sozinha); ISO incompleta
+  aparece como "ISO incompleta: faltam X GB" (NOVIDADES DA 0.39, itens
+  2 a 4); ISO sem o cabeçalho de disco do PS3 (feita de uma pasta por
+  um programa comum de ISO) abre (item 6).
+- Firmware do PS3 extraído em /data/rpcs3/dev_flash.
+- O pacote do emulador NÃO inclui jogos, firmware nem licenças: use
+  apenas cópias dos seus próprios jogos.
+
+==========================================================================
+FIRMWARE DO PS3 (como "Install Firmware" do RPCS3 do PC)
+==========================================================================
+- Os jogos precisam do firmware oficial do PS3, que não vem no pacote.
+  No PC, baixe o PS3UPDAT.PUP no site oficial da PlayStation (página de
+  atualização do sistema do PS3). É a atualização do PS3, não a do PS4:
+  um PS4UPDATE.PUP é recusado.
+- Copie para um pendrive (exFAT ou FAT32) em PS3/UPDATE/PS3UPDAT.PUP (a
+  mesma pasta que o PS3 usa) ou na raiz do pendrive. Pelo FTP também
+  vale /data/rpcs3/import/PS3UPDAT.PUP. A ordem de busca é: pendrive
+  PS3/UPDATE, raiz do pendrive, /data/rpcs3, /data/rpcs3/import.
+- XMB > Configurações > "Instalar firmware do PS3" > X. O arquivo é
+  conferido como no PC (cabeçalho, tamanho e assinatura de cada parte;
+  leva alguns segundos). 0.38: a janela de sistema "Deseja instalar o
+  firmware 4.92?" mostra o arquivo, a versão dele e a instalada: X (Sim)
+  instala, Círculo (Não) cancela.
+- A instalação mostra a janela "Instalando..." com a barra ("Pacote i de
+  n", "Não desligue o sistema."); enquanto ela está aberta a XMB espera
+  e nenhum jogo abre. Círculo (ou X) na janela pergunta "Deseja cancelar
+  a instalação do firmware?": X (Sim) cancela, Círculo (Não) continua.
+  Depois que a troca da pasta começa não dá mais para cancelar (leva um
+  instante).
+- Precisa de cerca de 550 MB livres no HD do PS4. Primeiro o pacote de
+  instalação (update_files.tar, ~190 MB) é copiado do PUP para
+  /data/rpcs3/dev_flash.installing e conferido ("copiando o
+  PS3UPDAT.PUP para /data"); depois disso o pendrive não é mais lido.
+  O firmware novo é montado na mesma pasta, cada arquivo é gravado de
+  fato no disco (fsync) e só então troca o /data/rpcs3/dev_flash.
+- O firmware anterior fica guardado em /data/rpcs3/dev_flash.old até a
+  PRÓXIMA abertura do aplicativo. Nela o firmware novo é conferido
+  (version.txt igual ao instalado e os arquivos principais presentes):
+  certo, a XMB diz "Firmware X conferido" e o dev_flash.old é apagado;
+  errado, o anterior volta sozinho e a XMB avisa. Se faltar espaço,
+  cancelar, o aplicativo fechar ou faltar energia no meio, fica um
+  firmware só (o anterior ou o novo) e a mensagem diz qual ("fica o
+  4.90", "fica sem firmware"). O estado fica em dev_flash.state.
+- O pendrive só é lido. O emulador nunca mexe na atualização do sistema
+  do PS4: o PS3UPDAT.PUP é só lido e vira arquivos em /data/rpcs3.
+- "Informações do sistema" mostra a versão instalada. Sem firmware, a
+  XMB avisa ao abrir e aponta para este item.
+- startup.log: linhas "firmware: ..." (arquivo encontrado, verificação,
+  versão instalada e tempo).
+
+Testar
+1. Sem firmware: a XMB abre com "Firmware do PS3 não instalado".
+2. Pendrive com PS3/UPDATE/PS3UPDAT.PUP: Configurações > Instalar
+   firmware do PS3 > X. Aparece a pergunta com a versão (ex.: 4.92).
+3. X: a janela "Instalando..." com a barra; as ondas da XMB continuam
+   animando atrás dela.
+4. No fim: a janela "A instalação foi concluída." com "Firmware 4.92
+   instalado ... o anterior fica guardado até a próxima abertura" (X
+   OK); Informações do sistema mostra "Firmware 4.92"; os
+   ícones e a fonte da XMB são recarregados; /data/rpcs3/dev_flash.old
+   existe (FTP).
+5. Arquivo errado (PS4UPDATE.PUP renomeado, download incompleto): a
+   mensagem diz o motivo e o firmware instalado não muda.
+6. Tirar o pendrive durante "Verificando" ou "copiando o PS3UPDAT.PUP":
+   a mensagem fala em pendrive desconectado (não em arquivo
+   corrompido), começa com "Firmware não instalado, fica o <anterior>"
+   na instalação e o firmware anterior continua.
+7. Círculo durante "Instalando...": aparece a pergunta de cancelar.
+   Círculo (Não): a instalação continua. X (Sim): "Instalação do
+   firmware cancelada: fica o <anterior>".
+8. Fechar e abrir o aplicativo depois do passo 4: a XMB diz "Firmware
+   4.92 conferido nesta abertura" e, em seguida, o dev_flash.old some
+   (startup.log: "passed the check at start"). Abrir de novo: nenhum
+   aviso.
+9. Instalar de novo e fechar o aplicativo (botão PS > Fechar aplicativo)
+   no meio de "Instalando firmware". Abrir de novo: a XMB diz qual
+   firmware ficou (o anterior, ou o novo "conferido"); Informações do
+   sistema mostra o mesmo; dev_flash.installing some (FTP). Não teste
+   tirando o PS4 da tomada: isso arrisca o próprio sistema do PS4 (o
+   instalador foi feito para aguentar, não é preciso provar no console).
+
+==========================================================================
+CONTROLES
+==========================================================================
+- XMB: Esquerda/Direita = categoria; Cima/Baixo = item; X = abrir/iniciar;
+  Círculo = voltar; Triângulo = atualizar lista (e importar .rap);
+  Quadrado = configurar o jogo; R1 = patches do jogo; L1 = limpar o
+  cache do jogo.
+- Voltar do jogo para a XMB: aperte L1 + R1 + Triângulo juntos e segure
+  1 s (ou L1 + R1 + Options por 2 segundos).
+- Sair: botão PS > Fechar aplicativo (o jogo pausa sozinho antes), ou o
+  item "Sair do RPCS3 PORT FOR PS4" na XMB.
+
+Até 4 jogadores
+- Cada controle extra precisa de um usuário logado no PS4: aperte o
+  botão PS no controle novo e escolha um usuário ou "Convidado".
+- Jogador 1 = azul, 2 = vermelho, 3 = verde, 4 = rosa (cor da luz).
+- A coluna "Usuários" da XMB mostra quem está em cada vaga.
+- Qualquer controle navega na XMB.
+
+==========================================================================
+NOVIDADES DA 0.39
+==========================================================================
+1. Idiomas: XMB, janelas, avisos e menu de configurações em Português
+   (Brasil), English, Español e العربية (árabe).
+   - Sem nada configurado, segue o idioma do PS4: Português (Brasil ou
+     Portugal) -> português; Espanhol (Espanha ou América Latina) ->
+     espanhol; Árabe -> árabe; inglês e qualquer outro idioma -> inglês.
+     startup.log: "i18n: ui-language.txt 'auto' (absent), PS4 system
+     language 17 (rc 0x0) -> pt-BR; game language auto -> Portuguese
+     (Brazil)".
+   - Para escolher: XMB > Configurações > "Idioma · Language · اللغة"
+     (o mesmo título em todos os idiomas). X ou Direita vai para o
+     próximo (Automático, Português, English, Español, العربية),
+     Esquerda volta. Muda na hora e fica gravado em
+     /data/rpcs3/ui-language.txt (uma palavra: auto, pt-BR, en, es ou ar;
+     também dá para criar o arquivo pelo FTP). Se o arquivo não puder ser
+     gravado, a XMB avisa e o idioma vale só até fechar o RPCS3. Com pt-BR
+     no arquivo a XMB fica como na 0.38.
+   - Árabe: da direita para a esquerda, letras ligadas (as formas árabes
+     vêm da fonte DejaVu do pacote, também com o firmware do PS3
+     instalado). A linha de mensagens fica à direita, o rodapé e os
+     botões das janelas ficam espelhados e a porcentagem da barra fica à
+     direita. Nomes de jogos, caminhos e números continuam da esquerda
+     para a direita.
+   - As notificações do PS4 vêm no idioma escolhido (em árabe quem
+     desenha é o próprio PS4: confira no teste 31). As telas de sistema
+     dentro do jogo (troféus, lista de saves, teclado, menu do botão PS)
+     ficam em português, inglês ou espanhol; com a XMB em árabe elas
+     aparecem em inglês. startup.log e RPCS3.log continuam em inglês.
+   - "Idioma dos jogos" (Configurações do RPCS3, logo abaixo do Áudio
+     contínuo): o idioma que os jogos de PS3 recebem do sistema (textos e
+     vozes do jogo, quando o jogo tem esse idioma). Automático = o idioma
+     do PS4 (com a XMB no automático) ou o da XMB escolhida (Português ->
+     Português (Brasil), Español -> Espanhol, English e árabe -> Inglês
+     (EUA)); ou um dos 20 idiomas do PS3. X ou Esquerda/Direita muda;
+     vale no próximo boot do jogo. Grava /data/rpcs3/game-language.txt
+     ("auto" ou o número do idioma do PS3). Por jogo (Quadrado sobre o
+     jogo): "Idioma deste jogo", que começa em "Igual ao global" e grava
+     /data/rpcs3/custom_configs/<TITLE_ID>.game-language. Até a 0.38 todo
+     jogo recebia Inglês (EUA). No Automático, um idioma escrito à mão no
+     YAML do jogo continua valendo. Com keep-user-settings.flag nada
+     muda. startup.log: a linha "Política PS4 para <ID>: ..." termina com
+     " · idioma do jogo Portuguese (Brazil) (auto, PS4 17)" (ou
+     "(Configurações)", "(este jogo)", "(YAML)"); RPCS3.log "Language:
+     Portuguese (Brazil)".
+2. Uma ISO nunca é tratada como disco. Só pede o disco no leitor a
+   imagem que a instalação pela linha "Disco de PS3" gravou: o mesmo
+   arquivo (mesmo caminho) com o mesmo tamanho. Qualquer outra ISO,
+   mesmo do mesmo jogo e do mesmo tamanho com outro nome, no PS4 ou no
+   pendrive, aparece como "ISO de PS3", sem cadeado, e abre sem disco.
+   - A linha do jogo instalado do disco diz "Instalado do disco · precisa
+     do disco no leitor" (sem o disco, com o cadeado).
+   - Registros de instalação da 0.37/0.38 (sem o caminho) valem para
+     /data/rpcs3/games/<nome da imagem>. startup.log "disc lock:
+     registry: N game(s) installed from disc (BLES01876 at
+     '/data/rpcs3/games/...' 10128 MiB)"; um registro que não serve diz
+     por quê ("... nothing is locked for ...").
+3. ISO incompleta (cópia interrompida): a lista mostra "ISO incompleta:
+   faltam X GB (cópia interrompida?) · copie de novo" e X não abre o jogo
+   (startup.log "XMB: '<arquivo>' is incomplete: file N bytes, image M
+   bytes"). Quando a cópia termina, a linha volta ao normal sozinha. Se
+   uma ISO curta passar mesmo assim, o jogo para com "A ISO deste jogo
+   está incompleta ...: copie-a de novo." (em vez de "Erro no emulador"
+   e "reabra o RPCS3"): RPCS3.log/startup.log "ISO: '<imagem>' ends at N
+   bytes but '<arquivo>' is read at ...: the image is incomplete (copy it
+   again)".
+4. ISO criptografada (formato redump) sem chave manual. X numa ISO sem a
+   .dkey abre a janela "Buscando a chave desta ISO..." (Círculo cancela)
+   e o jogo abre quando a chave é conferida. A chave vem, nesta ordem, de
+   um .ird ao lado da ISO (mesmo nome, qualquer .ird da pasta ou a
+   subpasta ird/), dos .ird já baixados e da base de chaves pela internet
+   (a mesma do PS3 Disc Dumper; precisa da data e hora do PS4 certas). É
+   gravada em /data/rpcs3/data/redump/<TITLE_ID>.dkey e
+   <nome da ISO>.dkey: da segunda vez abre direto. Uma .dkey errada ao
+   lado da ISO é posta de lado.
+   - startup.log "XMB: '<iso>' is an encrypted ISO without a key:
+     searching for its key", "disc key: ISO '<iso>': ... verified OK",
+     "disc key: ISO '<iso>': search took N ms"; RPCS3.log "ISO: init:
+     Found matching key file".
+   - Sem internet: "Sem internet: a chave desta ISO criptografada não
+     pôde ser buscada". Jogo fora da base: "Esta ISO está criptografada e
+     a chave não está na base (<ID>): use uma ISO decriptada".
+   - A .dkey manual (USB:/redump + "Importar chaves .dkey") continua
+     valendo como último recurso.
+5. Disco no leitor (jogos instalados do disco)
+   - Disco tirado durante o jogo: o jogo PAUSA (em vez de fechar) com o
+     aviso "RPCS3: o disco do jogo saiu do leitor e o jogo foi pausado.
+     Coloque o disco de novo para continuar." e continua sozinho quando
+     um disco do jogo volta ("RPCS3: disco de volta: jogo retomado.").
+     Conta como tirado depois de 3 verificações sem o disco em pelo menos
+     10 s. startup.log "disc lock: the game's disc left the drive; game
+     paused until a disc of it is back" e "disc lock: game resumed (its
+     disc is back)".
+   - Chave do disco: com o disco no leitor e a XMB aberta, a busca se
+     repete sozinha (1 minuto depois, depois cada vez mais espaçada, até
+     10 minutos), também para um disco instalado sem a chave. A lista de
+     chaves baixada fica guardada e é usada quando o download falha
+     ("disc key: index: ... (cached copy from <data>)").
+   - Trecho ilegível: a instalação para e diz o setor ("O leitor não
+     conseguiu ler um trecho do disco (setor 0x...): limpe o disco e
+     instale de novo (continua dali)"). Discos de camada dupla (até 50 GB)
+     também instalam.
+6. Pacotes e ISOs especiais
+   - ISO de jogo da PSN convertido (sem PS3_DISC.SFB válido): a lista
+     diz "ISO sem PS3_DISC.SFB: não inicia" e X explica "ISO sem
+     PS3_DISC.SFB (jogo da PSN convertido?): não inicia · instale o PKG
+     do jogo". O RPCS3 de PC também não abre essas ISOs.
+   - Pacote dentro da ISO que não abre: "Pacote da ISO ilegível (<arquivo>):
+     ISO danificada ou incompleta, copie de novo" (antes falava em PKG
+     renomeado). Um extra opcional do disco (PS3_EXTRA) que não abre não
+     impede mais o jogo: "Extra do disco ignorado (<arquivo>): o jogo
+     abre sem ele".
+   - Jogo de PKG que ficou pela metade (pasta sem PARAM.SFO em
+     dev_hdd0/game): "Instalação incompleta: instale o PKG de novo".
+   - ISO feita de uma pasta de jogo por um programa comum de criar ISO
+     (ImgBurn e parecidos), sem o cabeçalho de disco do PS3 (ex.: o
+     Dante's Inferno "Divine Edition"): era recusada como corrompida (o
+     RPCS3 de PC também recusa). Agora abre como imagem sem
+     criptografia. RPCS3.log "ISO: init: no PS3 disc header (sector 0
+     holds no region table: ...); read as one unencrypted region: ...".
+     iso-strict-header.flag volta a recusar ("ISO: images without a PS3
+     disc header are refused (iso-strict-header.flag)").
+7. Pastas criadas pelo FTP (bloqueadas para o emulador)
+   - Ao abrir, o RPCS3 confere /data/rpcs3 (games, pkgs, raps, cache,
+     dev_hdd0/game, dev_hdd0/home/00000001 e as outras) e, com o FTP do
+     GoldHEN LIGADO, libera pelo próprio FTP o que foi criado por ele.
+     Pode levar até cerca de 1 minuto uma vez (com 200 ou mais itens:
+     "RPCS3: liberando N pastas e arquivos bloqueados pelo FTP,
+     aguarde..."). startup.log "fs perms: ... SITE CHMOD sent N,
+     accepted N, refused 0 ..." e "fs perms: after the repair every
+     checked entry is writable".
+   - Uma pasta de cache que não pode ser liberada é posta de lado e
+     recriada ("fs perms: cache moved aside: ... a new cache is used"):
+     o jogo compila de novo uma vez. Jogos, PKGs, licenças, patches e
+     saves nunca são movidos.
+   - Com o FTP desligado, a XMB mostra a janela "Algumas pastas do
+     emulador foram criadas pelo FTP e estão bloqueadas para gravação."
+     com as pastas e o conserto pelo FileZilla (botão direito em
+     /data/rpcs3 > Permissões de arquivo > 777, recursão em
+     subdiretórios).
+   - dev_hdd0 copiado pelo FTP: X num jogo avisa "A pasta dev_hdd0 do
+     RPCS3 não aceita gravação (criada pelo FTP): ligue o FTP do GoldHEN
+     e reabra o RPCS3" em vez de abrir numa tela preta (startup.log "XMB:
+     '...' not booted: /data/rpcs3/dev_hdd0/<pasta> refuses writes (errno
+     N) ..."). No jogo: "RPCS3: o jogo não pôde criar seus dados em
+     dev_hdd0/game (pasta sem permissão): ligue o FTP do GoldHEN e reabra
+     o RPCS3". Mantenha o FTP do GoldHEN ligado quando abrir o RPCS3.
+   - no-fs-repair.flag desliga o conserto; dev-hdd0-gate-off.flag deixa
+     abrir mesmo com o dev_hdd0 bloqueado.
+8. Áudio
+   - "Áudio contínuo" vem AUTOMÁTICO: quando o jogo não produz o som a
+     tempo, o som fica um pouco mais lento (nunca abaixo de 70%) em vez
+     de picotar, e volta ao normal quando o jogo acompanha. Em jogos que
+     acompanham ele nunca entra. Configurações do RPCS3 > "Áudio
+     contínuo: Automático (padrão)" / "Desligado" (Desligado cria
+     /data/rpcs3/audio-no-stretch.flag). startup.log "cellAudio:
+     automatic continuity engaged (rate 0.xx, fill 0.xx)" só nos jogos
+     lentos. O audio-auto-stretch.flag da 0.34 é ignorado ("cellAudio:
+     audio-auto-stretch.flag ignored: ...").
+   - Reserva de áudio de 64 ms (antes 34): um bloco atrasado do jogo é
+     esperado (até 64 ms) em vez de virar silêncio. Custa ~30 ms a mais
+     de atraso do som. Saídas de som paradas viram silêncio na hora.
+     startup.log "cellAudio: PS4 audio policy: HR waits on, reserve 64
+     ms, wait up to 64 ms while reserve > 16 ms, idle after 100 ms,
+     continuity auto". Ajustes salvos com 34 ms passam para 64 uma vez
+     ("profile: 'Desired Audio Buffer Duration' saved by automatic
+     profile <=37 ('34') -> 39 ('64')").
+   - O volume e os ajustes de áudio do menu do botão PS (dentro do jogo)
+     valem na hora ("Updating cell_audio_thread configuration").
+   - "Renderer" nesse menu de áudio: o PS4 tem uma saída de som só, então
+     "Null" não deixa o jogo mudo (a saída é recriada e o som continua).
+     Para tirar o som, use o volume.
+   - Linhas de erro do mixer no RPCS3.log (_sys_lwmutex_lock ESRCH
+     "Invalid ID", sys_mutex_lock EDEADLK, sys_mutex_unlock EPERM em
+     threads de áudio) são normais: o PS3 faz o mesmo.
+   - A linha AudioOut de 10 s ganhou " reserve_waits=N late_max_ms=X
+     late<5/5-10/10-20/20-40/>40=... idle_ports=N rate=0.xx
+     tempo_avg=0.xx".
+9. Crashes e travamentos (todos os jogos)
+   - O crash do intérprete de shaders depois de alguns minutos
+     ("Verification failed ... VKProgramPipeline.cpp") foi corrigido
+     (interpreter-sync-link.flag é a saída de emergência).
+   - Congelamento do GTA IV e parecidos: a GPU emulada lê e grava as
+     etiquetas de sincronização sem passar pela proteção da memória
+     (rsx-label-direct.flag volta ao jeito antigo); a ordem do ZCULL
+     numa falta de página (zcull-av-upstream.flag) e uma rede de
+     segurança para uma falta de página que se repete sem fim
+     (no-av-livelock-net.flag).
+   - Depois de um crash da thread de vídeo, o jogo para e a XMB mostra a
+     janela de erro. Até a 0.38 uma thread do jogo podia ficar presa
+     esperando a thread de vídeo, que já tinha morrido, e o PS4 fechava
+     o aplicativo em 10 s (tela inicial do PS4, sem o aviso na XMB).
+     startup.log "PS4 RSX: a CPU fault at 0x... waited for the RSX
+     thread, which ended in a fatal error; not served, left to the
+     access-violation net so the stop can finish" (no OpenGL, "PS4
+     OpenGL: ..."). Com no-av-livelock-net.flag a espera volta a não ter
+     fim e o PS4 fecha o aplicativo como na 0.38.
+   - Aviso falso "o jogo parece travado": no primeiro boot o Fallout New
+     Vegas copia uns 2,6 GB para o HD (cerca de 7 min) com a barra de
+     progresso dele (uma janela de mensagem do sistema, que o RPCS3
+     desenha). Com essa janela na tela o jogo não manda quadros, e a 0.38
+     gravava dumps de STALL e mostrava "RPCS3: o jogo parece travado ha N
+     s. ..." com o jogo funcionando. Agora uma janela de mensagem do
+     sistema na tela conta como atividade (enquanto a thread de vídeo
+     está viva), e muita leitura e gravação de arquivos pelo jogo também.
+     startup.log, uma vez por boot: "STALL: no guest flip for 25 s while
+     a native message dialog is on screen; RSX loop N ms ago: counted as
+     activity, no STALL dump and no 'game looks frozen' toast
+     (stall-strict.flag restores the 0.38 rule)" (ou "while the game
+     reads or writes files (N calls in 5 s)"). Um travamento de verdade
+     (sem janela e sem arquivos) continua com o dump e o aviso.
+     stall-strict.flag volta à regra da 0.38.
+   - Threads: threads que terminaram são liberadas (o PS4 recusava novas
+     e o jogo ficava sem som ou voltava ao menu); uma criação recusada é
+     tentada de novo uma vez (thread-no-retry.flag); câmera, microfone e
+     outras threads de serviço só começam quando o jogo usa
+     (keep-service-threads.flag); parar o jogo não precisa de thread
+     nova. startup.log "PS4 threads: ...".
+   - Ordem de partida das threads PPU (Plants vs. Zombies): uma thread
+     nova de prioridade menor ou igual não faz mais quem a criou esperar,
+     como no PS3 (ppu-start-wait.flag volta à espera do RPCS3). startup.log
+     "PPU threads: sys_ppu_thread_start returns at once ...".
+   - Jogo congelado por um acesso inválido à memória (a tela "The PS3
+     application has likely crashed"): volta para a XMB com "O jogo
+     emulado travou (acesso inválido à memória em '<thread>'): voltou ao
+     menu"; outro jogo abre sem reabrir o RPCS3 (frozen-stays.flag deixa
+     congelado como na 0.38).
+   - GPU que para de responder por 10 s: o jogo fecha e volta para a XMB
+     ("GPU: confirmed hang (...): stopping to the XMB (no-hang-stop.flag
+     keeps waiting)"); nas próximas 3 aberturas esse jogo usa o "Async
+     Recompiler" sem o intérprete de shaders (aviso "RPCS3: ajuste
+     automatico para <ID> apos falha anterior: shaders sem interpretador
+     (a GPU travou)"). no-hang-stop.flag espera para sempre, como na
+     0.38.
+   - Opcional: dead-fifo-stop.flag faz um "Dead FIFO" (o vídeo do jogo
+     parou) voltar para a XMB em vez de "Erro no emulador".
+   - Depois de um erro, a janela mostra a primeira linha do motivo. Se o
+     jogo aberto sozinho pelo boot-next fechar de novo com o mesmo erro,
+     a XMB diz "<jogo> fechou de novo com o mesmo erro: reabrir o RPCS3
+     não resolve" e não pede para reabrir de novo.
+   - Um savestate que não pôde ser lido na sessão anterior é avisado
+     ("Sessão anterior: um savestate de <ID> não pôde ser lido ...").
+10. Desempenho
+   - Cache de shaders do driver de vídeo (Mesa) ligado por padrão em
+     /data/rpcs3/cache/mesa (até 512 MB): a segunda abertura de um jogo
+     compila bem menos shaders (Vulkan e OpenGL). startup.log "Mesa shader
+     cache: /data/rpcs3/cache/mesa/ (512 MiB, ...)". mesa-cache-off.flag
+     desliga; o mesa-cache.flag antigo não é mais preciso.
+   - Os links do intérprete de shaders passam na frente dos shaders do
+     jogo na fila (interp-no-lane.flag); a compilação de shaders só
+     espera a vez com a memória apertada (nível 2 ou mais).
+   - Anéis da GPU emulada crescem sozinhos quando um jogo precisa
+     (startup.log "ring ... grew 8 -> 16 MiB"; o próximo boot do jogo já
+     começa maior); rings-no-grow.flag desliga.
+   - Memória de vídeo: blocos vazios voltam ao sistema quando a janela
+     aperta (vma-keep-empty.flag).
+   - Esperas curtas do jogo mais precisas (timer HR a partir de 30 µs;
+     precise-sleep-spin.flag volta aos 40 µs); o governador de memória
+     usa regras novas (governor-v038.flag volta às da 0.38).
+   - "Modo frio" na primeira abertura: a compilação do jogo ("Compiling
+     PPU Modules" e "Building SPU Cache") usa até 2 threads em vez de 1,
+     sem as threads extras
+     (na 0.38, com o Modo frio ligado, o primeiro boot do Fallout New
+     Vegas levou uns 90 min, com 88 min de PPU numa thread só). Durante
+     o jogo as compilações continuam uma de cada vez (por isso áreas
+     novas ficam um pouco mais lentas no Modo frio). startup.log "cool
+     mode: compile stage (PPU modules, SPU cache) runs on at most 2
+     compile threads, no optional workers; compiles during play stay
+     serialized". cool-mode-serial-boot.flag volta ao jeito da 0.38 (uma
+     compilação de cada vez também na abertura).
+11. OpenGL (Configurações do jogo > GPU > Renderer: OpenGL)
+   - ZCULL "relaxado" por padrão no OpenGL (cada consulta de oclusão
+     estrita trava a GPU emulada no Zink); zcull-strict-gl.flag volta ao
+     estrito. Ajustes salvos pela 0.37/0.38 em OpenGL passam para o
+     relaxado uma vez.
+   - Opcional: gl-async.flag liga 1 compilador de shaders em segundo plano
+     no OpenGL (o modo de shaders vira "Async Recompiler"). Nunca rodou
+     no console: teste 32.
+   - A linha "RSX gameplay" do OpenGL mostra "GL program compiles N (ms)"
+     e "zcull query waits N (ms)".
+12. Configuração
+   - Quem escolhe o interpretador de PPU ou de SPU (10 a 50 vezes mais
+     lento que o LLVM no PS4) recebe um aviso ao abrir o jogo: "RPCS3:
+     <ID> usa o interpretador de PPU (escolhido por você): 10 a 50 vezes
+     mais lento" e a linha "Política PS4 para <ID>: PPU decoder =
+     interpreter (user setting): ..." ("pedido pela base do PC" quando é
+     o config_database.dat). Não escolha o interpretador.
+   - config_database.dat (ajustes por jogo do RPCS3 de PC) vem dentro do
+     pacote: jogos como TTT2 (texturas pretas), ModNation, Split/Second,
+     Skate 3 e Blur rodam com os ajustes do PC sem importar nada.
+     startup.log "config database: bundled /app0/config_database.dat
+     (...)" e, por jogo, "config database: applied SERIAL (N keys), M
+     value(s) changed". Uma cópia em /data/rpcs3 (pelo FTP ou "Importar
+     config_database.dat do PC") vale no lugar da do pacote, a não ser
+     que as duas tenham data e a do pacote seja mais nova.
+   - O aviso "RPCS3: configuração automática ativa para <ID> (N
+     ajuste(s) específico(s) para este jogo)" só aparece quando o jogo
+     tem ajustes próprios (linhas do emulador para esse jogo ou a
+     entrada dele no config_database.dat). Na 0.38 ele aparecia em todo
+     jogo, também com "(0 ajuste(s))", e parecia um erro. A contagem
+     completa continua no startup.log ("Configuração automática: N
+     ajuste(s) para <ID> ...").
+   - Perfil automático 39: os ajustes salvos são migrados uma vez (64 ms
+     de áudio; ZCULL relaxado em OpenGL).
+13. Diagnóstico
+   - RPCS3.log a cada 60 s: "heartbeat: <jogo> running; guest flips N (F
+     FPS over S s); RSX loop A ms ago; threads T (...); audio rate R".
+   - fatal.txt e startup.log: "frame chain (RBP walk; ...)" (quem chamou
+     a função que falhou).
+   - Vídeo travado por mais de ~35 s: aviso "RPCS3: o jogo travou no
+     vídeo; segure PS e feche o aplicativo.".
+   - Opcional (teste F2): shader-translate-async.flag traduz os shaders
+     novos fora da thread da GPU emulada.
+14. Cheats (códigos Artemis/NetCheat e cheats.yml do RPCS3 de PC)
+   - R2 sobre um jogo (ou R1 > primeira linha "Cheats") abre a lista:
+     X liga/desliga (vale no próximo início), Quadrado opções (modo,
+     intervalo, ver linhas, editar, renomear, apagar, copiar para meus
+     cheats, valor), Triângulo relê os arquivos, Círculo volta.
+   - Arquivos em /data/rpcs3/cheats/<TITLE_ID>.txt, .ncl ou .yml;
+     importação de USB:/cheats, USB:/rpcs3/cheats e
+     /data/rpcs3/import/cheats. "Adicionar cheat (teclado)": linhas
+     separadas por ";".
+   - Dentro do jogo: menu do botão PS > "Cheats".
+   - Tipos 0, 1, 2 e 4 funcionam; 6, A, B, D, E e F aparecem como "ainda
+     não suportado no PS4" (faltam arquivos de exemplo). "Action Replay
+     PS3" edita saves no PC: não é cheat de memória.
+15. Configurações do RPCS3 (todas as opções do PC)
+   - As abas do PC (CPU, GPU, Áudio, E/S, Sistema, Rede, Avançado,
+     Emulador, Depuração) e a aba PS4. Cada aba é uma página como a do
+     PS3: valor que vai rodar e um selo de quem decide (Automático, Jogo,
+     PC, PS4 com cadeado, Interruptor, Após falha, Seu, Deste jogo). X
+     muda (lista de valores, teclado do sistema, subpágina), Esq/Dir
+     passam valores (R1: passo maior), Quadrado volta ao automático,
+     Triângulo abre as opções da linha, L2/R2 trocam de aba.
+   - O que você muda para um valor diferente do automático vira "seu
+     ajuste": a lista "PS4 user settings:" no fim do arquivo (formato 2,
+     "PS4 settings format: 2"). A configuração automática não mexe nele;
+     os limites do PS4 continuam valendo.
+   - O config_<ID>.yml de um jogo guarda só os seus ajustes daquele jogo;
+     o resto vem do global e do automático. Arquivos antigos (0.38 ou
+     antes, cópias do PC) continuam valendo como antes até você converter
+     na linha do modo do jogo.
+   - Mais quatro opções ficam travadas no PS4: "Exit RPCS3 when process
+     finishes" (desligado), "Assume External Debugger" (desligado),
+     "Initialize Directories" (ligado) e "Automatically start games after
+     boot" (ligado), também num YAML copiado do PC.
+   - O "Salvar" do menu do botão PS dentro do jogo grava só o que você
+     mudou nele (antes gravava a configuração inteira em uso, com os
+     valores do perfil automático e os limites do PS4).
+
+==========================================================================
+TESTE NO CONSOLE DA 0.39
+==========================================================================
+Envie de CADA teste os três: /data/rpcs3/startup.log, RPCS3.log (e
+RPCS3.part*.log) e mesa.log de /data/rpcs3/log (o histórico fica em
+/data/rpcs3/log/history/0 a 7), e /data/rpcs3/fatal.txt se existir. Sem
+o startup.log não dá para saber o que aconteceu (no último lote só 1 de
+8 jogos veio com ele). Copie os logs só depois de fechar o RPCS3 (botão
+PS > Fechar aplicativo): um log copiado com o aplicativo aberto vem
+cortado. Um jogo por abertura do aplicativo. Anote o modelo do PS4
+(Fat, Slim, Pro; Pro com e sem Modo Turbo), o firmware do PS4, se o FTP
+do GoldHEN estava ligado, se o firmware do PS3 está instalado e se o
+jogo está em /data ou no pendrive.
+
+A - todo console (rápido)
+1. Killer is Dead (BLUS31186), 30 min a partir do save que fechou aos
+   3:34: nenhum "Erro no emulador"; linha "Vulkan backend" com "unbound
+   sampler slots 0" e "interp fallback env" maior que 0.
+2. GTA IV Complete Edition (BLUS30682), 3 x 15 min andando pela cidade
+   (mesmo save): no máximo um "Reports area at location ... was
+   accessed", nenhum "RSX: pause still waiting", nenhum "STALL", nenhum
+   "0x350300460". Áudio: "silent" < 50 por 10 s, "ratio" >= 0.70. VRAM:
+   "pressure trims" sem subir a cada quadro, "hard syncs" perto de 0.
+3. God of War Collection (BCUS98229), 15 min: nenhum crash; no máximo um
+   "ring ... grew 8 -> 16 MiB", sem rajadas de "hard sync" dos anéis.
+4. Demon's Souls (BLES00932 / BLUS30443), 20 min com um vídeo: nenhum
+   crash, nenhum "pthread_create refusal", "HLE Video Decoder" e "HLE
+   LPCM decoder" criados; áudio limpo.
+5. WWE SmackDown vs RAW 2010 (BLUS30412), a luta que travava aos 2:42:
+   nenhum "FIRST pthread_create refusal", nenhum "PPU Trap"; parar o
+   jogo volta para a XMB (nenhum "Emulation Join Thread' not started").
+6. Max Payne 3 (BLUS30557), uma fase de 20 min: AudioOut "periods" acima
+   de 1840 e "underruns" abaixo de 30 por 10 s. Pare 10 vezes com L1 +
+   R1 + Triângulo (no jogo e num vídeo): sempre a XMB, nenhum
+   "VKRenderTargets.h:136".
+7. PES 2013 (BLUS31029), abrir até uma partida duas vezes: "pipeline
+   burst" T/N <= 0.25 s na primeira e umas 10 vezes menor na segunda
+   (cache do Mesa: "Mesa shader cache: ..."); "SPU LLVM avg wait" mediana
+   < 500 ms; nenhuma recusa ("sysFileManager").
+8. Qualquer jogo: menu do botão PS > Áudio (volume): RPCS3.log "Updating
+   cell_audio_thread configuration" na hora.
+
+B - por tipo de problema
+9. Dragon Ball Raging Blast 2 (BLUS30581), além dos 2:02 e 10 min: áudio
+   com "rate=" e "tempo_avg=", nenhum "ratio=0.1".
+10. Dragon Ball Z Battle of Z (BLUS31314), Batman Arkham Origins
+   (BLUS31207), além dos 2:11 / 1:45, 15 min: nenhum crash.
+11. Super Street Fighter IV (BLUS30793), Prince of Persia Forgotten Sands
+   (BLUS30401), WWE SvR 2009 (BLES00361), 15 min: nenhum "Verification
+   failed ... VKProgramPipeline.cpp".
+12. Castlevania Lords of Shadow, Dante's Inferno, MotorStorm, Skate 3,
+   Folklore, ModNation Racers, ICO/SotC, Sonic the Hedgehog, Captain
+   America, Rango, Asura's Wrath, RE Operation Raccoon City, MK
+   Komplete, MGR Revengeance, TTT HD, Dead Island Riptide, GoW
+   Ascension, inFAMOUS 2, 15 a 30 min cada: nenhum crash; áudio
+   "game_late" < 10 e "silent" perto de 0. Folklore, GoW Collection e
+   Demon's Souls NÃO devem mostrar "automatic continuity engaged".
+13. Gran Turismo 6 (BCUS99247), menus + uma corrida: nenhuma recusa
+   "MEfYS" em sequência; "cellAudio: automatic continuity engaged",
+   sem buracos no som.
+14. God of War Origins Collection (BCUS98289), vídeo de abertura: o
+   vídeo toca, nenhuma recusa em sequência do "HLE Video Decoder".
+15. Tekken Tag Tournament 2 (BLUS31002), a tela de versus que travava:
+   nenhum "PPU Trap".
+16. inFAMOUS (BCES00220), 15 min: "snd_stream_service_thread" criada
+   (música presente), nenhum crash.
+17. MX vs ATV Supercross (BLUS31455), uma corrida: "Bink Snd" criada (som
+   dos vídeos).
+18. WWE SvR 2011 (BLES01045), uma luta: nenhuma recusa, nenhum trap.
+19. Call of Duty Black Ops (BLUS30591), 10 min: áudio "silent" perto de
+   0.
+20. RE Darkside Chronicles (HPEB00816), 10 min: áudio "periods" acima de
+   1780.
+21. Fallout 3 GOTY (BLES00741), 30 min: nenhuma GPU parada depois do
+   primeiro uso do intérprete; se parar: "GPU: confirmed hang ...
+   stopping to the XMB", XMB com o aviso, e o próximo boot do jogo com
+   "shader=Async Recompiler (multi-threaded) (async recompiler after a
+   GPU hang: adapt gpu_hang)" na linha "Política PS4 para ...".
+22. GoW HD (NPUA80490), Ratchet & Clank (NPEA00385), 15 min: menos de 1
+   "ring reclaim" por segundo depois que o anel cresceu.
+23. GTA IV sem expansões (BLUS30127 / BLES00229), abrir: as linhas de
+   diagnóstico novas (tabela de iomap, versão do SDK) para comparar com
+   o PC (ainda deve falhar na 0.39).
+24. A ISO europeia do GTA IV que estava incompleta (BLES00229): a lista
+   mostra "ISO incompleta: faltam X GB", X recusa, nenhum "Erro no
+   emulador".
+25. Plants vs. Zombies (BLUS30852), Sonic Generations (BLUS30612), até o
+   jogo: anote o resultado (logs para comparar com o PC).
+26. PS All-Stars (BCUS98472), Minecraft (BLUS31426), Midnight Club LA
+   (BLES00652), Blur (BLES00759), GTA San Andreas (BLES02219), Bomberman
+   Ultra (NPUB30051), 10 min cada: nenhum crash novo, FPS não menor que
+   na 0.38.
+
+C - discos, ISOs, pastas e idiomas
+27. Uma ISO de um jogo que também foi instalado do disco (mesmo TITLE_ID e
+   mesmo tamanho, outro nome de arquivo): a linha diz "ISO de PS3", sem
+   cadeado, e abre sem o disco. startup.log "disc lock: registry: ..."
+   com o caminho do jogo instalado.
+28. Instalar do disco um jogo que não seja o FIFA, com internet: "disc
+   key: ... verified OK", "disc install: done: ... (decrypted ...)".
+   Jogando, tire o disco: o jogo pausa com "Coloque o disco de novo para
+   continuar"; ponha o disco: continua ("disc lock: game resumed (its
+   disc is back)"). Sem internet: ponha o disco, ligue a internet depois;
+   em 1 a 10 min "disc key: searching again for <ID> ..." e a chave
+   chega.
+29. ISO criptografada sem a chave (ex.: as ISOs Ketsui/EyeCreate sem o
+   .key): X mostra "Buscando a chave desta ISO..." e o jogo abre;
+   startup.log "disc key: ISO '...': ... verified OK"; RPCS3.log "ISO:
+   init: Found matching key file" e "'enc type': REDUMP". Abra de novo:
+   não busca mais (a .dkey ficou em /data/rpcs3/data/redump).
+30. Pastas do FTP. (a) FTP do GoldHEN ligado: crie com o FileZilla
+   /data/rpcs3/dev_hdd0/game/TESTE00001 e abra o RPCS3: "fs perms: ...
+   not writable (owner uid 0)", "SITE CHMOD sent 1, accepted 1" e "after
+   the repair every checked entry is writable". (b) Num console com
+   /data/rpcs3/cache criado pelo FTP e o FTP DESLIGADO: "cache moved
+   aside: ..."; a segunda abertura do jogo não compila tudo de novo
+   (quase nenhum "LLVM: Compiling module"). (c) Com o FTP desligado e
+   uma pasta nova criada pelo FTP: a janela das pastas bloqueadas aparece
+   na XMB e o startup.log diz "still blocked (1)".
+31. Idiomas. PS4 em Português, English, Español e Árabe, sem
+   ui-language.txt: a XMB vem no idioma do PS4 (linha "i18n: ..."). Depois
+   percorra "Idioma · Language · اللغة". Em árabe: tudo alinhado à
+   direita, letras ligadas, parênteses certos, nenhum quadrado "?". Os
+   avisos de memória esgotada, disco removido e reabrir continuam
+   abrindo as janelas em todos os idiomas. Fotografe uma notificação do
+   PS4 em árabe (ex.: entrar com um 2.º controle): as letras saem ligadas
+   e da direita para a esquerda? "Idioma dos jogos" no Automático num PS4
+   em Português: RPCS3.log "Language: Portuguese (Brazil)" e um jogo com
+   português mostra português; "Idioma deste jogo" = Inglês: só esse
+   jogo em inglês.
+
+D - OpenGL
+32. Dois jogos testados em Vulkan (ex.: Folklore, GoW Collection) em
+   OpenGL: abrir duas vezes (cache do Mesa), depois com gl-async.flag:
+   "RSX gameplay" FPS, "GL program compiles N (ms)" e "zcull query waits
+   N (ms)"; com o arquivo, startup.log "OpenGL: async compiler: 1 worker
+   on a shared EGL context" (sem ele, "OpenGL: shader mode '...' ->
+   legacy recompiler: ..."). Passou: a segunda abertura sem travadas de
+   compilação, FPS não muito abaixo do Vulkan. APAGUE o gl-async.flag se
+   o jogo ficar pior.
+
+E - falhas de jogos, paradas e configuração automática
+E1. Mortal Kombat Komplete EU (BLES01508), a mesma ISO: "ISO incompleta:
+   faltam X GB", X recusa. Depois de copiar de novo: 30 min além do 1:18
+   sem "IO Failure detected" e sem "Dead FIFO".
+E2. Plants vs. Zombies (BLUS30852), 3 aberturas além da inicialização
+   dos troféus (uma de 40 min): nenhum "Access violation reading location
+   0x59c", nenhum "Emulation has been frozen". Depois com
+   ppu-start-wait.flag: a falha volta, com "guest access violation: ...",
+   "lifecycle: the game froze after a guest access violation" e a XMB
+   com o aviso; outro jogo abre sem reabrir o RPCS3. Com frozen-stays.flag
+   também: a tela parada como na 0.38. APAGUE os dois depois.
+E3. Regressão da ordem das threads PPU: A1 a A8 + WWE SvR 2011, TTT2,
+   inFAMOUS EU, GT6, GoW Collection (voltar ao menu de jogos): até o jogo
+   e uma fase/luta, nenhum travamento novo ao abrir ou carregar.
+E4. Max Payne 3 e ModNation: 10 paradas cada (L1 + R1 + Triângulo, no
+   jogo e num vídeo): sempre a XMB, nenhum "VKRenderTargets.h:136".
+E5. A ISO "Sonic The Hedgehog 2 (USA) (v1.00).iso": X: "Pacote da ISO
+   ilegível (...)" (ou, para um PS3_EXTRA, "disc extra ... skipped" e o
+   jogo abre); envie o startup.log com "PKG installer: '...' refused: not
+   a package (magic ...) (package of the booting disc)".
+E6. GTA IV sem expansões (Dead FIFO aos 0:43) SEM dead-fifo-stop.flag: a
+   janela "Ocorreu um erro no emulador." com a primeira linha do motivo e
+   como fechar; escolha o GTA IV, reabra: contagem com o nome do jogo,
+   o mesmo erro, e a XMB diz "fechou de novo com o mesmo erro"
+   ("boot-next not written").
+E7. O mesmo COM dead-fifo-stop.flag: "RSX: Dead FIFO:" e "lifecycle: the
+   renderer asked to stop the game (RSX dead FIFO)", XMB em até 15 s com
+   "O vídeo do jogo parou (Dead FIFO)"; outro jogo abre e desenha sem
+   reabrir. APAGUE o arquivo depois.
+E8. PES 2013 com um ajuste salvo "PPU Decoder: Interpreter (static)": o
+   aviso do interpretador e a linha "Política PS4 ... PPU decoder =
+   interpreter (user setting)"; depois com PPU LLVM: "pipeline burst" e
+   "draws skipped=" a cada 10 s.
+E9. config_database.dat do pacote (startup.log "config database:
+   bundled /app0/config_database.dat ..."): TTT2 e ModNation no
+   automático: "Write Color Buffers: true", "config database: applied
+   ...", texturas certas, o aviso "configuração automática ativa para
+   <ID> (N ajuste(s) específico(s) para este jogo)"; FPS comparado com a
+   0.38. Abrir Steins;Gate (BLJM60462), Skate 3, Split/Second, Blur.
+   Sonic Generations: o aviso do interpretador de SPU "(pedido pela base
+   do PC)" e se "Unknown STOP code: 0x0" ainda aparece. Um jogo sem
+   entrada nem linha própria (ex.: Terraria BLUS31537) abre sem o aviso
+   de configuração automática.
+E10. Skate 3, Max Payne 3, MGR: "SPU LLVM: ... avg wait" mediana < 500 ms;
+   MK9 / R&C ToD "building the SPU cache with 2 workers"; inFAMOUS EU:
+   as 16 "snd_stream_service_thread" e "SP Movie Loader" criadas, "silent"
+   perto de 0; Sonic 06 no console do cache feito pelo FTP: linha do
+   conserto e segunda abertura sem "LLVM: Compiling module"; Spider-Man
+   WoS / Miku F: "interpreter variant ... linked in" <= 1500 ms; Dead
+   Space / THP8 em OpenGL.
+E11. inFAMOUS EU: menu do botão PS > "Reload Last Emulation State" com o
+   savestate que existe: resultado + logs.
+
+F - tradução de shaders, permissões, memória e ISOs
+F1. Wolverine (BLUS30268), sem flag, 15 min com a primeira visita a uma
+   área nova (a cena dos 6:05 a 6:25): linha "Vulkan backend ... programs
+   translated on the RSX thread N (T ms, max M ms)" com T/N perto de 20 a
+   50 ms; RPCS3.log "PS4 RSX: ... new shader programs translated on the
+   RSX thread" no trecho de 1 FPS; nenhum crash.
+F2. O mesmo com /data/rpcs3/shader-translate-async.flag (opcional; startup
+   "RSX: new shader programs are translated on the pipeline workers
+   (shader-translate-async.flag)"): "translated on the RSX thread" perto
+   de 0 ms, "by workers N" maior que 0, "taken back" pequeno; a área
+   acima de 10 FPS; 30 min sem crash. Tire o arquivo: o trecho lento
+   volta (A/B). Mande o startup.log e o RPCS3.log das duas vezes.
+F3. DRIVER San Francisco (BLES00892) além dos 2:57 e Sniper Elite V2
+   (BLES01812) na primeira área: as linhas de F1 e F2 nos dois modos.
+F4. Splinter Cell Blacklist (BLES01766) no PS4 9.00 que mandou os logs.
+   (a) FTP do GoldHEN ligado: "fs perms: ... after the repair every
+   checked entry is writable" (dev_hdd0/game, home/00000001), nenhum
+   "Failed to create file: .../localusername", o jogo chega ao menu
+   ("RSX gameplay" com draws > 0) e com som. (b) FTP desligado e uma
+   pasta bloqueada: X mostra "A pasta dev_hdd0 do RPCS3 não aceita
+   gravação ..." e não abre; com dev-hdd0-gate-off.flag abre e mostra o
+   aviso no jogo. APAGUE o arquivo depois.
+F5. NFS Most Wanted 2012 (BLUS31010 + 1.03): além do "cellGemInit" até o
+   menu, nenhum "Access violation reading location 0x6cdb", nenhum
+   "Emulation has been frozen". Com ppu-start-wait.flag: a falha volta,
+   "guest access violation: ..." e a XMB com o aviso.
+F6. Sniper Elite V2, duas aberturas: as mudanças de nível de memória com
+   o motivo no RPCS3.log; "ring 'auxilliary upload heap' grew 16 -> 32
+   MiB" e depois nenhuma linha de "staging"; na segunda abertura "from
+   the title record: 'auxilliary upload heap' 32 MiB". FPS da intro e
+   AudioOut "periods".
+F7. A ISO "Call of Duty Classic - Spanish Version" (NPUB30065): a linha
+   "ISO sem PS3_DISC.SFB: não inicia", X recusa com o texto, nenhum
+   BootGame. Uma ISO redump (controle) continua abrindo.
+F8. Qualquer "occlusion timeout" (área do F1): a linha nova diz se a GPU
+   ainda estava rodando, se já tinha sinalizado ou se a consulta foi
+   reciclada.
+F9. Só depois de F2 passar: A1 a A8 com shader-translate-async.flag, mais
+   PES 2013 (além da recusa do ps3GameContent aos 1:15), GTA IV EU e R&C
+   ToD (BCUS98127): nenhum crash novo; "interpreter draws/frame" e FPS
+   não piores que sem o arquivo.
+
+G - ISOs sem cabeçalho, crash do vídeo, GTA IV e áudio
+G1. A ISO do Dante's Inferno "Divine Edition [BLUS30405].iso" (a mesma):
+   a linha com o título e o ícone, X abre até o menu; RPCS3.log "ISO:
+   init: no PS3 disc header ... read as one unencrypted region". Com
+   iso-strict-header.flag a recusa volta (APAGUE o arquivo depois).
+   Controle: uma ISO redump e uma ISO decriptada continuam com "'enc
+   type': ..., 'reg count': N". Diga qual programa fez essa ISO.
+G2. Parada depois de um crash da thread de vídeo. (a) GTA IV sem
+   expansões (BLUS30127 / BLES00229) SEM dead-fifo-stop.flag: a janela de
+   erro na XMB em até 15 s, nenhum "did not stop within 10 s". (b)
+   Qualquer log da 0.39 com crash da thread de vídeo: se uma thread
+   esperava, "PS4 RSX: a CPU fault at 0x... waited for the RSX thread,
+   ..." e depois "All threads have been stopped". (c) GTA IV CE europeu
+   30 min com 10 paradas (L1 + R1 + Triângulo ou o menu do botão PS):
+   nunca "shutdown: emulation threads did not stop within 10 s".
+G3. GTA IV PSN (NPEB00882 1.06), 15 min depois do primeiro "Compute
+   shader:": no máximo um "Reports area ... was accessed", nenhum "flip
+   event receive failed", nenhum STALL, nenhum "0x350300460".
+G4. GTA IV comum de disco (BLUS30127 ou BLES00229) COM a atualização do
+   jogo instalada (o PKG do update): passa da inicialização da GPU, ou
+   dá o mesmo Dead FIFO com as linhas de diagnóstico. Mande os logs nos
+   dois casos.
+G5. Dead Space (BLUS30177), menu do botão PS > Áudio: (a) um controle
+   deslizante: "Updating cell_audio_thread configuration" na hora; (b)
+   Renderer -> Null: a mesma linha, "cellAudio initializing. Backend:
+   ..." uma vez, as linhas AudioOut continuam, o som continua, nenhum
+   erro; (c) 15 min de jogo: "game_late" e "silent" perto de 0 quando o
+   jogo acompanha.
+G6. PS4 Pro: GTA IV CE EU, a mesma cena com o Modo Turbo ligado e
+   desligado: FPS da linha "RSX gameplay", "av readbacks=", "texture
+   copies" e a linha "CPU clock probe".
+
+H - janelas do sistema, Modo frio e travamentos
+H1. Fallout New Vegas (BLUS30888), a instalação dos dados de novo:
+   apague pelo FTP só a pasta /data/rpcs3/dev_hdd0/game/BLUS30888/ (não
+   a ISO); o jogo instala de novo na abertura seguinte (uns 7 min).
+   Durante a barra do jogo: nenhum "STALL: no guest flip or progress",
+   nenhum aviso "o jogo parece travado", e a linha "STALL: no guest flip
+   for 25 s while a native message dialog is on screen; ... counted as
+   activity ..." uma vez. Com stall-strict.flag os dumps e o aviso
+   voltam (A/B; APAGUE o arquivo depois).
+H2. Uma janela de sistema de Sim/Não ou OK deixada aberta por 60 s (ex.:
+   um jogo perguntando se cria os dados salvos): nenhum aviso; a mesma
+   linha de H1.
+H3. "Modo frio" ligado e o primeiro boot de um jogo grande (ou o mesmo
+   jogo depois de limpar o cache dele com L1): a linha "cool mode:
+   compile stage (PPU modules, SPU cache) runs on at most 2 compile
+   threads ..." e, no "Building SPU Cache", "SPU cache: compile N
+   programs with 2 workers" (na 0.38, 1 worker); anote os minutos do X
+   até a primeira imagem do jogo.
+   Depois limpe o cache de novo e repita com cool-mode-serial-boot.flag:
+   "cool mode: compile stages serialized too (cool-mode-serial-boot.flag)"
+   e o tempo (A/B). APAGUE o arquivo depois.
+H4. Fallout New Vegas 30 min com o Modo frio desligado: nenhum
+   "0x2bb1f18". Se a GPU parar ("gnm keepalive: submits allowed -> 0"),
+   a XMB volta em uns 10 s com o aviso e o próximo boot do jogo usa o
+   "Async Recompiler".
+H5. Controle: um travamento de verdade (ex.: GTA IV CE, se o
+   congelamento voltar), sem janela de sistema na tela: os dumps de
+   STALL e o aviso continuam. Se um travamento de verdade mostrar a linha
+   "counted as activity", mande os logs.
+H6. Tester do Dante's Inferno / inFAMOUS: mande também o startup.log
+   (modelo e firmware do PS4).
+
+I - cheats (novidade 14; use os códigos de quem pediu, de um jogo que você tem)
+I1. Pendrive com cheats/<TITLE_ID>.txt: R2 no jogo > "Importar cheats
+   para este jogo": a linha do resultado ("N arquivo(s) de cheats
+   importado(s), M cheat(s) ..."); startup.log "cheats: import result:"
+   com os lugares lidos; a lista mostra os cheats DESLIGADOS; um código
+   com erro aparece "Inválido: Linha N: ..." no idioma escolhido.
+   startup.log "cheats: list of <ID> v<versão>: ...".
+I2. Um cheat de valor (dinheiro, vida) ligado com X > abrir o jogo:
+   startup.log "cheats: 1 on for <ID> ..."; RPCS3.log (canal Cheats) a
+   primeira escrita com o valor antigo e o novo; o valor fica fixo no
+   jogo. Linha "heartbeat" (FPS, threads) igual à do mesmo jogo sem
+   cheats.
+I3. Um cheat de código (endereço no código do jogo, a lista diz "no
+   início do jogo (código)"): o primeiro início depois de ligar compila
+   algumas partes PPU; o efeito aparece. Desligado: o próximo início
+   volta ao normal. Ligado de novo: sem compilar outra vez.
+I4. Menu do botão PS dentro do jogo > "Cheats": desligar e ligar um
+   cheat constante muda na hora; um de início mostra "(próximo início)".
+I5. "Adicionar cheat (teclado)": nome, depois "0 01234560 05F5E0FF;
+   0 0123456Z 1": o teclado abre de novo com o texto e "Linha 2: ...";
+   corrigido, o cheat aparece na lista e em
+   /data/rpcs3/cheats/<ID>_user.txt. Quadrado > Editar códigos abre o
+   teclado com as linhas separadas por "; ". Quadrado > Apagar pergunta
+   antes.
+I6. Modo online (RPCN) ligado: a linha de baixo da lista diz "Cheats de
+   <jogo> · Cheats podem afetar troféus e placares online (RPCN)" e
+   ligar um cheat repete o aviso.
+   startup.log não deve ter "number keyboard refused" no valor de um
+   cheat do PC sem sinal (se tiver, anote: abriu o teclado latino).
+I7. Savestate com um cheat constante ligado > carregar: o cheat continua;
+   com um cheat de início, o menu mostra "(do savestate)".
+I8. Arquivo de outra versão: as linhas dizem "Códigos para a versão
+   ...; instalada: ..."; um endereço que não existe desliga o cheat com
+   um aviso depois de 1 minuto.
+I9. 30 min com 20 cheats constantes (100 ms): nenhuma travada nova
+   (heartbeat "RSX loop"), nenhum "STALL" novo.
+
+J - configurações (novidade 15)
+J1. Configurações do RPCS3 > GPU: a página com seções, o valor à
+   direita e o selo (Automático / PS4 com cadeado / Seu). L2/R2 trocam
+   de aba; Triângulo abre as opções da linha; Quadrado volta ao
+   automático. Na primeira vez que o menu abre: startup.log "cfg
+   browser: self-check 262 settings, 0 without catalog row, 0
+   round-trip failures".
+J2. GPU > Modo de shaders > X: a lista de valores com a bolinha no
+   atual; "Só o interpretador de shaders" pede confirmação.
+J3. GPU > Escala de resolução > X: o teclado numérico do sistema com o
+   valor; digite 150 > aviso > X: 150 %. O startup.log não deve ter
+   "number keyboard refused" (se tiver, abriu o teclado latino: anote).
+J4. Avançado > Bibliotecas do firmware > X: as duas listas; X numa
+   biblioteca pede confirmação (uma vez) e troca LLE/HLE.
+J5. Global: GPU > Gravar buffers de cor: Ligado; Círculo até o topo e
+   Círculo de novo: "Salvar as alterações?" (X Salvar, Círculo
+   Descartar, Triângulo continuar editando) > X. startup.log "settings:
+   global settings saved (settings format 2, 1 pin(s): Video > Write
+   Color Buffers)"; /data/rpcs3/ps4-settings.yml termina com "PS4
+   settings format: 2" e "PS4 user settings:" com essa chave. Depois:
+   Quadrado na mesma linha e Salvar de novo (volta ao automático).
+J6. Num jogo (Quadrado no jogo > GPU), mude "Gravar buffers de cor" e
+   Salvar: o config_<ID>.yml tem só essa opção e as linhas "PS4 ...".
+   No boot do jogo: startup.log "Política PS4 para <ID>: 1 ajuste(s)
+   seu(s): Video > Write Color Buffers=<valor> · ajustes globais: N" e o
+   RPCS3.log mostra o valor, com o resto do perfil automático aplicado.
+J7. No mesmo jogo, Quadrado nessa linha > Salvar: o config_<ID>.yml é
+   apagado (nenhum ajuste seu); startup.log "settings: <ID> saved
+   (settings format 2, 0 pin(s))".
+J8. Um jogo com um config_<ID>.yml antigo (salvo pela 0.38 ou copiado
+   do PC): na linha do modo do jogo, X mostra "Converter: N valor(es)
+   viram ajustes seus" > X: startup.log "settings: <ID> converted to
+   settings format 2 (N pin(s): ...)". Mande o startup.log.
+J9. Copie para /data/rpcs3/custom_configs/config_<ID>.yml um YAML do PC
+   com "Exit RPCS3 when process finishes: true" e "Multithreaded RSX:
+   true": no boot, startup.log "console limit: 'Exit RPCS3 when process
+   finishes' = 'false' (was 'true'): ..." e "console limit:
+   'Multithreaded RSX' = 'false' (was 'true'): ..."; sair do jogo volta
+   para a XMB, como sempre.
+J10. Abra no RPCS3 de PC um config_<ID>.yml salvo pelo PS4: carrega sem
+   erro (as linhas "PS4 ..." são ignoradas).
+J11. Menu do botão PS dentro do jogo (Options + Touchpad) > mude o
+   volume > Quadrado (Salvar): startup.log "home menu: saved 1 live
+   setting(s) for <ID> (..., settings format 2, 1 pin(s)): Audio >
+   Master Volume" (com um arquivo antigo: "settings format 1, full
+   dump") e o aviso "Ajustes do menu do jogo salvos para <ID> (1)"; num
+   jogo sem arquivo antigo, o config_<ID>.yml não tem "VRAM allocation
+   limit", "Internet enabled" nem "Max LLVM Compile Threads".
+J12. XMB em inglês, sem pendrive: na coluna Rede, a linha "No external
+   drive or USB drive connected" mostra a ajuda em duas linhas (nada
+   cortado na direita).
+
+==========================================================================
+NOVIDADES DA 0.37
+==========================================================================
+1. Congelamentos do tipo do Mortal Kombat (todos os jogos): quando uma
+   thread do jogo precisa esperar uma trava interna do emulador (áudio,
+   controles, PlayStation Move, voz, memória, SPU), ela agora "sai da
+   fila" do escalonador antes de esperar, como o RPCS3 já faz em outros
+   lugares. Era o congelamento do Mortal Kombat Komplete na intro.
+   - startup.log, uma vez por lugar: "HLE sync: lv2-aware wait in
+     <função> (lock 0x...)" (ex.: cellAudioGetPortBlockTag).
+   - Se ainda existir um lugar desse tipo, ele aparece sozinho: "HLE
+     sync: PPU '<nome>' parked by lv2 in <função> holding N host
+     lock(s)". A linha "guest sleeps" (60 s) ganhou "hle-sync: host
+     waits N (max X ms), detached M, parked-with-lock K".
+2. SPURS (God of War: Ascension e todos os jogos que usam SPURS): três
+   falhas do RPCS3 original no caminho que acorda os SPUs foram
+   corrigidas. A linha "SPU waits:" (60 s) ganhou "putllc16 notifies/s=",
+   "putllc16 rsx stale rejected=" e "rsx touch woke/s=".
+   - A cópia de volta da GPU (readback) ficou mais barata: o dma.flag
+     vem com trace=off por padrão ("DMA flags: ... trace=off (defaults,
+     no dma.flag)"); trace=on continua disponível.
+   - Cada readback mede as etapas: "DMA: readback #N ... X ms (request
+     A, drain B, copy C, swap D) SPUn ls=0x...".
+   - Ainda é INCERTO se o GoW passa do logo: o teste 2 diz.
+3. Configuração igual à do RPCS3 de PC
+   - Shaders "Async Recompiler with Shader Interpreter" (o padrão do PC):
+     enquanto um shader compila, a cena é desenhada pelo intérprete em
+     vez de perder desenhos (a piscada da primeira cena). "pipelines:
+     skipped draws=" deve ficar em 0. O preparo do intérprete é medido:
+     "Vulkan: interpreter variants ready in N ms (M pipelines)".
+     shader-interpreter-lazy.flag pula esse preparo (cada variante liga
+     no primeiro uso: "Vulkan: interpreter variant 0x... linked in N ms
+     (first use)"). shader-skip-draws.flag volta ao jeito da 0.36.
+   - ZCULL com os valores do PC ("Relaxed ZCULL Sync: false", "Accurate
+     ZCULL stats: true" no RPCS3.log). zcull-relaxed.flag volta aos
+     valores da 0.36 em todos os jogos. O banco de ajustes do PC continua
+     decidindo por jogo.
+   - Ajustes salvos por versões antigas (0.36 ou antes): os valores que a
+     configuração antiga forçava (Shader Mode, Relaxed ZCULL Sync,
+     Accurate ZCULL stats) passam para o valor atual uma vez, só se você
+     não tinha mudado: "profile: '<ajuste>' saved by automatic profile
+     <=36 ('<antigo>') -> 37 ('<novo>')". Salvar no menu grava "PS4
+     automatic profile: 37".
+   - config_database.dat: o pacote pode trazer uma cópia (só se a
+     licença for aprovada); com as duas, vale a mais nova. startup.log
+     "config database: ..." e, por jogo, "config database: applied
+     <SERIAL> (N keys)".
+   - Jogos do banco que pediam a espera ativa pura do SPU ficam com o
+     limite do console: "console limit: 'Disable SPU GETLLAR Spin
+     Optimization' = 'false' ...".
+   - Sonic & SEGA All-Stars Racing liga Write Color Buffers como no PC
+     (corrige gráficos; pode custar FPS).
+4. Timer de alta resolução ligado por padrão (era o hr-wait.flag da
+   0.36): esperas curtas mais precisas e menos CPU girando à toa. Só
+   liga se o teste do início passar: "hr wait: on (default;
+   no-hr-wait.flag disables)". no-hr-wait.flag desliga.
+5. GPU emulada mais rápida, sem mudar o que o jogo vê:
+   - cópias de vértices de 16 KB ou mais numa thread auxiliar, só em
+     jogos sem Write Color Buffers, Write Depth Buffer, Read Color
+     Buffers, Read Depth Buffer e Strict Rendering: "RSX: vertex copies
+     of 16 KiB or more run on 'RSX copy worker' (bounded ring 1024,
+     help-on-sync; rsx-copy-worker-off.flag disables)" e, a cada 10 s,
+     "copies: worker KiB/frame=A inline KiB/frame=B helped=H sync wait
+     us/frame=W ring full=F". rsx-copy-worker-off.flag desliga;
+     rsx-copy-worker-min-kib.txt muda o tamanho mínimo (padrão 16);
+   - índices com "primitive restart" usam SSE4.1 ("index: simd N,
+     skip-restart S, expand E");
+   - espera ociosa curta (50 µs com o timer HR): "idle sleeps=N (T us)";
+   - medições novas: "radv us/frame=N" e "xform KiB/frame=full A reloc B";
+   - espera de semáforo no máximo 10 s, mesmo com compilação andando
+     (antes até 60 s); sem compilação andando, 3 s (padrão): "RSX:
+     semaphore 0x... TIMED OUT after N ms (compile extension M ms)".
+6. Compilação SPU sem trabalho jogado fora: o texto do código SPU só é
+   montado quando alguém vai ler (estimativa, a medir: boot 2 a 15 s mais
+   rápido em jogos com muito SPU). Compare "SPU cache: compile N
+   programs" com "SPU cache: workers finished".
+7. Patches
+   - "Baixar patches do RPCS3": o erro "curl 27" vinha de uma função que
+     não existe no PS4 (eventfd); o curl agora usa o modo sem bloqueio
+     que o PS4 aceita (SO_NBIO 0x1200) e não usa IPv6.
+   - Teste da conexão segura ao abrir, sem internet (de 127.0.0.1 para
+     127.0.0.1): "TLS self-test: ... -> TLS OK (no internet used)". Se
+     falhar, a linha diz em qual passo e o item de download diz
+     "Download indisponível". Precisa da data e hora do PS4 certas.
+   - Certificados raiz completos: 148 da Mozilla (antes 13).
+   - Mensagens de erro do download em português; no startup.log a
+     linha "patches: download: curl N '...'" traz a versão do curl.
+   - Importar lê também os pendrives 1 a 8, /data/rpcs3/patch.yml
+     (e imported_patch.yml, <TITLE_ID>_patch.yml) e confere o que já
+     está em /data/rpcs3/patches. Resultado sempre no startup.log:
+     "patches: import result: <frase> | scanned: <lugares>".
+8. Pastas para o FTP: ao abrir, o emulador cria e libera (0777) games,
+   pkgs, raps, import, patches, custom_configs, data, data/redump,
+   data/disc-lock e exdata ("folders: 10 ready for FTP (0777): ...").
+   Pastas e arquivos
+   novos criados pelo emulador também aceitam o FTP (o FileZilla pode
+   sobrescrever).
+9. Instalador de PKG
+   - Update que pede uma versão que você não tem: tela "Instalar update
+     fora de ordem?" (X instala, Círculo cancela). Se o disco for
+     exatamente a versão pedida, instala sem perguntar. startup.log
+     "PKG installer: '...' is update v01.12 of BCUS98232 and needs
+     v01.11; dev_hdd0: nothing installed; base game: '...' v01.00
+     (library)" e "PKG installer: install over a missing v01.11
+     confirmed with X (disc v01.00)". Para desfazer: apague
+     /data/rpcs3/dev_hdd0/game/<TITLE_ID> pelo FTP.
+   - PKG ainda sendo copiado: X avisa e não instala ("XMB: '...' not
+     installed: incomplete file, N of M bytes, last write S s ago (still
+     copying)"); a lista atualiza sozinha quando a cópia termina
+     ("library change: PKG complete: ...").
+   - Tela de resumo depois de instalar: "PKG installed: update v01.12 of
+     BCUS98232 ... now boots v01.12; license: not needed".
+10. Diagnóstico: o STALL mostra as travas de cada thread PPU ("holds
+    [0x..] waits 0x.."), os donos das travas de memória ("STALL vm:
+    passive owners ..."), as linhas SPURS em hexadecimal ("STALL SPURS
+    0x... line0: ..."); detector "RSX kick 0x...: waiters=N, SPU readback
+    in flight=1 (SPUn since N ms)"; linha "memory: direct N MiB
+    (sceKernelGetDirectMemorySize), flexible avail M MiB".
+11. Modo PS4 Pro ("Neo") NÃO entra na 0.37: o driver de vídeo descreve a
+    GPU do PS4 comum e o modo Pro não tem volta dentro do aplicativo. No
+    Pro, o Modo Turbo (Boost Mode) continua sendo o maior ganho.
+12. Disco de PS3 no leitor do PS4 (como no PC, sem passo manual de
+    .dkey). O emulador lê o leitor só pelo servidor FTP do próprio
+    GoldHEN (127.0.0.1:2121; /data/rpcs3/disc-ftp.txt muda o endereço) e
+    só lê: o disco nunca é gravado. O disco é copiado uma vez para
+    /data/rpcs3/games/<TITLE_ID> - <Nome>.iso e depois abre como ISO.
+    - Coluna Jogo: "Disco de PS3: <Nome> (<TITLE_ID>)" enquanto há um
+      disco de PS3 no leitor, ou "Disco de PS3: ligue o FTP do GoldHEN"
+      quando o FTP está desligado. Coluna Rede: a linha do leitor
+      (vazio, não é de PS3, ligue o FTP).
+    - startup.log ao colocar o disco: "disc stream: drive: PS3 disc
+      BLES01876 'FIFA 14', 4 plain regions, 10128.0 MiB; key ... missing
+      (127.0.0.1:2121, GoldHEN FTP server v2.2)".
+    - Chave automática (base de IRDs que o PS3 Disc Dumper do PC usa, ou
+      USB:/ird e USB:/redump): "XMB: PS3 disc BLES01876 in the drive: key
+      search started", "disc key: IRD 1/3 '...': ... key a84b6c01
+      verified OK", "disc key: result: Chave do disco obtida
+      automaticamente | IRD database; saved
+      /data/rpcs3/data/redump/BLES01876.dkey (key check a84b6c01, ...)".
+      A chave nunca aparece no log, só a conferência (a84b6c01).
+    - X na linha: tela "Instalar o disco no PS4 (~10,6 GB, ~N min). O
+      disco nunca é alterado." com a chave e o espaço livre. X instala;
+      sem chave a tela explica e oferece "X: instalar sem a chave".
+      startup.log "XMB: PS3 disc BLES01876 'FIFA 14': install confirmed
+      with X (key ready; ...)", "disc install: start: ...", "disc
+      install: free ..., decrypting with the key from ...", a cada 30 s
+      "disc install: N MiB of 10128.0 MiB (P%), R MiB/s, about S s left",
+      no fim "disc install: copied: ...", "disc install: verify: ...",
+      "disc install: done: /data/rpcs3/games/BLES01876 - FIFA 14.iso
+      (decrypted, plays without a key)" e "XMB: PS3 disc install of
+      BLES01876 ended: done (...)".
+    - Círculo durante a cópia pergunta; Círculo de novo cancela (na 0.38:
+      X = Sim cancela, Círculo = Não continua): "XMB:
+      PS3 disc install cancel confirmed with Circle", "disc install:
+      cancelled at ...", "disc install: kept N MiB of M MiB in ....part
+      for the next install". X de novo na linha: "disc install: resume: N
+      MiB of M MiB already written; the copy restarts at LBA 0x... and
+      compares what is already in the file first". Passando de 2 GiB,
+      uma vez: "disc install: the server refuses to start a transfer at
+      an offset with bit 31 set (550 ...)" (limite do FTP do GoldHEN,
+      contornado sozinho).
+    - Nenhum jogo abre durante a instalação ("Aguarde a instalação do
+      disco terminar"). "Sair do RPCS3" pede X duas vezes.
+    - Depois de instalado, X na linha do disco abre a ISO: "XMB: PS3 disc
+      BLES01876: booting the image installed from it ('...')".
+13. Cadeado do disco: um jogo instalado do disco (item 12) só abre com um
+    disco desse jogo no leitor, como no PS3.
+    - Sem o disco, o ícone fica apagado com um cadeado no meio (o cadeado
+      do próprio firmware do PS3 instalado; sem ele, um desenhado pelo
+      emulador) e o subtítulo diz "precisa do disco no leitor".
+      startup.log: "disc lock: padlock icon: tex_lock_icon from the
+      firmware (explore_plugin_full.rco)".
+    - A instalação grava o registro
+      /data/rpcs3/data/disc-lock/<TITLE_ID>.txt antes de dar o nome
+      final à ISO: "disc install: lock record
+      /data/rpcs3/data/disc-lock/BLES01876.txt (identity ..., fingerprint
+      ...)". Quem tem registro: "disc lock: registry: 1 game(s) installed
+      from disc (BLES01876 10128 MiB)".
+    - Disco no leitor: o cadeado sai ("disc lock: BLES01876 'FIFA 14':
+      unlocked (disc in the drive: exact)"). Tirado: o cadeado volta em
+      até 1 minuto ("locked (no disc in the drive)").
+    - X com o cadeado: "Verificando o disco..." e, sem o disco, a tela
+      "Coloque o disco do jogo no PS4" com o motivo (leitor vazio, disco de
+      outro jogo com o nome dele, FTP do GoldHEN desligado). Colocando o
+      disco com a tela aberta: "Disco reconhecido!" e X abre o jogo.
+      Círculo volta e a XMB diz "Insira o disco do jogo "FIFA 14" no PS4
+      para jogar.".
+    - Serve qualquer disco do mesmo jogo (outra tiragem com o mesmo
+      TITLE_ID também abre: "same TITLE_ID, another pressing"). Na 0.37 o
+      disco era conferido só ao abrir o jogo; na 0.38 tirar o disco
+      durante o jogo fecha o jogo (TESTE NO CONSOLE DA 0.38, item 1).
+    - ISO, pastas e PKG colocados de outro jeito nunca pedem disco (a não
+      ser uma ISO igual à instalada: mesmo TITLE_ID e mesmo tamanho).
+      0.39: só a própria imagem instalada (mesmo caminho e tamanho) pede
+      o disco; qualquer outra ISO abre sem disco (NOVIDADES DA 0.39,
+      item 2).
+
+==========================================================================
+TESTE NO CONSOLE DA 0.38
+==========================================================================
+Envie de cada teste: /data/rpcs3/startup.log, RPCS3.log (e
+RPCS3.part*.log) e mesa.log de /data/rpcs3/log, e /data/rpcs3/fatal.txt
+se ele existir. Um jogo por abertura do aplicativo, a não ser onde o
+teste pede dois. Nenhum teste deve acabar em "Erro no emulador" nem
+criar o fatal.txt.
+0. Abrir o aplicativo sem jogo. startup.log:
+   - "orbis: mem ledger: query rc=0x00000000, N entries, free X KiB,
+     largest Y KiB, ... - ledger ON (kernel walk)": o emulador mede a
+     memória direta livre do PS4. Se vier "ledger ESTIMATED: ..." no
+     lugar, anote: o console não respondeu à consulta e o emulador usa
+     uma estimativa.
+   - "orbis: mem mmap-direct: placement top of the pool (...),
+     small-heap/large segregation on (...)" (onde o heap pega memória) e
+     "orbis: mem mmap-direct [boot]: cap ..., ladder on, trim on, ...".
+   - "XMB dialogs: firmware images (system_plugin.rco)": as janelas usam
+     as imagens do firmware do PS3 instalado. Sem firmware do PS3:
+     "XMB dialogs: drawn stand-ins for ..." (desenhos do emulador).
+1. (0.39: tirar o disco PAUSA o jogo em vez de fechar; veja o teste 28
+   da 0.39.)
+   Disco tirado durante o jogo (muda o teste 15(g) da 0.37). Use o FIFA
+   14 (BLES01876) instalado do disco, com o FTP do GoldHEN ligado.
+   (a) Abra o FIFA 14 com o disco no leitor. startup.log: "disc lock:
+       watching the drive while '...' runs (FIFA 14 (BLES01876)): a check
+       every 3 s; two checks without its disc close the game".
+   (b) Jogando, aperte o botão de ejetar do PS4 e tire o disco. Em poucos
+       segundos o jogo fecha sozinho e a XMB volta com a janela "O disco
+       foi removido." (X fecha); o FIFA 14 fica com o cadeado.
+       startup.log: "disc lock: BLES01876 not in the drive (...): the
+       next check decides", depois "disc lock: FIFA 14 (BLES01876): disc
+       removed during the game (...; 2 checks N ms apart): returning to
+       the XMB", "shutdown: request original RPCS3 graceful stop", "disc
+       lock: watch of BLES01876 ended (back to the XMB; ...)" e "XMB: the
+       disc-removed notice is shown as a system dialog". Anote quantos
+       segundos levou do ejetar até a XMB.
+   (c) Ponha o disco: o cadeado sai e X abre o jogo de novo.
+   (d) Ejete e ponha o disco de volta o mais rápido que der. Anote se o
+       jogo continuou ("disc lock: BLES01876 is in the drive again ...:
+       the game goes on") ou fechou: as duas coisas estão certas, ele só
+       continua se o leitor já ler o disco na verificação seguinte.
+   (e) Com o jogo pausado (botão PS, tela inicial do PS4), tire o disco e
+       volte para o aplicativo: o jogo já fechou e a XMB mostra o aviso.
+   (f) Desligue o FTP do GoldHEN durante o jogo: o jogo NÃO fecha
+       ("disc lock: drive check without an answer about the disc (FTP
+       server off ...): not counted"). Ligue o FTP e tire o disco: fecha.
+   (g) Um jogo que não veio do disco (ISO pelo FileZilla, pasta, PKG):
+       tirar ou pôr discos nunca fecha o jogo (não aparece "watching the
+       drive").
+   (h) Deixe o FIFA 14 rodando 30 min com o disco: o jogo não fecha
+       sozinho e não aparece "disc stream: last ..." a cada 30 s.
+2. Memória da compilação SPU (FIFA 14 BLES01876: na 0.37 ele fechou com
+   a memória esgotada no meio dela). Apague pelo FTP os arquivos spu-*.dat
+   da pasta do FIFA dentro de /data/rpcs3/cache (o resto do cache pode
+   ficar) e abra o FIFA 14 até o menu.
+   - startup.log: "SPU memory: cache build start: N program(s), W
+     worker(s), compilers recycled after 256 program(s) or 8 MiB of
+     code; heap live ...", a cada 60 s "SPU memory: cache build K
+     program(s) in S s, R compiler(s) recycled; heap live X MiB ..." (o
+     X deve ficar quase parado) e no fim "SPU memory: cache build done
+     in S s: ... heap live A -> B MiB (peak P) ...". Anote S e P.
+   - Passou: nenhum "CAP REACHED", "heap critical" ou "Erro no
+     emulador" durante a compilação; P abaixo de uns 1200 MiB.
+   - Se a memória apertar mesmo assim: "SPU memory: cache build ends
+     early after K program(s): ..." (o resto compila durante o jogo) ou
+     "SPU memory: no JIT memory for program 0x...": o jogo continua.
+   - Volte para a XMB (L1 + R1 + Triângulo): "SPU memory: after the
+     stop: ... 0 LLVM compiler(s) still alive; heap live ..." e "orbis:
+     mem mmap-direct: trim returned N KiB in M carve-out(s) ..." (a
+     memória que o jogo largou volta para o PS4). Abra o FIFA 14 de novo
+     sem fechar o aplicativo: ele abre, e as linhas "orbis: mem
+     mmap-direct" não têm "REFUSED". Anote quanto tempo levou do X até o
+     menu nas duas vezes.
+   - Se aparecer o aviso "RPCS3: memória JIT esgotada, parte do código
+     SPU roda em modo interpretado (lento). Salve o jogo e reinicie o
+     aplicativo.": o jogo continua, mais lento (startup.log "SPU memory:
+     block 0x... has no code (no JIT memory): run by the interpreter
+     ..."). Salve, feche pelo botão PS e abra de novo; mande os logs.
+   - Opcional (simula a falta de memória JIT): crie pelo FTP o arquivo
+     /data/rpcs3/test-jit-cap-mib.txt com o número 160 e abra o FIFA 14
+     com os spu-*.dat apagados. startup.log: "JIT memory: test cap of
+     160 MiB ...", "JIT memory: commit of N KiB ... refused (errno 12,
+     test cap) ...", depois "SPU memory: cache build ends early after K
+     program(s): ..." ou "SPU memory: no JIT memory for program 0x...",
+     e pode vir o aviso acima com "SPU memory: block 0x... has no code
+     (no JIT memory): run by the interpreter up to 0x... (I
+     instruction(s); ...)". Passou: o jogo chega ao menu (lento), o I
+     dessas linhas fica nas centenas ou milhares (não 1 a 5) e nenhum
+     "Erro no emulador". APAGUE o arquivo depois do teste.
+3. Depois de um erro no emulador (só se algum teste acabar em "Erro no
+   emulador: ..."): volte para a XMB e aperte X em qualquer jogo. O jogo
+   NÃO abre; a XMB mostra a janela "Ocorreu um erro no emulador." com
+   "Para jogar de novo, feche o aplicativo pelo botão PS e abra-o outra
+   vez." (X OK; a linha de baixo da XMB repete o texto) e o startup.log
+   "lifecycle: boot of '...' refused: a thread ended in a fatal error in
+   this process; the XMB asks to close and reopen the application" e
+   "XMB: the emulator-error notice is shown as a system dialog". A XMB
+   continua funcionando (PKG, configurações, Sair). A janela também diz
+   "<jogo> abre sozinho quando o RPCS3 for aberto de novo." (startup.log
+   "lifecycle: wrote '...' in boot-next.txt for the next start"). Feche
+   pelo botão PS > Fechar aplicativo e abra de novo: aparece a janela "O
+   RPCS3 foi aberto de novo para jogar este jogo." com uma barra que
+   enche em 5 s, e o jogo abre sozinho (veja o teste 9).
+4. Janelas de sistema do PS3 (todas as telas de instalação, de disco, de
+   update e os avisos). Compare com o PS3: faixa escura no meio da tela
+   com uma linha clara em cima e outra embaixo, texto centralizado, barra
+   prateada com a porcentagem à esquerda e o tempo restante à direita,
+   os botões X, Círculo e Quadrado desenhados como no PS3, as ondas da
+   XMB atrás. Nenhum contador de FPS do emulador (um "FPS: ..." é o do
+   GoldHEN: desligue a opção de FPS no menu do GoldHEN). Fotografe as
+   janelas e mande junto com o startup.log.
+   (a) PKG de jogo ou DLC: o nome do jogo, "Instalando..." ("(i/n)" com
+       vários pacotes), "N MB de M GB", a barra com a porcentagem e
+       "Tempo restante: cerca de N min", Círculo Cancelar
+       ("Cancelando..."); no fim "A instalação foi concluída." (X OK).
+   (b) Update fora de ordem (o 01.12 do GoW, se ainda não estiver
+       instalado): "Deseja instalar mesmo assim?" X Sim, Círculo Não
+       (Não: nada instalado).
+   (c) Um PKG que falha (um PKG de PS4, ou sem espaço): "Não foi possível
+       concluir a instalação." com o motivo (X OK, ou some sozinha em
+       20 s); depois a linha de baixo da XMB repete o motivo.
+   (d) Disco de PS3 no leitor: X na linha: "Deseja instalar este disco no
+       PS4?" com o ícone do disco; X Instalar abre a janela da cópia
+       ("Lendo o disco...", "Copiando o disco..." com a barra e os MB/s,
+       "Conferindo a imagem copiada..."). X volta para a XMB (a cópia
+       continua); X na linha do disco abre a janela de novo. Círculo
+       pergunta "Deseja cancelar a instalação do disco?": Círculo (Não)
+       continua; X (Sim) cancela (startup.log "XMB: PS3 disc install
+       cancel confirmed on the copy screen" ou "... confirmed with X").
+   (e) Cadeado (jogo instalado do disco, sem o disco): X: "Verificando o
+       disco...", depois "Coloque o disco deste jogo no leitor do PS4."
+       com o motivo; ponha o disco: "Disco reconhecido." X Jogar.
+   (f) Firmware do PS3 (PS3UPDAT.PUP no pendrive; reinstalar a mesma
+       versão serve): "Deseja instalar o firmware 4.93?" X Sim, Círculo
+       Não; durante a instalação a barra, "Pacote i de n" e "Não desligue
+       o sistema."; Círculo pergunta se quer cancelar (Não continua); no
+       fim "A instalação foi concluída.".
+   (g) Teste 1(b): a janela "O disco foi removido.".
+   (h) Teste 3 (só se houver um erro no emulador): a janela "Ocorreu um
+       erro no emulador.".
+5. Shaders (Wolverine BLUS30268, depois FIFA 14). startup.log: "Vulkan:
+   interpreter preload skipped (default); variants link on first use
+   ..." (na 0.37 o FIFA passou 87 min nessa etapa antes do jogo),
+   "Vulkan: shader interpreter variants link on first use,
+   asynchronously in their generic form ...; at most N pipelines kept,
+   least recently used released ...", "Vulkan: pipelines are created
+   without an application VkPipelineCache ...". Jogando: "Vulkan:
+   interpreter variant 0x... linked in N ms (first use, ...)" e, quando
+   passar do limite, "Vulkan: interpreter pipelines live N (cap M),
+   released K least recently used ...". Anote o tempo do X até a primeira
+   imagem do jogo e se alguma cena nova sumiu ou piscou. A cada 10 s a
+   linha "Vulkan backend" traz "pipelines live L (...); interpreter
+   pipelines live n (...)" e, só se acontecer, "draws skipped=N not
+   ready, M descriptor set refused": desenhos pulados por falta de
+   memória (a imagem segue sem eles; o jogo não fecha). Com a memória
+   apertada aparece "RSX: memory pressure (...)": o emulador guarda menos
+   pipelines até a memória voltar.
+6. Memória de vídeo (Wolverine 30 min, no mesmo lugar da 0.37).
+   startup.log: "PS4 VRAM: window meter on (orbis-drm VA list, ...):
+   window N MiB, mapped M MiB, largest free range L MiB; ...", "PS4
+   VRAM: emergency reserve of N MiB held in the GPU window ...", "PS4
+   RSX: rings attrib ..." e, com as linhas VRAM de sempre, "VRAM: window
+   used A of B MiB (allocator C, RADV and other D), largest free range
+   E MiB; reserve ...; dma ... MiB (blocks released ...); ...". Podem
+   aparecer "VRAM: age-based eviction #N: ..." e "DMA: released N idle
+   mirror block(s) ...": é memória sendo devolvida. Passou: nenhum
+   "required allocation ... failed" e nenhum "Erro no emulador". Se a
+   memória de vídeo acabar mesmo assim, o jogo fecha e volta para a XMB
+   (aviso "RPCS3: memória de vídeo esgotada. O jogo será fechado e você
+   volta ao menu.") em vez de travar, e a XMB mostra a janela "A memória
+   de vídeo se esgotou e o jogo foi fechado." (startup.log "lifecycle:
+   the renderer asked to stop the game (GPU window): ..." e "XMB: the
+   out-of-memory stop notice is shown as a system dialog"): mande os
+   logs.
+7. Vídeos, fontes, patches e savestate.
+   (a) Um jogo com vídeos (a abertura do FIFA 14 ou do GoW): startup.log
+       "VDEC: picture queue A -> B pictures (handle=0x..., memSize ...)";
+       os vídeos tocam como na 0.37.
+   (b) JoJo Eyes of Heaven (BLJS10318) ou outro jogo em japonês, na lista
+       de saves ou numa mensagem: "fonts: pages N ..." com o N parando de
+       crescer; ao voltar para a XMB "fonts: pages ... released at the
+       overlay teardown (...)". Abra de novo: o N não passa do anterior.
+   (c) Com o patch.yml importado, um jogo com patches: na primeira
+       abertura "patches: per-title extract for <TITLE_ID> written (N
+       patch(es), M entries): ..."; na segunda "patches: per-title
+       extract for <TITLE_ID> parsed instead of the patch files (...)".
+   (d) Savestate (se você usa): salvar e carregar funcionam como na 0.37
+       (agora com uma thread só; o arquivo fica um pouco maior).
+8. Orçamento de memória (todos os testes acima mostram estas linhas).
+   startup.log:
+   - "budget: direct 4608 = sys S + heap H/C (live L: small ..., large
+     ...; fb 0) + guest G/1024 + jit J/640 + stacks K/64 + gpu+other O |
+     free F (largest ...) reserve R | flex ... | window ... | level N
+     room M slope ... | shed ... | compiles admitted ... MiB (... waited)"
+     ao abrir o aplicativo, a cada 60 s, no fim de cada etapa da abertura,
+     ao voltar para a XMB e quando o nível muda. Cada parte do emulador
+     tem um teto; o heap (C) fica com o que sobra. Anote C, L e o maior N
+     de cada jogo. Se vier "(ledger estimated)", o PS4 não respondeu à
+     consulta de memória (veja o teste 0).
+   - Passou: "free F" sempre maior ou igual a "reserve R" (fora alguns
+     segundos), N quase sempre 0 ou 1, nenhum "Erro no emulador".
+   - Quando a memória aperta: "memory governor: heap pressure 0 -> 1
+     (...): compiles serialized, no optional workers" (compila mais
+     devagar), "... -> 2 (...): compiles wait between programs, level-2
+     shedders and heap trim, save notice" com o aviso "RPCS3: memória do
+     emulador baixa. Salve o jogo; ..." e "shed: heap trim (...) freed N
+     MiB at level 2". O nível 3 mostra o aviso "Memória do emulador quase
+     esgotada: salve o jogo agora e reinicie o aplicativo depois": salve
+     e mande os logs. O nível desce sozinho quando a memória volta
+     ("... pressure 2 -> 1").
+   - Ao voltar para a XMB: "memory record of <TITLE_ID>: this session
+     heap +N MiB over M at boot, jit ..., guest ..., window ..., max
+     level ...; kept 'mem heap=...'" (o quanto o jogo precisou; fica em
+     /data/rpcs3/adapt/<TITLE_ID>.mem) e "heap reserve: 1 x 48 MiB taken
+     ..." quando a reserva foi usada e pega de novo.
+   - Teste forçado (opcional, FIFA 14): crie /data/rpcs3/test-heap-cap-
+     mib.txt com 1024 e abra o FIFA 14. startup.log: "health: TEST heap
+     cap 1024 MiB ...", depois níveis 1 e 2, linhas "shed:" e
+     compilações mais lentas, sem "Erro no emulador". APAGUE o arquivo
+     depois do teste.
+9. Trocar de jogo sem fechar o aplicativo (Wolverine 15 min, volte para a
+   XMB com L1 + R1 + Triângulo, abra o FIFA 14).
+   - startup.log: "lifecycle: pre-boot memory check of '...' (BLES01876):
+     heap room N MiB, needs M MiB (...)". Se M couber em N, o FIFA abre.
+   - Se não couber (ou depois de uma GPU perdida, do nível 3 de memória
+     ou de um jogo que não terminou de fechar; depois de um erro no
+     emulador vale o teste 3): o FIFA NÃO abre e aparece a janela "Para
+     jogar, feche o RPCS3 e abra de novo." com o motivo, "<nome do arquivo
+     do jogo, ex.: BLES01876 - FIFA 14> abre sozinho quando o RPCS3 for
+     aberto de novo." e como fechar o aplicativo (X OK). startup.log:
+     "lifecycle: boot of '...' refused by the clean-process rule (...)",
+     "lifecycle: wrote '...' in boot-next.txt for the next start" e "XMB:
+     the close-and-reopen request of the clean-process rule is shown as a
+     system dialog".
+   - Feche pelo botão PS > Fechar aplicativo e abra de novo: a janela "O
+     RPCS3 foi aberto de novo para jogar este jogo." com a barra de 5 s;
+     o jogo abre sozinho quando a barra enche (X abre na hora, Círculo
+     cancela e fica na XMB). startup.log: "lifecycle: boot-next.txt:
+     '...' boots after a 5 s countdown (X now, Circle cancels)", "XMB:
+     boot-next countdown ... shown as a system dialog" e "XMB: boot-next
+     countdown ended; booting" (ou "... X pressed, booting now" / "...
+     cancelled with Circle"). Abrir o aplicativo de novo depois disso não
+     repete a contagem.
+   - Para testar sem a regra: /data/rpcs3/boot-dirty.flag (startup.log
+     "lifecycle: boot-dirty.flag present: the clean-process rule is
+     off"). Apague depois.
+10. Segunda abertura rápida (cache dos objetos SPU). FIFA 14: abra uma vez
+   até o menu, feche pelo botão PS, abra de novo até o menu.
+   - startup.log das duas vezes: "SPU objcache: fp=... stamp=...
+     pack=spu-obj-v1-....pack: N records (M MiB), index in T ms" (na
+     primeira "; new pack") e, no fim do "Building SPU Cache", "SPU
+     cache: workers finished; built=..., failure=0; objects loaded=A
+     compiled=B stored=C rejected=0 (...)". Primeira vez: loaded=0 e
+     compiled = stored. Segunda vez: loaded = o número de programas e
+     compiled perto de 0. Ao voltar para a XMB: "SPU objcache: ...
+     closed (...)". Também "PPU cache: N repeated check(s) of unchanged
+     modules skipped (...)".
+   - Anote o tempo do X até o menu nas duas vezes: a segunda deve ser bem
+     mais curta.
+   - Se algo der errado no jogo só com o cache (gráfico ou som estranho
+     que a 0.37 não tinha): crie /data/rpcs3/no-spu-object-cache.flag e
+     abra de novo (startup.log "SPU objcache: off (...)"; tudo compila
+     como na 0.37). Para conferir o cache sem usá-lo:
+     spu-objcache-verify.flag ("verify same=N diff=0" no fim; diff acima
+     de 0 = mande os logs). Mais opções na lista de arquivos (fim deste
+     documento).
+11. Linhas de memória que todo teste mostra (só conferir):
+   - "required modules and RPCS3 log ready; log: message store released
+     (early messages written to RPCS3.log)": o log não guarda mais as
+     mensagens na memória (o FIFA 14 juntava 36 MB em 2,6 h).
+   - "PS4 stacks: ...; N live of 32 (peak P), ..., X MiB direct held,
+     ...": pilhas de threads do emulador, no máximo 32 (128 com
+     own-stacks.flag).
+
+==========================================================================
+TESTE NO CONSOLE DA 0.37 (nesta ordem)
+==========================================================================
+Envie de cada teste: /data/rpcs3/startup.log, e RPCS3.log (e
+RPCS3.part*.log) e mesa.log de /data/rpcs3/log. Se o aplicativo fechar
+sozinho, envie também /data/orbis-abort.log e /data/tempest-vkloader.log
+(direto em /data). Um jogo por abertura do aplicativo; para comparar
+FPS, use o mesmo save e o mesmo lugar. Mude um arquivo de opção por vez
+e apague o arquivo depois.
+0. Abrir o aplicativo sem jogo. startup.log: "folders: 10 ready for FTP
+   (0777): games pkgs raps import patches custom_configs data data/redump
+   data/disc-lock exdata"; "TLS self-test: ... -> TLS OK (no internet
+   used)"; "hr wait:
+   on (default; no-hr-wait.flag disables)"; "memory: direct N MiB".
+1. Mortal Kombat Komplete (BLUS30902): passar da intro (NRINTROLOGO) e
+   entrar numa luta. startup.log: "HLE sync: lv2-aware wait in
+   cellAudioGetPortBlockTag"; "profile: 'Shader Mode' ..." (o MK tem
+   ajuste salvo); nenhum "STALL:"; a linha "guest sleeps" com "precise
+   usleeps=... spin=" bem menor que ~12,8 s por minuto. RPCS3.log: as
+   linhas AudioOut com "periods" perto de 1875 (não 0). Depois volte
+   para a XMB e feche: nenhum STALL com "in=cellPadEnd".
+2. God of War: Ascension (BCUS98232), do zero até a primeira luta.
+   Passou: nenhum "TIMED OUT 0x50300510". Se parar: espere 60 s e envie;
+   as linhas "DMA: readback #N ... ms (request, drain, copy, swap)",
+   "RSX kick ...: waiters=, SPU readback in flight=", "STALL SPURS ...
+   line0:" e "putllc16 rsx stale rejected=" na linha "SPU waits:" dizem
+   onde parou.
+3. Update 01.12 do God of War (PKG): (a) aperte X no PKG enquanto o
+   FileZilla ainda copia: a XMB diz "ainda copiando" e o startup.log
+   "still copying"; (b) quando a cópia terminar: "library change: PKG
+   complete: ..."; (c) X: aparece a pergunta; Círculo: "Instalação
+   cancelada: nada foi instalado"; X de novo e X na pergunta: progresso,
+   tela de resumo; (d) abra o GoW: RPCS3.log "SYS: Updates found at
+   /dev_hdd0/game/BCUS98232/". Se o jogo travar ou não abrir com o
+   update: apague /data/rpcs3/dev_hdd0/game/BCUS98232 pelo FTP.
+4. Wolverine (BLUS30268), 10 min no mesmo lugar da 0.36. startup.log:
+   "Vulkan: interpreter variants ready in N ms" (anote N);
+   "pipelines: skipped draws=0"; "copies: worker ... sync wait us/frame"
+   abaixo de 500; "idle sleeps=N (T us)" com T/N entre 160 e 250; "radv
+   us/frame"; FPS no mesmo lugar contra a 0.36. Repita uma vez com
+   shader-interpreter-lazy.flag e outra com rsx-copy-worker-off.flag.
+5. Demon's Souls (BLUS30443): startup.log "config database: ...
+   applied"; RPCS3.log "Relaxed ZCULL Sync: false"; o tempo entre "SPU
+   cache: compile N programs" e "SPU cache: workers finished" (0.36:
+   17,3 ms por programa); FPS em Boletaria contra a 0.36.
+6. Minecraft (BLUS31426): nenhuma trava da GPU emulada; menu e entrada
+   no mundo sem pausas de vários segundos. Se piorar: repita com
+   zcull-relaxed.flag.
+7. inFamous (BCUS98119): RPCS3.log "SPU XFloat Accuracy: Accurate", "SPU
+   Block Size: Mega", "Relaxed ZCULL Sync: true", "Accurate ZCULL stats:
+   false" (a entrada do PC dele) e "Multithreaded RSX: false" (limite do
+   console); as linhas "SPU waits:".
+8. Ben 10 (BLUS30663): abre como na 0.36 (OpenGL); nenhuma linha nova de
+   valor forçado.
+9. Terraria (sua cópia): 10 min jogando, nenhum STALL.
+10. Patches: depois do teste 0, "Baixar patches do RPCS3":
+    "patches: download: patch.yml replaced" ou "up to date" (ou um
+    "curl N '<mensagem>'" com mensagem). Envie um patch.yml pelo
+    FileZilla para /data/rpcs3/patches (deve aceitar); depois
+    "Importar patches de jogos": a frase na tela e "patches: import
+    result: ..." no startup.log.
+11. Testadores com PS4 Pro: WipEout HD Fury (BCES00664), Sonic & SEGA
+    All-Stars Racing (BLES00750), Silent Hill Downpour (BLUS30565),
+    Oddworld Stranger's Wrath HD, Lollipop Chainsaw (BLUS30917), JoJo
+    Eyes of Heaven, Blades of Time (BLUS30833): os valores do RPCS3.log
+    iguais aos da entrada do PC (WipEout e Sonic: Write Color Buffers:
+    true); FPS contra os logs da 0.35/0.36; "VDEC perf" igual.
+12. Testadores com PS4 Slim: Naughty Bear (BLUS30700), Minecraft, El
+    Chavo Kart (BLUS31198), Deception IV (BLUS31396), Lollipop Chainsaw,
+    UMvC3 (BLUS30787) e DMC4 (BLES00186): underruns do AudioOut contra os
+    logs anteriores; o pico de "PS4 threads:"; nenhuma recusa de thread
+    "CELL_EAGAIN" além da 0.36.
+13. Qualquer jogo, fechar pelo botão PS > Fechar aplicativo: nenhum
+    CE-34878-0.
+14. Disco de PS3 no leitor (FIFA 14 BLES01876 ou outro seu), com o FTP do
+    GoldHEN ligado, internet e uns 12 GB livres:
+    (a) FTP do GoldHEN desligado: a coluna Jogo mostra "Disco de PS3:
+        ligue o FTP do GoldHEN" (X diz onde ligar); ligue o FTP: em
+        poucos segundos a linha vira "Disco de PS3: FIFA 14 (BLES01876)".
+    (b) startup.log: "disc key: ... verified OK" e "disc key: result:
+        Chave do disco obtida automaticamente"; pelo FTP aparece
+        /data/rpcs3/data/redump/BLES01876.dkey (32 bytes).
+    (c) X na linha: a tela de instalação; X: progresso na linha de baixo.
+        Anote a velocidade ("disc install: ... MiB/s" a cada 30 s).
+    (d) Depois de uns 3 GB (passa dos 2 GiB): Círculo, Círculo. Feche e
+        abra o aplicativo, X na linha ("Continuar a instalação"), X: a
+        cópia continua ("disc install: resume: ..." e a linha do 550).
+    (e) No fim: "disc install: done: ... (decrypted, plays without a
+        key)"; o FIFA 14 aparece na lista como ISO e abre (RPCS3.log sem
+        erro de chave). X na linha do disco também abre.
+    (f) Opcional: sem internet e sem a .dkey (apague
+        /data/rpcs3/data/redump/BLES01876.dkey e os .ird de
+        /data/rpcs3/data/ird pelo FTP: o IRD baixado no teste (b) daria a
+        chave de novo, sem internet), tire e ponha o
+        disco: a linha diz "sem a chave do disco"; Quadrado na linha abre
+        a tela, que explica "Sem internet: ..." e o que fazer (Círculo
+        volta, nada é gravado).
+    Envie o startup.log inteiro. O disco só é lido (nada é gravado nele).
+15. Cadeado do disco (depois do teste 14, FIFA 14 instalado):
+    (a) startup.log da instalação: "disc install: lock record
+        /data/rpcs3/data/disc-lock/BLES01876.txt (...)" antes de "disc
+        install: done"; pelo FTP aparece esse arquivo (texto pequeno).
+    (b) Disco no leitor: o FIFA 14 da lista sem cadeado; startup.log
+        "disc lock: BLES01876 'FIFA 14': unlocked (disc in the drive:
+        exact)". X abre o jogo ("disc lock: '...': disc BLES01876 present
+        (exact, checked in N ms): booting").
+    (c) Volte para a XMB e tire o disco: em até 1 minuto aparece o
+        cadeado ("locked (no disc in the drive)"). X: tela "Coloque o
+        disco do jogo no PS4" com "Agora não há nenhum disco no leitor.".
+        Coloque o disco com a tela aberta: "Disco reconhecido!" ("disc
+        lock: disc BLES01876 inserted while the screen was shown"); X abre.
+    (d) Tire o disco e aperte X no FIFA logo em seguida (antes do
+        cadeado aparecer): "disc lock: X on '...' (BLES01876): checking
+        the drive" e depois a tela pedindo o disco (o jogo NÃO abre).
+    (e) Desligue o FTP do GoldHEN e aperte X: a tela diz que o FTP está
+        desligado e onde ligar; ligue o FTP com a tela aberta (botão PS >
+        Configurações > GoldHEN): a tela muda sozinha.
+    (f) Coloque o disco de outro jogo de PS3: a tela diz o nome dele; se
+        esse outro jogo também foi instalado do disco, ele perde o cadeado.
+    (g) Tire o disco no meio do jogo: na 0.37 o jogo continuava; na 0.38
+        ele fecha (TESTE NO CONSOLE DA 0.38, item 1). Na XMB o cadeado
+        volta.
+    (h) Uma ISO copiada pelo FileZilla de outro jogo: nunca tem cadeado.
+        startup.log: "disc lock: padlock icon: tex_lock_icon from the
+        firmware (explore_plugin_full.rco)".
+    (i) Logo depois de pôr o disco o emulador procura a chave e lê o
+        disco. Se X ficar em "O leitor está demorando para responder",
+        espere: o jogo abre quando a leitura acabar (startup.log "disc
+        lock: '...': the drive is busy with the disc key search: waiting
+        for it" e depois "disc key: search took N ms"). Anote o N.
+
+==========================================================================
+NOVIDADES DA 0.36
+==========================================================================
+1. Fechar pelo botão PS depois de jogar (CE-34878-0): uma thread pequena
+   ("GNM keepalive") avisa a GPU do PS4 (sceGnmSubmitDone) 0,5 s depois
+   que o emulador para de mandar trabalho para ela, de novo a cada 1 s
+   parado e a cada 250 ms enquanto o sistema pede para suspender. Sem
+   esse aviso o PS4 não conseguia suspender o aplicativo e o encerrava
+   (o KLog da 0.35 mostra "Can't suspend ... submitDone() is not called"
+   com a GPU parada, "busy:0"). no-gnm-keepalive.flag desliga.
+2. God of War: Ascension: enquanto a GPU emulada espera um semáforo que
+   o SPU vai escrever, os resultados de oclusão (ZCULL) pendentes são
+   mandados para a GPU e conferidos sem travar; se depois de 50 ms ainda
+   estiverem pendentes, são lidos à força. Era o círculo da 0.35: o SPU
+   só começava quando esse resultado chegava, e ele só era gravado
+   depois da espera. rsx-no-report-drain.flag desliga (só para
+   comparar: o GoW volta a travar).
+3. Memória de vídeo (o fechamento do Wolverine aos ~23 min): o anel de
+   vértices não salta mais de 64 para 128 MB: os quadros antigos são
+   liberados antes e, se ainda faltar espaço, ele cresce de 16 em 16 MB
+   (até 128 MB) ou espera a GPU ("ring ... grew" ou "recovered by hard
+   sync" no startup.log); a limpeza pesada de VRAM que não libera nada
+   fica 10 s sem rodar em vez de rodar a cada quadro; os descriptor pools
+   de programas da GPU parados há mais de 20 s são devolvidos.
+   ring-reclaim-off.flag e no-pool-release.flag desligam cada parte.
+4. Segundo jogo sem fechar o aplicativo (ex.: inFamous, XMB, Mortal
+   Kombat): o carregador do Vulkan usava a primeira instância, já
+   destruída, e o jogo fechava com SIGABRT. Agora usa a instância viva.
+5. Rede: o socket P2P não bloqueia mais, o accept do jogo não trava e um
+   teste no início ("network ABI: SO_NBIO ...") descobre se o PS4 deixa
+   os sockets sem bloqueio. Se deixar, o RPCN pode conectar pela
+   primeira vez.
+6. Diagnóstico:
+   - um abort() agora diz na linha "reason:" do fatal.txt quem chamou
+     (endereço no rpcs3_ps4.elf), a mensagem do assert antes dele e a
+     linha "FATAL" do /data/tempest-vkloader.log quando foi o carregador
+     do Vulkan;
+   - o STALL mostra o estado de cada SPURS ("STALL SPURS 0x...: wklFlag=
+     ... receiver=... readyCount[..]=... signal1=...");
+   - "GPU: a command buffer submitted N ms ago has not finished" avisa
+     uma GPU travada;
+   - as primeiras cópias de volta da GPU ficam no log ("DMA: readback
+     #N ...") e uma cópia com parâmetros impossíveis é recusada ("DMA:
+     rejected readbacks N").
+7. Opcional: hr-wait.flag usa o timer de alta resolução do PS4 nas
+   esperas curtas da GPU emulada e do jogo (~0,15 ms em vez de ~1 ms). Só
+   liga se o teste do início passar ("HR reuse ... -> reuse OK"); sem o
+   arquivo nada muda.
+8. Pequenos:
+   - a linha "health:" para de repetir "temperature unavailable" depois
+     que o sensor é dado como indisponível (veja TEMPERATURA);
+   - spu-mode.txt e port_probe.txt aparecem como "(inert)" na linha
+     "flags:": não fazem nada nesta versão, pode apagar;
+   - a thread de áudio tem nome ("PS4 AudioOut Thread" no RPCS3.log);
+   - o startup.log testa outras formas de ler o espaço livre ("ABI probe
+     free space:").
+9. Voltar do jogo para a XMB: aperte L1 + R1 + Triângulo juntos (até 0,3 s de
+   diferença entre eles) e segure 1 segundo
+   (L1 + R1 + Options por 2 segundos continua valendo).
+
+==========================================================================
+NOVIDADES DA 0.34 (XMB, biblioteca e instalador)
+==========================================================================
+1. PS4 Pro sem Modo Turbo: ao abrir o primeiro jogo aparece o aviso
+   "Ative o Modo Turbo (Boost Mode)..." (seção PS4 PRO: MODO TURBO).
+2. Licenças .rap: a cópia em exdata recebe o nome que o RPCS3 procura
+   (<CONTENT_ID>.rap), venha o nome do arquivo em maiúsculas ou
+   minúsculas; .rap numa subpasta (raps/Jogo/x.rap) também é lido;
+   arquivos .rif são ignorados (o RPCS3 só usa .rap).
+3. Instalador de PKG
+   - Mensagens que dizem o motivo: update fora de ordem (versão que ele
+     espera e a instalada), PKG de PS4, "Sem espaço em /data para este
+     PKG", sem permissão de gravação.
+   - PKG dividido em partes (NOME_00.pkg, NOME_01.pkg...): só a parte
+     _00 aparece na lista; ela instala o pacote todo.
+4. Biblioteca
+   - Um jogo copiado direto em games/ (ou USB:/GAMES) não esconde mais os
+     outros jogos da pasta; ele aparece com "copiado direto na pasta:
+     mova para uma subpasta".
+   - Pasta de disco sem PS3_DISC.SFB: aparece "falta PS3_DISC.SFB" e o X
+     diz o que copiar, em vez de "Invalid file or folder".
+   - Pastas /data/rpcs3/PS3ISO, pkg, packages, iso, gamez (qualquer
+     caixa) também são lidas; no USB, PKG na raiz e a pasta PACKAGES.
+   - dev_hdd0/game é lida só no primeiro nível (mais rápido).
+5. XMB parada gasta menos CPU: 30 fps depois de 10 s sem mexer no
+   controle, 10 fps depois de 1 minuto e 2 fps depois de 5 minutos (o
+   relógio continua andando). Qualquer botão volta ao normal na hora.
+6. "Modo frio (menos calor)" em Configurações do RPCS3, ao lado do Modo
+   online (seção TEMPERATURA E MODO FRIO).
+7. Sem config_database.dat, o primeiro jogo aberto mostra um aviso para
+   importá-lo (Configurações > Importar config_database.dat do PC).
+8. Coluna Rede, abaixo de "Armazenamento dos jogos": "Discos de PS3
+   (Blu-ray)" (como copiar um disco físico), "Importar chaves .dkey
+   (USB:/redump)" e "Testar leitor de disco (só leitura)" (seção DISCOS
+   FÍSICOS DE PS3).
+
+Testar
+1. PS4 Pro com o Modo Turbo desligado: abra um jogo. Aparece o aviso do
+   Modo Turbo e o startup.log tem "boost: PS4 Pro at base clock (Boost
+   Mode off)". Ligue o Modo Turbo, abra o emulador de novo: nenhum
+   aviso, e "CPU clock probe: ~2080 MHz (Boost/Pro clock".
+2. Licença: copie um .rap com o nome em minúsculas e a extensão .RAP para
+   /data/rpcs3/raps/Jogo/ e use "Importar licenças .rap". A XMB diz "1
+   licença(s) .rap importada(s)"; startup.log "licenses: 1 .rap imported
+   into exdata"; em dev_hdd0/home/00000001/exdata o nome está em
+   maiúsculas com ".rap" minúsculo (FTP).
+3. Pasta de disco sem PS3_DISC.SFB: o subtítulo diz "falta PS3_DISC.SFB";
+   X mostra o que copiar; startup.log "XMB: '...' not booted: missing
+   PS3_DISC.SFB". Copie o arquivo e aperte Triângulo: o aviso some.
+4. Deixe a XMB parada 6 minutos sem tocar no controle. O startup.log
+   mostra "XMB perf (30 s): ... idle tiers 30/10/2 fps: A/B/C frames,
+   tier now 2 fps". Aperte um botão: a animação volta na hora.
+5. Configurações do RPCS3 > "Modo frio (menos calor)" > X: o startup.log
+   tem "settings: cool mode (Modo frio) switched ON (cool-mode.flag
+   created)" e /data/rpcs3/cool-mode.flag existe (FTP). X de novo apaga.
+6. Um update de PKG fora de ordem: a mensagem diz "Este update vX é para
+   a vY, mas está instalada a vZ".
+7. Sem /data/rpcs3/config_database.dat: ao abrir o primeiro jogo aparece
+   o aviso para importar; startup.log "config database: not present when
+   the first game was chosen".
+
+==========================================================================
+NOVIDADES DA 0.34 (desempenho e estabilidade)
+==========================================================================
+1. Wolverine: corrigida a causa do fechamento por falta de memória (cada
+   programa da GPU guardava ~1,8 MB; agora ~60 KB). A linha "PS4 VRAM:"
+   mostra "descriptor storage N sets, M KiB".
+2. God of War: Ascension: a GPU emulada não desiste mais de esperar os
+   SPUs enquanto eles ainda compilam (era o congelamento na primeira
+   imagem); a espera curta de 1 ms fica desligada para ele, como o PC
+   pede ("As Host").
+3. GPU emulada (RSX) gasta menos CPU esperando o jogo: depois de 1 ms
+   parada ela dorme em vez de girar (200 µs no Modo frio).
+   rsx-sema-spin.flag volta ao jeito da 0.33.
+4. Compilação: o código SPU que está rodando é compilado primeiro; o
+   código PPU já ligado não fica mais duplicado na memória ("PPU link:
+   released X MiB of object files"); com a memória quase no fim, a
+   compilação de código SPU novo espera a memória voltar ("SPU LLVM:
+   heap critical, ...") em vez de esgotá-la.
+5. Memória de vídeo: limpezas pesadas de VRAM não se repetem a cada
+   quadro quando não liberam nada (menos travadas).
+6. Vídeos H.264 atrasados pulam o filtro de blocos para ficar no tempo
+   (imagem um pouco mais quadriculada); vdec-full-quality.flag mantém o
+   filtro sempre.
+7. Câmera e microfone sem aparelho não criam threads (sobra thread para
+   o jogo); keep-service-threads.flag mantém as threads.
+8. Trocar a saída de áudio (fone, HDMI) durante o jogo: o áudio volta
+   sozinho.
+9. Mortal Kombat Komplete: a rede do jogo não trava mais a tela do
+   dragão.
+10. Jogo de disco com PKG de instalação (ex.: inFamous): instalado pela
+    tela de instalação ("Instalando conteúdo do disco 1/1").
+11. Primeira abertura de um jogo grande: aviso "Primeira abertura:
+    compilando N módulos (pode levar ~X min)".
+12. Memória do emulador quase no fim: aviso "salve o jogo agora e
+    reinicie o aplicativo depois".
+13. Logs: o RPCS3.log não para mais em 64 MB; continua em
+    RPCS3.part1.log, RPCS3.part2.log (envie todos). O startup.log lista
+    os arquivos de opção ("flags: N switch file(s) in /data/rpcs3: ...")
+    e um aviso aparece se houver arquivos de teste esquecidos.
+14. Jogo da PSN em pasta com nome tipo "Jogo [NPUB30554]" abre.
+
+==========================================================================
+NOVIDADES DA 0.34 - PARTE 2 (áudio, vídeos, cenas, rede e patches)
+==========================================================================
+1. Áudio picotado
+   - Enquanto espera o jogo, o áudio confere a cada ~1 ms em vez de 2 ms
+     (startup.log "cellAudio: block poll ~1 ms while waiting for the
+     game"). audio-poll-2ms.flag volta aos 2 ms.
+   - Quando falta um pedaço de som, em vez de um silêncio seco (o
+     estalo) o som cai num fade curto ("AudioOut: underrun concealment
+     on"). Não recupera o som que o jogo não produziu.
+     audio-no-conceal.flag desliga.
+   - "Áudio contínuo (ajuste de tempo)" em Configurações do RPCS3, ao
+     lado do Modo frio: quando o jogo não acompanha o som, o áudio é
+     esticado em vez de picotar (a voz dos vídeos pode atrasar um
+     pouco). Vale a partir do próximo jogo; cria/apaga
+     /data/rpcs3/audio-auto-stretch.flag. Liga só depois de 2 janelas
+     de 10 s com o jogo atrasado: "cellAudio: game-paced audio (periods
+     N and M of 1875, silent ones excluded): time stretching on for this
+     boot". (0.39: o Áudio contínuo é automático, o audio-auto-stretch.flag
+     é ignorado e a linha virou "cellAudio: automatic continuity engaged
+     ..."; veja NOVIDADES DA 0.39, item 8.)
+   - Opcionais (só quando o log indicar): audio-fine-poll.flag e
+     audio-high-priority.flag (veja ARQUIVOS OPCIONAIS).
+2. Vídeos dos jogos
+   - Vídeos convertidos para RGB (Demon's Souls, Deception IV) usam um
+     conversor SSE próprio, bem mais rápido: "VDEC: GetPicture yuv420p ->
+     argb through the PS4 SSE converter". vdec-sws-convert.flag volta ao
+     conversor antigo (swscale).
+   - Linha "VDEC perf" com pace= (quadros por segundo decodificados),
+     starved=, blocked= e conv=sse|sws.
+   - startup.log "movie: <arquivo> (N.N MiB) opened by '<thread>'" quando
+     o jogo abre um vídeo (.bik, .usm, .pam, .avi, .mp4...).
+   - vdec-slice-threads.flag agora vale também para MPEG-2.
+3. Cenas que piscam na primeira vez
+   - A primeira vez que uma cena aparece, os shaders dela ainda estão
+     compilando e alguns desenhos ficam de fora (pisca ou some algo por
+     um instante). Da segunda vez em diante (cache guardado) é limpo.
+   - A linha "RSX gameplay" (a cada 10 s) mostra "pipelines: skipped
+     draws=N in M frames (hold candidates C, held H), pending now P max
+     X, fast-linked=F" e cada rajada grande de compilação (10 ou mais
+     na fila; até 16 por jogo) gera "RSX: pipeline burst: N pipelines
+     in S s, ...".
+   - "Evitar piscadas nas cenas" em Configurações do RPCS3, ao lado do
+     Modo frio: segura a última imagem completa enquanto os shaders
+     compilam (pequena pausa em vez de piscar, no máximo 750 ms por
+     vez). Vale a partir do próximo jogo; grava
+     /data/rpcs3/present-hold-ms.txt com 750 (apaga ao desligar).
+     startup.log "RSX: frames that lost draws to compiling pipelines are
+     held up to 750 ms (present-hold-ms.txt)".
+   - Opcionais: vk-fast-pipelines.flag, vk-compile-3.flag,
+     zcull-strict-on-read.flag (veja ARQUIVOS OPCIONAIS).
+4. Rede, teclado e sensor: as funções do PS4 que nunca eram encontradas
+   (rede, teclado na tela, sensor de movimento) agora são buscadas em
+   tempo de execução. Isso deve fazer funcionar o "Baixar patches do
+   RPCS3", o DNS do RPCN, o teclado na tela e o sensor de movimento
+   (SIXAXIS) nos jogos. São caminhos que rodam pela primeira vez no
+   console: se algo novo falhar, envie os logs. startup.log "net:
+   libSceNet module ..., resolver pool N ...; exports bound 9/9 (8 by
+   dlsym)" (N igual ou maior que 0), "net: dns:" com um endereço e, ao
+   abrir o teclado, "on-screen keyboard: ... exports bound 5/5";
+   RPCS3.log "PS4 Pads: scePadSetMotionSensorState bound through
+   sceKernelDlsym".
+5. Patches recomendados no PS4 (seção PATCHES DE JOGOS): com o patch.yml
+   importado ou baixado e o jogo na configuração automática, os patches
+   que tiram o MLAA feito nos SPUs (God of War: Ascension, God of War
+   III, LittleBigPlanet 2/3, ICO, Shadow of the Colossus e outros) ligam
+   sozinhos: startup.log "Patches: N recomendado(s) no PS4 ligado(s)
+   para <SERIAL> v<versão>: ...".
+6. CPU: ppu-priority.flag (opcional); a linha de 60 s "guest sleeps"
+   ganhou "precise usleeps by thread" e "SPURS busy A.A of N"; a linha
+   "timer probe" ganhou "HR timer", "nanosleep" e "wait_for 500".
+
+Testar (a ordem completa está em TESTE NO CONSOLE DA 0.34)
+1. Configurações do RPCS3 > "Evitar piscadas nas cenas" > X: startup.log
+   "settings: Evitar piscadas switched ON (present-hold-ms.txt = 750)" e
+   /data/rpcs3/present-hold-ms.txt com 750 (FTP). X de novo apaga
+   ("switched OFF").
+2. Configurações do RPCS3 > "Áudio contínuo (ajuste de tempo)" > X:
+   "settings: Audio continuo switched ON (audio-auto-stretch.flag
+   created)" e o arquivo existe. X de novo apaga. (0.39: a linha é
+   "Áudio contínuo: Automático (padrão)"; X grava "settings: Audio
+   continuo switched OFF (audio-no-stretch.flag created)" e X de novo
+   "... switched to AUTOMATIC (audio-no-stretch.flag removed)".)
+3. Lista de patches (R1) de God of War: Ascension com o patch.yml
+   importado: a linha "Disable SPU MLAA - God of War: Ascension (01)"
+   diz "Ligado · recomendado no PS4". X: "Desligado neste jogo" e a
+   linha "BCUS98232|SPU-7cd2...|Disable SPU MLAA - ..." aparece em
+   /data/rpcs3/patches/ps4_recommended_off.txt; X de novo tira a linha.
+   O patch_config.yml não muda.
+
+==========================================================================
+COMO LER AS LINHAS NOVAS DO LOG (0.34)
+==========================================================================
+- RPCS3.log, a cada 10 s com som tocando:
+    AudioOut: blocks=1875 underruns=U concealed=C callback_lock_misses=0;
+    cellAudio: periods=P game_late=.. host_late=H (max .. us)
+    in_progress_waits=.. silent=.. untouched_waits=W wait_ms=T drops=D
+    ring_min_ms=R
+  blocks=1875 = a saída do PS4 tocou tudo o que devia em 10 s.
+  underruns = blocos (de 5,33 ms) que chegaram vazios ou pela metade:
+  quanto maior, mais picota (0.33: 382 a 818 no vídeo de abertura do
+  Wolverine, 5 a 46 depois dele). concealed = desses, quantos
+  viraram fade em vez de silêncio. periods = blocos que o áudio do jogo
+  produziu (1875 = no tempo; 1500 = 20% atrasado). host_late = vezes que
+  o próprio emulador acordou atrasado (se for maior que 0, teste
+  audio-high-priority.flag). untouched_waits / wait_ms = esperas pelo
+  jogo. drops = blocos jogados fora com o buffer cheio. Depois que o
+  Áudio contínuo entra em ação (linha "game-paced audio" no
+  startup.log; 0.39: "automatic continuity engaged") aparece "
+  stretch=on ratio=0.85" (0.39: nunca abaixo de 0.70); com
+  audio-fine-poll.flag, " assist=on poll_ms=N" (assist=off nas janelas
+  em que o jogo não está atrasado).
+- startup.log, a cada 10 s: "RSX gameplay: F FPS ..." (FPS do jogo), com
+  "pipelines: skipped draws=..." (desenhos perdidos por shader
+  compilando), "present src rt=.. tex=.. cpu=.. switches=..; tag
+  misses=.." (de onde veio a imagem mostrada).
+- startup.log "VDEC perf (...)": codec, decode avg/max, busy, pace=,
+  GetPicture conversions=N to argb conv=sse avg=X ms.
+- RPCS3.log a cada 60 s: "ATRAC3plus: N AUs/s, decode avg X us max Y us,
+  D decoders" (só em jogos com áudio ATRAC3plus).
+- startup.log, até 8 por jogo: "cellAudio: port N started: C channels,
+  B blocks, attr 0x..., notify queues Q" (cada saída de som do jogo).
+- startup.log: a linha que prova cada arquivo opcional da parte 2:
+    audio-poll-2ms.flag       "cellAudio: block poll 2 ms"
+    audio-no-conceal.flag     "AudioOut: underrun concealment off"
+    audio-auto-stretch.flag   "cellAudio: automatic time stretching
+                              armed" (e, quando liga, "game-paced audio");
+                              0.39: ignorado ("audio-auto-stretch.flag
+                              ignored: automatic continuity is the
+                              default")
+    audio-fine-poll.flag      "cellAudio: fine block poll armed"
+    audio-high-priority.flag  "cellAudio: audio threads at priority"
+    vdec-sws-convert.flag     "VDEC: vdec-sws-convert.flag: GetPicture RGB
+                              conversion through swscale"
+    vdec-release-slot.flag    "VDEC: GetPicture releases the PPU run slot"
+    vdec-slice-threads.flag   "VDEC: mpeg2video slice threading requested"
+                              (ou "H.264 slice threading requested")
+    present-hold-ms.txt       "RSX: frames that lost draws ... held up to"
+                              (valor errado: "present-hold-ms.txt ignored")
+    vk-fast-pipelines.flag    "RSX: pipelines compiled while 4 or more are
+                              pending are linked without driver
+                              optimizations"
+    vk-compile-3.flag         " · shaders Vulkan com 3 threads" na linha
+                              "Política PS4 para ..." (ou
+                              "vk-compile-3.flag sem efeito (motivo)")
+    zcull-strict-on-read.flag "ZCULL: CPU reads reports at ...; strict
+                              report sync from now on" (só quando o jogo
+                              lê os resultados pela CPU)
+    ppu-priority.flag         "PPU: host priority raised above SPU threads"
+
+==========================================================================
+TESTE NO CONSOLE DA 0.34 (nesta ordem)
+==========================================================================
+Envie de cada teste: startup.log, RPCS3.log (e RPCS3.part*.log) e
+mesa.log de /data/rpcs3/log. Mude um arquivo de opção por vez.
+1. PS4 Pro: Configurações > Sistema > Modo Turbo ligado. startup.log
+   "CPU clock probe: ~2080 MHz (Boost/Pro clock".
+2. Abrir o app sem jogo. startup.log: "network ABI: non-blocking
+   recvfrom -> -1/35"; a linha "flags: ..." (apague arquivos de teste
+   esquecidos); "timer probe (...) ...; HR timer 100=..."; "net:
+   libSceNet module 0x0, sceNetInit 0x0, resolver pool N" com N >= 0 e
+   "exports bound 9/9"; "net: dns:" com um endereço de verdade.
+   RPCS3.log "Use native user interface: true". "Baixar patches do
+   RPCS3" funciona.
+3. Wolverine (BLUS30268): vídeo de abertura e primeira luta, 10+ min na
+   primeira fase. startup.log: "health: heap ... live" estável (até ~100
+   MiB de variação) depois que o jogo começa; "small heap X MiB"; "PPU
+   link: released X MiB of object files"; "descriptor storage N sets, M
+   KiB" em "PS4 VRAM:"; nenhum "FALLING BACK ... 400 KiB"; nenhum
+   fatal.txt; "RSX gameplay" no mesmo lugar da 0.33; "cellAudio: block
+   poll ~1 ms" e "AudioOut: underrun concealment on". RPCS3.log: as
+   linhas AudioOut (na 0.33 eram 382 a 818 underruns no vídeo).
+4. Wolverine, primeira cena com o motor do jogo depois da abertura:
+   "RSX: pipeline burst: N pipelines ..." e "skipped draws=" > 0. Feche,
+   abra de novo e repita a mesma cena (sem apagar o cache):
+   "skipped draws=0" (ou perto) e sem piscar = diagnóstico confirmado.
+   Anote o "hold candidates C" da linha "RSX gameplay".
+5. God of War: Ascension (BCUS98232): deixe a primeira abertura
+   terminar e jogue além da primeira imagem. startup.log "guest sleeps:
+   precise sleep off for BCUS98232"; "RSX: semaphore 0x50300510 waited N
+   ms ... released"; RPCS3.log sem "nv406e::semaphore_acquire has timed
+   out"; as linhas "RSX gameplay" continuam depois de guest_flips 1304.
+   Se a tela ficar preta, espere 60 s antes de fechar (o emulador grava
+   o diagnóstico STALL aos 25 s e aos 35 s). Primeiro vídeo: "VDEC perf
+   ... codec=mpeg2video" (o "to <formato>" e o "conv="). Com o patch.yml
+   importado: "Patches: N recomendado(s) no PS4 ligado(s) para
+   BCUS98232 ..."; três janelas "RSX gameplay" numa luta; depois o mesmo
+   lugar com /data/rpcs3/custom_configs/BCUS98232.no-recommended-patches
+   (MLAA de volta), para comparar.
+6. Mortal Kombat Komplete (BLUS30902): passar da tela do dragão.
+   "sys_net_bnet_recvfrom" subindo nas estatísticas de syscalls,
+   "vblank=" andando, nenhum "PS4: host recvfrom blocked" nem STALL.
+   Um vídeo do modo história: "movie: <nome>.AVI (N.N MiB) opened by ..." e
+   o primeiro "VDEC perf ... codec=mpeg4".
+7. PKG: o disco do inFamous (BCUS98119) e um PKG da PSN ou update. Disco:
+   tela "Instalando conteúdo do disco 1/1"; startup.log "PKG install: N
+   MiB to write" e "PKG installed:". PKG da PSN (X na lista): tela
+   "Instalando PKG PS3"; startup.log "MiB to write" e "PS3 package
+   installed successfully". Nos dois: RPCS3.log "PKG: Created directory",
+   nenhum "Failed to normalize installation path"; depois o jogo abre.
+8. Jogos em pasta: um disco em pasta (Nome/PS3_GAME + PS3_DISC.SFB) e um
+   jogo PSN numa pasta "Título [NPUBxxxxx]" com o .rap importado.
+   "licenses: N .rap imported"; RPCS3.log "PS4: PSN folder ... mounted
+   as /dev_hdd0/game/NPUB..." e "Loading RAP file".
+9. Demon's Souls 15 min, depois o mesmo lugar com
+   /data/rpcs3/rsx-sema-spin.flag: "RSX gameplay" igual ou melhor SEM o
+   arquivo; "sema waits=... lowered L"; heap estável. Vídeo de abertura
+   (ds_opening) até o fim: "VDEC: GetPicture yuv420p -> argb through the
+   PS4 SSE converter" e "VDEC perf ... conv=sse avg=X ms" com X até 1,5
+   (0.33: 6,3), pace= perto de 29.97. Uma vez com vdec-sws-convert.flag
+   para comparar.
+10. Minecraft, menus (60 FPS): sem arquivo e com rsx-sema-spin.flag. O
+    FPS fica em ~60 sem o arquivo; se cair, avise.
+11. Trocar a saída de áudio (fone/HDMI) durante um jogo: startup.log
+    "AudioOut: sceAudioOutOutput failed", RPCS3.log "Backend stopped
+    unexpectedly" e "Backend recovered".
+12. Um jogo novo (sem cache): "PPU compile: 2 workers (+N optional ...)",
+    o tempo até "compile stage finished". Numa cena nunca vista, com
+    "Evitar piscadas" ligado (ou present-hold-ms.txt com 500): "RSX:
+    frames that lost draws ... held up to N ms" e "held H" com H > 0; diga se
+    viu pausas em vez de piscadas. Uma vez com vk-fast-pipelines.flag em
+    outra cena nunca vista: "fast-linked=", "pending now P max X" e
+    quanto dura a rajada.
+13. PS4 Slim: UMvC3 2 min de menu + 1 luta, DMC4 tela de instalação +
+    menu. Compare periods, untouched_waits, wait_ms e underruns com a
+    0.33 (19 a 22%). Se periods ficar em 1780 ou menos com host_late
+    0: repita com o Áudio contínuo ("cellAudio: game-paced audio ...
+    time stretching on" e "stretch=on ratio="). Só se untouched_waits/wait_ms
+    continuarem altos: audio-fine-poll.flag ("assist=on poll_ms="). Só
+    se host_late > 0: audio-high-priority.flag.
+14. Ben 10 (BLUS30663), primeira fase 3 min: periods por janela (0.33:
+    ~1100 a 1200 nas ruins); depois com o Áudio contínuo; se quiser,
+    profile.flag com a linha cpuusage=1 e
+    custom_configs/BLUS30663.spu-fast-fma.
+15. Deception IV (Slim), abertura: "pace=", "starved=", "blocked=";
+    depois com no-precise-sleep.flag (pace e "precise usleeps by
+    thread" na linha guest sleeps); depois com vdec-release-slot.flag.
+16. Opcionais, um por sessão: spu-fast-fma.flag no Demon's Souls com
+    profile.flag cpuusage=1; spu-wait-escalation.flag; vram.flag com
+    window_mb=736 num jogo pesado de VRAM ("fatal trims backed off",
+    hard syncs por 10 s); rsx-sema-sleep-us.txt com 0 contra o padrão
+    (o rsx-sema-sleep.flag não existe); zcull-strict-on-read.flag no
+    Wipeout/Sonic (brilhos piscando contra "hard syncs" e FPS);
+    vdec-slice-threads.flag no DMC4 ("threads=2 (slice)");
+    ppu-priority.flag no UMvC3; vk-compile-3.flag (nenhuma recusa de
+    thread, duração das rajadas); uma vez ORBIS_FRAME_STATS=1 em
+    /data/rpcs3/mesa-env.txt com a câmera parada (mesa.log
+    "frame-to-frame change": acima de zero = defeito do driver de
+    vídeo, não do RPCS3).
+
+==========================================================================
+PS4 PRO: MODO TURBO (BOOST MODE)
+==========================================================================
+- No PS4 Pro: Configurações > Sistema > Modo Turbo (Boost Mode) > ligado.
+  A CPU sobe de ~1,6 GHz para ~2,1 GHz (cerca de 31% a mais), medido no
+  Pro de um testador; é o maior ganho de desempenho que existe para o
+  emulador. Também esquenta um pouco mais o console.
+- O startup.log de cada sessão mostra "CPU clock probe: ~1583 MHz (base
+  clock" (sem Modo Turbo) ou "~2080 MHz (Boost/Pro clock" (com ele).
+- PS4 Fat e Slim não têm Modo Turbo: ficam sempre em ~1,6 GHz.
+
+==========================================================================
+TEMPERATURA E MODO FRIO
+==========================================================================
+- O PS4 não deixa aplicativos lerem o sensor de temperatura: em todos os
+  consoles testados (Slim e Pro) a leitura volta com o erro 0x80020002
+  (ENOENT). Por isso o emulador NÃO consegue avisar nem pausar o jogo
+  por temperatura. O que o startup.log mostra:
+    "thermal: no reading (ENOENT), try 1 of 3; ..." (tenta 3 vezes:
+    no início, depois de 60 s e de 300 s);
+    "thermal: sensor unavailable (ENOENT); the emulator cannot pause on
+    heat, the PS4 firmware protects the console" (depois da 3ª);
+    na linha "health:" de cada minuto, "temperature unavailable
+    (ENOENT)" até a 3ª tentativa; depois dela (0.36) a linha não fala
+    mais de temperatura ("n/a" só antes da primeira leitura; "off
+    (no-thermal.flag)" com esse arquivo).
+- Quem protege o console é o próprio PS4 (ventoinha, aviso de console
+  muito quente, desligamento).
+- Ventilação: 10 a 15 cm livres em volta das saídas de ar, nada de rack
+  fechado, pano ou tapete; limpe a poeira das entradas e saídas de ar.
+- "Modo frio (menos calor)" (Configurações do RPCS3): menos CPU gasta
+  esperando à toa, menos calor e ruído; alguns jogos perdem um pouco de
+  FPS, mais em áreas novas (durante o jogo as compilações rodam uma de
+  cada vez). 0.39: o "Compiling PPU Modules" da primeira abertura usa
+  até 2 threads (na 0.38, uma só; cool-mode-serial-boot.flag volta a
+  isso). Vale a
+  partir do próximo jogo. Cria/apaga o arquivo
+  /data/rpcs3/cool-mode.flag.
+- O emulador nunca mexe na ventoinha, no clock, na energia nem no
+  sistema do PS4.
+
+==========================================================================
+DISCOS FÍSICOS DE PS3
+==========================================================================
+- 0.37: com o disco no leitor do PS4 e o FTP do GoldHEN ligado, o
+  próprio emulador instala o jogo (X na linha "Disco de PS3") e busca a
+  chave do disco sozinho (item 12 das NOVIDADES DA 0.37). Nada abaixo é
+  preciso para isso.
+- Também dá para copiar o disco fora do PS4: no PC com um leitor de
+  Blu-ray compatível e o PS3 Disc Dumper (pasta com PS3_GAME e
+  PS3_DISC.SFB), ou num PS3 desbloqueado (multiMAN, webMAN MOD,
+  IRISMAN: pasta ou ISO).
+- Pasta para USB:/GAMES/, ISO para USB:/PS3ISO/, em disco exFAT (FAT32
+  não aceita arquivos de 4 GB ou mais; ISO em partes .iso.0/.iso.1 não é
+  lida).
+- ISO criptografada (redump) precisa da chave .dkey com o mesmo nome ao
+  lado: Jogo.iso + Jogo.dkey (ou /data/rpcs3/data/redump/Jogo.dkey).
+  Também vale /data/rpcs3/data/redump/<TITLE_ID>.dkey (ex.: BLUS30443.dkey):
+  o emulador lê o TITLE_ID dentro da ISO e procura essa chave.
+  0.39: não é mais preciso: sem a chave, X busca sozinho ("Buscando a
+  chave desta ISO...", NOVIDADES DA 0.39, item 4). A .dkey manual fica
+  como último recurso.
+- Coluna Rede > "Importar chaves .dkey (USB:/redump)":
+  copia os .dkey da pasta redump na raiz do pendrive (qualquer caixa)
+  para /data/rpcs3/data/redump. Só aceita chave de verdade (32
+  caracteres hex ou 16 bytes); o pendrive só é lido. startup.log:
+  "disc keys: N .dkey imported into /data/rpcs3/data/redump/ (...)".
+- Coluna Rede > "Testar leitor de disco (só leitura)":
+  teste opcional que só vê se o app consegue ler o leitor do PS4 (lista
+  /dev e, desde a 0.37, lê pelo FTP do GoldHEN 3 setores; até 36 s). X
+  uma vez explica, X de novo começa. Para jogar do disco use a linha
+  "Disco de PS3" (item 12 das NOVIDADES DA 0.37). Resultado nas linhas
+  "disc probe: ..." do startup.log. Se o teste não terminar, fica o
+  arquivo /data/rpcs3/disc-probe.blocked e o teste fica desligado:
+  apague esse arquivo para testar de novo.
+
+Testar
+1. ISO redump com a chave em USB:/redump/BLUS30443.dkey: "Importar
+   chaves .dkey" diz "1 chave(s) .dkey importada(s)"; o jogo abre e o
+   RPCS3.log tem "ISO: init: Found matching key file:
+   '/data/rpcs3/data/redump/BLUS30443.dkey'".
+2. Opcional, com um disco de PS3 no leitor: "Testar leitor de disco"
+   (X duas vezes). Envie o startup.log com as linhas "disc probe:".
+
+==========================================================================
+NOVIDADES DA 0.33
+==========================================================================
+1. Firmware do PS3 instalado pela XMB: Configurações > "Instalar
+   firmware do PS3" (seção FIRMWARE DO PS3 abaixo).
+2. Jogos em HD externo ou pendrive (PS3ISO, GAMES, PKG), com detecção
+   ao conectar e desconectar (seção JOGOS NO HD EXTERNO OU PENDRIVE).
+3. Patches de jogos como no PC: importar, baixar de rpcs3.net e ligar
+   por jogo com R1 (seção PATCHES DE JOGOS).
+4. config_database.dat do RPCS3 de PC: ajustes por jogo do PC (seção
+   AJUSTES POR JOGO).
+5. Cache dos jogos
+   - L1 sobre um jogo limpa o cache dele (seção LIMPAR O CACHE).
+   - Antes de cada jogo, se /data tiver menos de 4 GB livres ou
+     /data/rpcs3/cache passar de 8 GB, os caches dos jogos usados há
+     mais tempo são apagados (aparece um aviso). Esses jogos compilam
+     de novo na próxima vez.
+6. Estabilidade
+   - Erros de disco e de rede que fechavam o jogo (ex.: Wolverine)
+     agora chegam ao jogo como erros normais do PS3.
+   - Um jogo que parou com erro não trava mais o próximo jogo. Se não
+     der para liberar, a XMB diz "O emulador precisa reiniciar após o
+     erro anterior": feche pelo botão PS e abra de novo.
+   - A medição de desempenho (profile.flag) vem desligada; ela
+     interrompia esperas de rede dos jogos.
+7. Jogos
+   - Sensor de movimento do DualShock 4 enviado aos jogos como o
+     SIXAXIS do DS3.
+   - Lista de saves do PS3 (jogos que mostram a lista para salvar ou
+     carregar) e avisos de troféu na tela.
+   - Os jogos usam o fuso horário e o horário de verão do PS4.
+   - Mais formatos de áudio e vídeo, como no RPCS3 de PC (FLAC, Vorbis,
+     Opus, AC3, WMA...), para músicas e gravações feitas pelos jogos.
+   - "Accurate DFMA" pode ser ligado só para um jogo (Quadrado no jogo,
+     ligar a opção e Salvar).
+
+==========================================================================
+NOVIDADES DA 0.32
+==========================================================================
+1. Gráficos que dependem de "Write Color Buffers" (ex.: Demon's Souls)
+   - A cópia das imagens da GPU de volta para o jogo foi refeita para o
+     PS4: cada cópia vai sozinha para a GPU, com confirmação de término,
+     e nada é reaproveitado enquanto a GPU ainda está usando.
+   - Demon's Souls liga "Write Color Buffers" sozinho na configuração
+     automática (sem ele os gráficos ficam pretos).
+   - Se a GPU parar, o log registra em qual passo da cópia ela parou.
+2. Memória de vídeo
+   - Falta de VRAM agora libera caches e tenta de novo, em vez de fechar.
+   - Blocos de memória menores e sem cópias duplicadas.
+3. Opções que não funcionam no PS4 ficam travadas
+   - "Multithreaded RSX" e "Asynchronous Texture Streaming" aparecem como
+     "Indisponível no PS4" e ficam sempre desligadas, mesmo em configuração
+     manual (elas causavam falta de VRAM no console).
+   - Uma configuração salva igual à automática volta sozinha para o
+     automático.
+
+==========================================================================
+NOVIDADES DA 0.31
+==========================================================================
+1. Estabilidade em jogos pesados
+   - Menos threads de serviço; se o sistema recusar uma thread nova, o
+     emulador usa uma pilha própria em vez de fechar o jogo.
+   - Se mesmo assim faltar recurso, o jogo recebe o erro normal do PS3
+     (como num PS3 de verdade) em vez do aplicativo cair.
+   - Falta de memória de vídeo ou do jogo vira erro tratável, não crash.
+     Leitura de disco/ISO tenta de novo antes de desistir.
+   - Se um jogo tiver problema, o emulador anota e se ajusta sozinho na
+     próxima vez (menos threads de compilação, menos VRAM).
+
+2. Desempenho
+   - Esperas curtas do jogo ficaram precisas (antes cada uma durava ~1 ms).
+   - A GPU emulada (RSX) responde mais rápido quando chega trabalho novo.
+   - PS4 Pro: ative o Modo Turbo em Configurações > Sistema > Modo Turbo
+     (Boost Mode). "Informações do sistema" mostra o clock medido da CPU.
+   - Minecraft: diminua a distância de renderização nas opções do jogo;
+     o FPS cai conforme o mundo mostra mais pedaços ao mesmo tempo.
+   - A CPU do PS4 é bem mais fraca que a de um PC: jogos leves rodam bem,
+     jogos muito pesados podem ficar com FPS baixo.
+
+3. Configuração automática (ligada por padrão)
+   - Ao abrir um jogo, o emulador aplica sozinho o melhor perfil para o
+     PS4 e as correções conhecidas de cada jogo.
+   - Configurações > "Configuração automática" liga/desliga.
+   - Salvar uma configuração própria para um jogo faz ela valer só para
+     ele; "Voltar para automático" desfaz.
+
+4. Online (RPCN - servidor do próprio RPCS3, sem servidores da Sony)
+   - XMB > PlayStation Network > "Modo online" liga/desliga.
+   - Conta: importe o rpcn.yml do RPCS3 do PC (coloque em um pendrive em
+     /rpcs3/rpcn.yml e use "Importar rpcn.yml"), ou entre com usuário e
+     senha pelo teclado da tela. Criar conta pede um e-mail seu para
+     receber o código (token).
+   - UPnP fica desligado até você ligar no mesmo menu.
+   - Jogos muito pesados (ex.: Demon's Souls) rodam melhor offline.
+
+5. XMB mais fluida
+   - Menu desenhado com menos custo; lista de jogos e ícones carregados em
+     segundo plano e guardados em cache.
+   - Parada, a XMB reduz a animação para economizar CPU, e fica parada
+     enquanto a tela inicial do PS4 está aberta.
+
+6. Segurança do console
+   - O emulador é um aplicativo comum: não controla ventoinha, clock,
+     energia nem firmware, e só grava na pasta /data/rpcs3.
+   - (Corrigido na 0.34) A leitura de temperatura nunca funcionou: o PS4
+     não deixa aplicativos lerem o sensor, então o aviso de 85 °C e a
+     pausa de 92 °C nunca acontecem. Quem protege o console é o próprio
+     PS4. Deixe o console ventilado (seção TEMPERATURA E MODO FRIO).
+   - Aviso de pouco espaço livre; os caches têm limite de tamanho.
+   - O jogo nunca acessa arquivos do sistema (/host_root/ desligado).
+   - O emulador NUNCA atualiza o sistema do PS4.
+
+==========================================================================
+PRIMEIRA VEZ QUE ABRE UM JOGO
+==========================================================================
+A primeira inicialização de cada jogo compila o código do jogo para o
+PS4 ("Compiling PPU Modules" / "Building SPU Cache"). Normalmente leva
+de 6 a 45 minutos (jogos grandes, até cerca de uma hora). É feito uma
+vez só; nas próximas vezes abre bem mais rápido. Deixe terminar: não
+feche o aplicativo durante essa etapa. Com o "Modo frio" ligado o
+"Compiling PPU Modules" usa até 2 threads (0.39; na 0.38, uma só).
+Alguns jogos instalam dados no HD na primeira vez, com a barra de
+progresso do próprio jogo (ex.: Fallout New Vegas, uns 7 minutos): o
+jogo não travou, espere. Desde a 0.39 o aviso "o jogo parece travado"
+não aparece enquanto essa janela do jogo está na tela.
+Guarde o cache: não apague o cache de um jogo (L1 na XMB) só porque a
+primeira sessão foi lenta; apagar faz a compilação toda de novo. Muitos
+jogos também precisam dos patches do PC: importe o patch.yml (seção
+abaixo). Os ajustes por jogo do PC (config_database.dat) já vêm no
+pacote.
+
+==========================================================================
+PATCHES DE JOGOS (como "Manage Game Patches" do RPCS3 do PC)
+==========================================================================
+- Patches mudam o jogo (60 FPS, pular vídeos, correções...). São os
+  mesmos arquivos do RPCS3 do PC (patch.yml).
+- Pelo FTP do GoldHEN: copie o patch.yml do RPCS3 do PC para
+  /data/rpcs3/patches/ (vale direto, sem importar) ou para
+  /data/rpcs3/import/ e use XMB > Configurações > "Importar patches de
+  jogos". No pendrive: rpcs3/patches/ ou a raiz. As pastas games, pkgs,
+  raps, import, patches, custom_configs e data/redump aceitam arquivos
+  pelo FTP (o emulador libera ao abrir).
+- O que "Importar patches de jogos" lê, nesta ordem: pendrive
+  rpcs3/patches/*.yml (pendrives 1 a 8), /data/rpcs3/import/*.yml,
+  /data/rpcs3/patch.yml (e imported_patch.yml, <TITLE_ID>_patch.yml;
+  os outros .yml de /data/rpcs3 são ignorados) e o patch.yml da raiz do
+  pendrive. O que já está em /data/rpcs3/patches só é conferido.
+  O arquivo é conferido antes de entrar em /data/rpcs3/patches; o
+  anterior fica guardado como .bak; o original fica onde estava.
+  Arquivos SERIAL_patch.yml mantêm o nome; outros .yml são juntados ao
+  imported_patch.yml (como no PC). Se o mesmo nome estiver em dois
+  lugares, vale o primeiro da ordem acima.
+- O resultado aparece na tela e no startup.log: "patches: import
+  result: <frase> | scanned: <cada lugar> (absent | N file(s) | errno
+  E)". Exemplos: "Patches importados: patch.yml (N patches) · R1 num
+  jogo para ligar", "patch.yml já está em /data/rpcs3/patches: N patches
+  prontos", "Os patches já estavam importados (nada mudou)", "<nome>
+  recusado pelo motor de patches (RPCS3.log); se o FTP ainda copia,
+  espere e repita", "Sem permissão para gravar em /data/rpcs3/patches".
+- "Baixar patches do RPCS3" pega o patch.yml mais recente de rpcs3.net
+  por conexão segura (precisa da data e hora do PS4 certas). Ao abrir, o
+  emulador testa a conexão segura sem usar a internet (linha "TLS
+  self-test:" do startup.log). Se a opção disser "indisponível", use o
+  FTP ou o pendrive.
+- Se o FileZilla recusar um arquivo, abra o emulador uma vez e tente de
+  novo; se continuar, veja a linha "folders:" do startup.log.
+- Ligar/desligar: na lista de jogos, fique sobre o jogo e aperte R1.
+  X liga/desliga, Quadrado mostra as notas do patch, Triângulo relê os
+  arquivos, Círculo volta. "Nenhum patch para este jogo" quer dizer que
+  o patch.yml não tem patches para esse jogo nessa versão.
+- Vale a partir do próximo início do jogo. A escolha fica em
+  /data/rpcs3/patch_config.yml (mesmo formato do PC).
+- Ao iniciar o jogo, o startup.log mostra "Patches: N aplicado(s) para
+  SERIAL". Se o jogo der problema, desligue o patch e teste de novo.
+
+Patches recomendados no PS4 (0.34)
+- Alguns patches do próprio patch.yml tiram trabalho pesado da CPU do
+  PS4: os "Disable SPU MLAA" / "Disable MLAA" (tiram o antisserrilhado
+  MLAA feito nos SPUs; as bordas ficam um pouco serrilhadas). Para God of
+  War: Ascension, God of War III, LittleBigPlanet 2 e 3, ICO, Shadow of
+  the Colossus, Puppeteer, Dragon Age II, WWE '12, Alice: Madness
+  Returns, Tokyo Jungle, SoulCalibur V, DmC, MotorStorm Apocalypse/RC,
+  Sly Cooper: Thieves in Time, Twisted Metal e outros, eles ligam
+  sozinhos a cada início do jogo, só quando:
+  - o patch.yml foi importado ou baixado (nada vem no pacote);
+  - o jogo está na configuração automática (não com ajuste manual
+    salvo, nem com a configuração automática desligada, nem com
+    keep-user-settings.flag).
+- Na lista do jogo (R1) eles aparecem com "recomendado no PS4". X
+  desliga só aquele patch, só naquele jogo (fica gravado em
+  /data/rpcs3/patches/ps4_recommended_off.txt, uma linha
+  SERIAL|HASH|DESCRIÇÃO); X de novo liga. Para desligar todos os
+  recomendados de um jogo: crie
+  /data/rpcs3/custom_configs/<TITLE_ID>.no-recommended-patches.
+  O patch_config.yml nunca é alterado por eles.
+- Outros aparecem como "sugerido no PS4" (desfoque de profundidade,
+  borrão de movimento, SSAO, "Enable GPU Lighting" de Uncharted 2/3 e
+  The Last of Us): nunca ligam sozinhos; ligue com X se o jogo estiver
+  lento. Quadrado mostra o motivo antes das notas.
+- startup.log ao iniciar: "Patches: N recomendado(s) no PS4 ligado(s)
+  para <SERIAL> v<versão>: <nomes> (desligar: lista de patches do
+  jogo)", ou "Patches: recomendados no PS4 não ligados para <SERIAL>
+  (<motivo>)".
+
+==========================================================================
+JOGOS NO HD EXTERNO OU PENDRIVE (como no PS3)
+==========================================================================
+Preparar o disco (no PC)
+- Formate em exFAT (recomendado: aceita ISO maior que 4 GB). FAT32
+  também funciona, mas só com arquivos de até 4 GB; ISO dividida em
+  partes (.iso.0, .iso.1...) não é lida.
+- O "armazenamento estendido" do PS4 NÃO serve: ele é criptografado
+  pelo console e o emulador não consegue ler. Use um HD ou pendrive
+  comum formatado no PC (NTFS não é lido pelo PS4).
+- Crie na raiz do disco as pastas (os mesmos nomes do multiMAN/webMAN;
+  maiúsculas ou minúsculas tanto faz):
+    PS3ISO   arquivos .iso (pode usar subpasta: PS3ISO/RPG/jogo.iso)
+    GAMES    uma pasta por jogo, com PS3_GAME/USRDIR/EBOOT.BIN dentro
+    PKG      pacotes .pkg de PS3 (X instala no PS4)
+  Também são lidas: ISO e PKG soltos na raiz, GAMEZ, PACKAGES e
+  PS3/GAMES. Dentro de
+  cada uma, no máximo duas subpastas de profundidade são procuradas
+  (ex.: PS3ISO/RPG/Japão/jogo.iso), para que um disco grande seja lido
+  rápido; o resto do disco não é vasculhado. PKG de PS4 no mesmo disco
+  (os do GoldHEN) não aparecem na lista do emulador.
+
+Usar
+- Ligue o disco em qualquer porta USB do PS4 (fat, slim ou pro).
+- Na coluna Jogo, cada jogo diz de onde vem: "PS4" (/data/rpcs3) ou
+  "USB 1", "USB 2"... A coluna Rede mostra, abaixo de "Armazenamento dos
+  jogos", cada disco e quantos jogos ele tem.
+- Conectar ou desconectar com a XMB aberta: em até 2 segundos a lista
+  se atualiza sozinha ("USB 1 conectado: N jogo(s)" ou "USB 1
+  desconectado"). Os jogos de um disco desconectado somem da lista e
+  voltam quando ele for ligado de novo. Triângulo lê todos os discos
+  de novo (use depois de copiar jogos pela rede para o disco).
+- Disco ligado sem jogos: aparece uma linha dizendo o que falta
+  ("sem as pastas PS3ISO, GAMES ou PKG", "nenhum jogo nas pastas" ou
+  "não foi possível ler o disco"; neste caso, Triângulo tenta de novo).
+- Disco só com PKG de PS4 (pasta PKG do GoldHEN): a linha diz "só PKG
+  de PS4"; eles não entram na contagem nem na lista de jogos.
+- A primeira leitura de um disco com muitos jogos pode levar alguns
+  segundos; a XMB continua respondendo. Depois a lista vem do cache.
+- O jogo abre direto do disco, que é só lido: nada é gravado nele.
+  Cache, saves, configurações, licenças e updates ficam no PS4, em
+  /data/rpcs3. Um update instalado vale também para a ISO do USB.
+- Jogo de PSN em pasta (sem PS3_GAME) não abre do USB, porque ele
+  gravaria os dados dele no disco: copie a pasta para /data/rpcs3/games
+  ou instale o PKG. ISO e jogos de disco em pasta abrem normalmente.
+- Não tire o disco com o jogo aberto. Se tirar, o jogo pode parar com
+  erro; ao voltar, a XMB avisa "USB 1 foi desconectado".
+
+Testar
+1. Pendrive exFAT com PS3ISO/jogo.iso: ligue com a XMB aberta. Em até
+   2 s aparece "USB 1 conectado" e o jogo com "USB 1 ·" no subtítulo.
+2. Abra o jogo, jogue, volte (L1 + R1 + Options). Nada novo no
+   pendrive; o cache está em /data/rpcs3/cache.
+3. Tire o pendrive com a XMB aberta: o jogo some em até 2 s.
+4. Pendrive vazio: a linha "USB 1: sem as pastas..." aparece.
+5. startup.log: linhas "library: USB 1 (/mnt/usb0)", "USB hot-plug:"
+   e "XMB loader (...): ... usb polls N avg ... ms".
+
+==========================================================================
+AJUSTES POR JOGO DO RPCS3 DE PC (config_database.dat)
+==========================================================================
+- O RPCS3 de PC baixa uma lista de ajustes por jogo (2000+ jogos) e a
+  aplica sozinho. O emulador do PS4 não baixa esse arquivo, mas desde a
+  0.39 o pacote traz uma cópia dele (/app0/config_database.dat), usada
+  sozinha pela configuração automática: não é preciso importar nada
+  (startup.log "config database: bundled /app0/config_database.dat
+  ..."). Para usar uma cópia mais nova, a do seu RPCS3 de PC (pasta
+  GuiConfigs, config_database.dat), siga os passos abaixo.
+- Coloque no pendrive em /config_database.dat, /GuiConfigs/ ou
+  /rpcs3/, ou pelo FTP em /data/rpcs3/import/config_database.dat.
+- XMB > Configurações > "Importar config_database.dat do PC". O arquivo
+  é conferido antes; se houver mais de uma cópia, vale a mais nova (pela
+  data dentro dele). O anterior fica como config_database.dat.bak.
+- Vale a partir do próximo início de cada jogo. O startup.log mostra
+  (0.37) "config database: /data/rpcs3/config_database.dat (timestamp
+  T, N titles); ..." e, por jogo, "config database: applied SERIAL (N
+  keys), M value(s) changed" (ou "SERIAL has no entry").
+- Com as duas cópias (a do pacote e a de /data), vale a de /data, a não
+  ser que as duas tenham data e a do pacote seja mais nova; a linha
+  "config database: bundled ..." diz quando a do pacote está valendo.
+- Um jogo com ajustes próprios (a entrada dele nesse arquivo ou as
+  linhas do emulador para ele) mostra ao abrir o aviso "RPCS3:
+  configuração automática ativa para <ID> (N ajuste(s) específico(s)
+  para este jogo)"; os outros jogos abrem sem esse aviso.
+
+==========================================================================
+LIMPAR O CACHE DE UM JOGO
+==========================================================================
+- Na lista de jogos, fique sobre o jogo e aperte L1, depois X para
+  confirmar (qualquer outro botão cancela).
+- Apaga só /data/rpcs3/cache/cache/SERIAL (código compilado e shaders
+  desse jogo). O próximo início compila o jogo de novo (demora como na
+  primeira vez). Saves e configurações não são tocados.
+- Use quando um jogo começar a fechar ou travar logo depois de uma
+  atualização do emulador ou do jogo.
+
+==========================================================================
+SE DER PROBLEMA
+==========================================================================
+- A mensagem aparece na tela e de novo no próximo início.
+- Os registros das últimas 8 sessões ficam em /data/rpcs3/log/history/0..7
+  (startup.log, RPCS3.log, mesa.log, fatal.txt).
+- Envie SEMPRE os três juntos: startup.log, RPCS3.log e mesa.log da
+  mesma sessão, copiados depois de fechar o RPCS3 (veja TESTE NO CONSOLE
+  DA 0.39). Só o RPCS3.log não basta: o startup.log diz o que o
+  emulador fez no PS4 (memória, threads, pastas, disco, idioma).
+- Não escolha o interpretador de PPU ou de SPU nas configurações de um
+  jogo: no PS4 ele é 10 a 50 vezes mais lento que o LLVM (o jogo fica
+  com 1 ou 2 FPS). A 0.39 avisa quando um jogo abre com ele.
+- Envie também /data/orbis-abort.log e /data/tempest-vkloader.log (FTP,
+  direto na pasta /data): eles dizem quem chamou um abort() e qual função
+  do Vulkan faltou.
+- Se a tela parar, espere 1 minuto antes de fechar pelo botão PS.
+- "O emulador precisa reiniciar após o erro anterior": feche pelo botão
+  PS > Fechar aplicativo e abra de novo.
+- "Memória do emulador esgotada (2 GB): o jogo foi fechado" (startup.log
+  "fatal: thread failed with the heap at its cap"): só fechar e abrir o
+  aplicativo devolve essa memória. Envie os logs desse jogo.
+
+==========================================================================
+ARQUIVOS OPCIONAIS EM /data/rpcs3 (avançado)
+==========================================================================
+Crie o arquivo (vazio) para ativar; apague para voltar ao normal.
+  keep-user-settings.flag    não aplica nenhum ajuste automático
+  auto-config-off.flag       desliga a configuração automática (o menu faz isso)
+  accurate-dfma.flag         mantém "Accurate DFMA" (mais lento)
+  no-precise-sleep.flag      volta às esperas curtas do sistema
+  rsx-idle-poll-us.txt       espera ativa da RSX em µs (0 a 2000; padrão 50
+                             com o timer HR ligado, 200 sem ele)
+  rsx-normal-priority.flag   GPU emulada sem prioridade elevada
+  no-bg-pause.flag           não pausa o jogo ao abrir a tela inicial do PS4
+  no-thermal-pause.flag      nunca pausa o jogo por temperatura (o PS4 não
+                             deixa apps lerem o sensor; veja TEMPERATURA)
+  cool-mode.flag             Modo frio ligado (o menu Configurações faz isso)
+  no-lightbar.flag           mantém as cores de luz do sistema nos controles
+  pad-keep-open.flag         não fecha controles parados dos jogadores 2-4
+  pad-no-motion.flag         não envia o sensor de movimento aos jogos
+  mesa-cache.flag            sem efeito desde a 0.39: o cache de shaders do
+                             driver de vídeo já vem ligado
+                             (mesa-cache-off.flag desliga); pode apagar
+  profile.flag               liga a medição de desempenho no log (vem
+                             desligada; linha full=1 = medição completa)
+  no-profile.flag            mantém a medição desligada mesmo com profile.flag
+  vdec-slice-threads.flag    vídeos H.264 e MPEG-2 dos jogos com 2 threads
+  no-extra-spu-workers.flag  sem threads extras no "Building SPU Cache"
+  spu-recycle-programs.txt   programas SPU por compilador (padrão 256, 0 = nunca
+                             recria o compilador)
+  cache-budget-gib.txt       limite dos caches em GB (padrão 8)
+  no-cache-trim.flag         nunca apaga caches de jogos sozinho
+  no-lock-release.flag       não libera travas deixadas por um erro
+  vram.flag                  limites de VRAM (linhas device_mb=N / host_mb=N)
+  dma.flag                   cópias de volta da GPU, linhas CHAVE=VALOR:
+                             events=label|vk  isolate=on|off  speculate=on|off
+                             trace=on|off  cpu_swap=on|off
+                             (padrão: label, on, off, off, off; até a 0.36
+                             o trace vinha on)
+  diagnostics.flag           registros detalhados a cada 60 s
+  mesa-env.txt               variáveis do driver de vídeo, CHAVE=VALOR por linha
+  no-thermal.flag            não lê os sensores de temperatura
+
+Novos na 0.34 (sem o arquivo vale o padrão da 0.34, dito em cada linha)
+  rsx-sema-spin.flag         RSX volta a esperar girando (como na 0.33);
+                             padrão: dorme depois de 1 ms parada
+  rsx-sema-sleep-us.txt      µs de espera da RSX antes de dormir (0 a
+                             20000, padrão 1000; 0 = nunca dorme)
+  rsx-sema-yield.flag        sem efeito desde a 0.34 (o startup.log avisa)
+  rsx-plain-copy.flag        cópias de vértices com memcpy (padrão:
+                             streaming stores)
+  rsx-profiler-off.flag      desliga os cronômetros da linha "RSX gameplay"
+                             (padrão: ligados)
+  spu-compile-push.flag      fila antiga de compilação SPU (padrão: o
+                             código em uso primeiro)
+  ppu-keep-objects.flag      mantém os objetos PPU na memória (como na
+                             0.33; padrão: liberados depois de ligar)
+  vram-trim-every-frame.flag limpeza pesada de VRAM a cada verificação
+                             (como na 0.33; padrão: espera 500 ms se a
+                             última não liberou nada)
+  vram.flag                  também a linha window_mb=N (512 a 832,
+                             padrão 640)
+  vdec-full-quality.flag     vídeos H.264 sempre com o filtro de blocos
+                             (padrão: pula quando o vídeo atrasa)
+  keep-service-threads.flag  mantém as threads de câmera e microfone sem
+                             aparelho (padrão: não cria)
+  spu-fast-fma.flag          opcional: FMA do SPU em precisão simples (por
+                             jogo: custom_configs/<TITLE_ID>.spu-fast-fma)
+  spu-wait-escalation.flag   opcional: esperas SPU mais longas sem eventos
+  disc-probe.blocked         criado pelo teste do leitor de disco que não
+                             terminou; apague para testar de novo
+  audio-poll-2ms.flag        áudio confere o jogo a cada 2 ms (como na
+                             0.33; padrão ~1 ms; 0.39: o padrão confere a
+                             cada 250 µs com o timer HR, e o arquivo
+                             desliga o timer HR no áudio: "HR waits off
+                             (audio-poll-2ms.flag)")
+  audio-no-conceal.flag      buraco no som vira silêncio seco (padrão:
+                             fade curto)
+  audio-auto-stretch.flag    sem efeito desde a 0.39 (o Áudio contínuo é
+                             automático; audio-no-stretch.flag desliga);
+                             pode apagar
+  audio-fine-poll.flag       opcional: o áudio espera o jogo cedendo a CPU
+                             em vez de dormir (até 150 ms por segundo)
+  audio-high-priority.flag   opcional: threads de áudio um passo acima da
+                             GPU emulada
+  vdec-sws-convert.flag      conversão RGB dos vídeos pelo swscale (como na
+                             0.33; padrão: conversor SSE)
+  vdec-release-slot.flag     opcional: o PPU cede a vez durante a
+                             conversão de vídeos de 640x360 ou mais
+  present-hold-ms.txt        Evitar piscadas: até quantos ms a última
+                             imagem completa é segurada (1 a 3000; o menu
+                             grava 750; 0 ou sem arquivo = desligado)
+  vk-fast-pipelines.flag     opcional: com 4 ou mais shaders na fila,
+                             compila sem otimizar (o próximo início refaz
+                             otimizado pelo cache)
+  vk-compile-3.flag          opcional: 3 threads de compilação de shaders
+                             Vulkan (padrão 2)
+  zcull-strict-on-read.flag  opcional: ZCULL exato depois que o jogo lê os
+                             resultados pela CPU (pode custar FPS)
+  ppu-priority.flag          opcional: PPU um passo acima dos SPUs (por
+                             jogo: custom_configs/<TITLE_ID>.ppu-priority)
+  custom_configs/<TITLE_ID>.no-recommended-patches
+                             não liga os patches recomendados desse jogo
+  patches/ps4_recommended_off.txt
+                             patches recomendados desligados (a lista R1
+                             grava; uma linha SERIAL|HASH|DESCRIÇÃO)
+
+Novos na 0.36 (sem o arquivo vale o padrão da 0.36, dito em cada linha)
+  no-gnm-keepalive.flag      não avisa a GPU do PS4 quando ela fica ociosa
+                             (volta o CE-34878-0 ao fechar; padrão: avisa)
+  rsx-no-report-drain.flag   só para comparar: a GPU emulada não confere
+                             os resultados de oclusão enquanto espera
+                             (o God of War volta a travar; padrão: confere)
+  ring-reclaim-off.flag      não libera os quadros antigos dos anéis da GPU
+                             antes de eles crescerem (padrão: libera)
+  no-pool-release.flag       não devolve os descriptor pools de programas
+                             parados (padrão: devolve depois de 20 s)
+  hr-wait.flag               sem efeito desde a 0.37: o timer de alta
+                             resolução já é o padrão (no-hr-wait.flag
+                             desliga); pode apagar
+  mesa-env.txt               a linha ORBIS_SUBMIT_DONE=1 é um teste
+                             opcional (aviso à GPU a cada quadro; padrão:
+                             sem a linha)
+
+Novos na 0.37 (sem o arquivo vale o padrão da 0.37, dito em cada linha)
+  no-hr-wait.flag            esperas curtas sem o timer de alta resolução
+                             (como na 0.36; padrão: timer HR ligado se o
+                             teste do início passar)
+  shader-skip-draws.flag     shaders "Async Recompiler" da 0.36 (desenhos
+                             que esperam shader somem por um instante;
+                             padrão: intérprete desenha enquanto compila)
+  shader-interpreter-lazy.flag
+                             não prepara as variantes do intérprete ao
+                             abrir o jogo; cada uma liga no primeiro uso
+                             (padrão: prepara ao abrir)
+  zcull-relaxed.flag         ZCULL como na 0.36 em todos os jogos (Relaxed
+                             ZCULL Sync ligado, Accurate ZCULL stats
+                             desligado; padrão: valores do PC)
+  rsx-copy-worker-off.flag   cópias de vértices sem a thread auxiliar
+                             (padrão: cópias de 16 KB ou mais na thread
+                             "RSX copy worker")
+  rsx-copy-worker-min-kib.txt
+                             tamanho mínimo, em KB, das cópias que vão para
+                             a thread auxiliar (padrão 16)
+  dma.flag                   a linha trace=on volta o rastreio das cópias
+                             de volta da GPU (padrão 0.37: trace=off)
+
+Novos na 0.38 (sem o arquivo vale o padrão da 0.38, dito em cada linha;
+cada um volta uma parte ao jeito da 0.37, só para comparar)
+  shader-interpreter-preload.flag
+                             prepara todas as variantes do intérprete ao
+                             abrir o jogo, como na 0.37 (padrão 0.38: cada
+                             uma liga no primeiro uso; o
+                             shader-interpreter-lazy.flag virou o padrão)
+  interpreter-sync-link.flag variantes do intérprete ligadas na hora, na
+                             forma exata (padrão: na forma genérica, sem
+                             parar o desenho)
+  interpreter-no-lru.flag    guarda todas as pipelines do intérprete
+                             (padrão: as menos usadas são liberadas acima
+                             do limite)
+  no-pipeline-lru.flag       guarda todas as pipelines dos shaders
+                             (padrão: as menos usadas são liberadas)
+  shader-preload-all.flag    carrega todo o histórico de shaders do disco
+                             ao abrir (padrão: só os mais recentes)
+  vk-app-pipeline-cache.flag usa o VkPipelineCache como na 0.37 (padrão:
+                             sem ele, menos memória do driver)
+  rings-full.flag            anéis da GPU emulada do tamanho da 0.37
+                             (padrão: metade, cerca de 200 MB a menos)
+  vram-meter-off.flag        não mede a janela de memória de vídeo inteira
+                             (padrão: mede e usa a medida para liberar)
+  vram-reserve-off.flag      sem a reserva de emergência de memória de
+                             vídeo (padrão: reserva; sem ela, uma falta de
+                             memória de vídeo fecha o jogo)
+  texture-age-evict-off.flag não tira texturas paradas há muito tempo
+                             quando a memória de vídeo aperta (padrão: tira)
+  dma-age-out-off.flag       mantém os blocos de cópia da GPU parados
+                             (padrão: libera depois de 30 s ou acima de
+                             64 MB)
+  vdec-queue-60.flag         fila de 60 quadros nos vídeos dos jogos, como
+                             no RPCS3 (padrão: limitada pela memória)
+  font-pages-unbounded.flag  nunca descarta páginas de fontes das telas do
+                             sistema (padrão: no máximo 24)
+  patch-extract-off.flag     lê sempre o patch.yml inteiro ao abrir o jogo
+                             (padrão: um extrato por jogo)
+  savedata-preload.flag      lê todos os arquivos do save para a memória
+                             antes, como na 0.37 (padrão: só quando o jogo
+                             pede)
+  no-trim.flag               não devolve ao PS4 a memória que o heap largou
+                             e não separa os blocos grandes dos pequenos,
+                             como na 0.37 (padrão: devolve no fim de cada
+                             etapa da abertura e ao voltar para a XMB;
+                             startup.log "trim is off for this process"
+                             com o arquivo)
+  no-ledger-query.flag       não consulta o PS4 sobre a memória direta
+                             livre (padrão: consulta; sem ela, "ledger
+                             ESTIMATED")
+  test-jit-cap-mib.txt       SÓ PARA TESTE (TESTE NO CONSOLE DA 0.38, item
+                             2): um número em MB; acima dele de memória
+                             privada do emulador o código SPU novo é
+                             recusado, como se a memória tivesse acabado.
+                             Apague depois do teste
+  no-mem-budget.flag         sem o orçamento de memória: o heap volta ao
+                             teto fixo de 2048 MB e nada fica reservado
+                             para as outras partes, como na 0.37 (os
+                             níveis de memória continuam; startup.log
+                             "memory budget: OFF")
+  boot-dirty.flag            SÓ PARA TESTE: abre o jogo escolhido mesmo
+                             quando o aplicativo devia ser fechado e aberto
+                             antes (padrão: pede para fechar e abrir, e o
+                             jogo abre sozinho depois)
+  no-spu-object-cache.flag   desliga o cache dos objetos SPU: cada abertura
+                             compila tudo de novo, como na 0.37 (padrão:
+                             a segunda abertura carrega o que já foi
+                             compilado); spu-objcache-off.flag faz o mesmo
+  spu-objcache-verify.flag   SÓ PARA TESTE: compila tudo e compara com o
+                             cache, sem usar o cache
+  spu-objcache-readonly.flag usa o cache, mas não grava nada novo
+  spu-objcache-reset.flag    apaga o cache SPU do jogo a cada abertura
+                             enquanto o arquivo existir
+  spu-objcache-mib.txt       tamanho máximo do cache SPU de cada jogo em MB
+                             (padrão 192; 32 a 1024)
+  spu-timebase-baked.flag    código SPU que lê o relógio igual ao da 0.37
+                             (o cache continua; vale depois de fechar e
+                             abrir o aplicativo)
+  ppu-check-full.flag        confere todo o código PPU a cada etapa da
+                             abertura, como na 0.37 (padrão: uma vez)
+  rsx-compile-no-slot.flag   shaders Vulkan compilam sem esperar a vez
+                             quando a memória aperta, como na 0.37
+  upload-staging-off.flag    texturas grandes sobem pelo anel da GPU, como
+                             na 0.37 (padrão: buffer próprio quando não
+                             cabem)
+
+Novos na 0.39 (sem o arquivo vale o padrão da 0.39, dito em cada linha;
+os marcados "opcional" ligam algo novo, os outros voltam uma parte ao
+jeito da 0.38, só para comparar)
+  ui-language.txt            idioma da XMB: auto, pt-BR, en, es ou ar (o
+                             item "Idioma · Language · اللغة" grava;
+                             padrão: o idioma do PS4). pt-BR = XMB da 0.38
+  game-language.txt          idioma dos jogos: auto ou o número do idioma
+                             do PS3, 0 a 19 (o item "Idioma dos jogos"
+                             grava; padrão: automático)
+  custom_configs/<TITLE_ID>.game-language
+                             o mesmo para um jogo (padrão: o global)
+  audio-no-stretch.flag      Áudio contínuo desligado (o menu grava;
+                             padrão: automático)
+  audio-upstream-skip.flag   bloco de som atrasado jogado fora depois de
+                             10,7 ms, como no RPCS3 (padrão: espera até 64
+                             ms enquanto houver reserva)
+  mesa-cache-off.flag        sem o cache de shaders do driver de vídeo
+                             (padrão: ligado em /data/rpcs3/cache/mesa)
+  zcull-strict-gl.flag       ZCULL estrito também no OpenGL (padrão:
+                             relaxado no OpenGL, valores do PC no Vulkan)
+  gl-async.flag              opcional: compilador de shaders em segundo
+                             plano no OpenGL (1 thread; padrão: desligado)
+  interp-no-lane.flag        links do intérprete de shaders na fila comum
+                             (padrão: passam na frente)
+  rsx-label-direct.flag      etiquetas da GPU emulada pela memória
+                             protegida, como na 0.38
+  zcull-av-upstream.flag     ordem do RPCS3 numa falta de página do ZCULL
+  no-av-livelock-net.flag    sem a rede de segurança das faltas de página
+                             repetidas (também volta o fechamento do
+                             aplicativo pelo PS4 em 10 s depois de um
+                             crash da thread de vídeo, como na 0.38)
+  vma-keep-empty.flag        mantém blocos vazios de memória de vídeo
+  rings-no-grow.flag         anéis da GPU emulada não crescem (padrão:
+                             crescem quando o jogo precisa; o tamanho fica
+                             guardado por jogo)
+  no-hang-stop.flag          GPU parada: espera para sempre, como na 0.38
+                             (padrão: volta para a XMB depois de 10 s)
+  dead-fifo-stop.flag        opcional: "Dead FIFO" volta para a XMB em vez
+                             de "Erro no emulador" (padrão: como na 0.38)
+  shader-translate-async.flag
+                             opcional, só para o teste F2: shaders novos
+                             traduzidos fora da thread da GPU emulada
+  thread-no-retry.flag       criação de thread recusada falha na hora
+                             (padrão: tenta de novo uma vez)
+  governor-v038.flag         regras de memória e de threads da 0.38
+  precise-sleep-spin.flag    esperas curtas com o timer HR a partir de 40
+                             µs (padrão: 30 µs)
+  ppu-start-wait.flag        sys_ppu_thread_start espera a thread nova de
+                             prioridade menor, como no RPCS3 (padrão: não
+                             espera, como no PS3)
+  frozen-stays.flag          jogo congelado por acesso inválido fica
+                             parado na tela, como na 0.38 (padrão: volta
+                             para a XMB)
+  no-fs-repair.flag          não conserta as pastas criadas pelo FTP e não
+                             põe de lado a pasta de cache bloqueada
+  dev-hdd0-gate-off.flag     abre o jogo mesmo com dev_hdd0/game ou
+                             dev_hdd0/home/00000001 bloqueado (padrão: X
+                             avisa e não abre)
+  iso-strict-header.flag     recusa a ISO sem o cabeçalho de disco do PS3,
+                             como na 0.38 (padrão: abre como imagem sem
+                             criptografia)
+  stall-strict.flag          regra de travamento da 0.38: só quadros do
+                             jogo, progresso do boot e a lista de saves
+                             contam como atividade (padrão: uma janela de
+                             mensagem do sistema na tela e muita leitura
+                             e gravação de arquivos também contam)
+  cool-mode-serial-boot.flag Modo frio com uma compilação de cada vez
+                             também na primeira abertura, como na 0.38
+                             (padrão: até 2 na abertura, uma durante o
+                             jogo)
+Antigos com efeito novo na 0.39
+  keep-service-threads.flag  também cria todas as threads de serviço ao
+                             abrir o jogo (padrão 0.39: cada uma só quando
+                             o jogo usa)
+  rings-full.flag            também vale para o anel auxiliar de texturas
+  thread-limit-probe.flag    SÓ PARA TESTE: mede o limite de threads ao
+                             abrir o aplicativo (sem jogo); 0.39: grava o
+                             resultado em thread-cap.txt para este
+                             firmware. Apague depois
