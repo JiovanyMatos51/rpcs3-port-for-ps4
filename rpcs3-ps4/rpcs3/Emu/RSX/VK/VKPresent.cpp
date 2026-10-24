@@ -17,6 +17,7 @@
 #include "VKDMA.h"
 #include "vkutils/descriptors.h"
 #include "util/ps4_gpu_health.hpp"
+#include "util/ps4_rsx_programs.hpp"
 #include "util/ps4_vram_policy.hpp"
 #endif
 
@@ -587,6 +588,8 @@ namespace
 	constexpr u64 ps4_hold_reference_us = 750'000;
 	constexpr u32 ps4_burst_min_pending = 10;
 	constexpr u32 ps4_burst_notes_max = 16;
+	// RPCS3.log burst lines per renderer (testers often send RPCS3.log alone)
+	constexpr u32 ps4_burst_log_notes_max = 64;
 }
 
 void VKGSRender::ps4_track_pipeline_burst(u64 now, u32 skipped, u32 draws)
@@ -594,6 +597,15 @@ void VKGSRender::ps4_track_pipeline_burst(u64 now, u32 skipped, u32 draws)
 	auto& pc = rsx::g_ps4_rsx_counters;
 	auto& burst = m_ps4_burst;
 	const u32 pending = vk::ps4_pipelines_pending();
+
+	// Where the RPCS3.log line counts from: interpreter links and draws, and the longest pipeline wait.
+	const auto snapshot = [&]()
+	{
+		burst.links_at_start = vk::ps4_interpreter_first_use_links(burst.link_us_at_start);
+		burst.interp_draws_at_start = vk::g_ps4_interpreter_draws_total;
+		burst.skipped_total = 0;
+		utils::ps4::rsx_programs::g_pipeline_waits.burst_max_us.exchange(0, std::memory_order_relaxed);
+	};
 
 	if (!burst.active)
 	{
@@ -603,6 +615,7 @@ void VKGSRender::ps4_track_pipeline_burst(u64 now, u32 skipped, u32 draws)
 			burst.start_us = now;
 			burst.submitted_at_start = pc.pipe_submitted.load();
 			pc.pipe_burst_max.release(0);
+			snapshot();
 			return;
 		}
 
@@ -612,6 +625,7 @@ void VKGSRender::ps4_track_pipeline_burst(u64 now, u32 skipped, u32 draws)
 			burst.start_us = now;
 			const u64 submitted = pc.pipe_submitted.load();
 			burst.submitted_at_start = submitted > pending ? submitted - pending : 0;
+			snapshot();
 		}
 
 		burst.active = true;
@@ -623,6 +637,7 @@ void VKGSRender::ps4_track_pipeline_burst(u64 now, u32 skipped, u32 draws)
 	if (skipped)
 	{
 		burst.frames_with_skips++;
+		burst.skipped_total += skipped;
 
 		if (skipped > burst.worst_skips)
 		{
@@ -651,8 +666,31 @@ void VKGSRender::ps4_track_pipeline_burst(u64 now, u32 skipped, u32 draws)
 			burst.notes == ps4_burst_notes_max ? " (last burst line of this boot)" : "").c_str());
 	}
 
+	// RPCS3.log: every burst that lost draws or reached the startup.log size, with how long its pipelines waited and
+	// what the shader interpreter did meanwhile.
+	if ((peak >= ps4_burst_min_pending || burst.skipped_total) && burst.log_notes < ps4_burst_log_notes_max)
+	{
+		burst.log_notes++;
+
+		u64 link_us = 0;
+		const u64 links = vk::ps4_interpreter_first_use_links(link_us);
+
+		utils::ps4::rsx_programs::burst_summary summary;
+		summary.pipelines = submitted - burst.submitted_at_start;
+		summary.seconds = (now - burst.start_us) / 1'000'000.;
+		summary.ready_max_ms = utils::ps4::rsx_programs::g_pipeline_waits.burst_max_us.load(std::memory_order_relaxed) / 1000;
+		summary.links = links - std::min(burst.links_at_start, links);
+		summary.link_ms = (link_us - std::min(burst.link_us_at_start, link_us)) / 1000;
+		summary.skipped = burst.skipped_total;
+		summary.frames_with_skips = burst.frames_with_skips;
+		summary.interpreter_draws = vk::g_ps4_interpreter_draws_total - burst.interp_draws_at_start;
+		summary.last = burst.log_notes == ps4_burst_log_notes_max;
+		rsx_log.notice("%s", utils::ps4::rsx_programs::burst_line(summary));
+	}
+
 	burst.start_us = now;
 	burst.submitted_at_start = submitted;
+	snapshot();
 }
 
 bool VKGSRender::ps4_hold_incomplete_frame(const rsx::display_flip_info_t& info)
@@ -1324,7 +1362,12 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		.min_scalable_dimension = static_cast<u16>(g_cfg.video.min_scalable_dimension),
 	};
 
+#ifdef RPCS3_PS4
+	// With MSAA on, a live change waits for the next boot (the running config stays latched)
+	if (active_res_scaling_config != this->resolution_scaling_config && !ps4_scale_change_deferred(active_res_scaling_config))
+#else
 	if (active_res_scaling_config != this->resolution_scaling_config)
+#endif
 	{
 		// First, try to reclaim any memory since the res scale upgrade is so memory intensive
 		if (const auto severity = vk::vmm_determine_memory_load_severity();

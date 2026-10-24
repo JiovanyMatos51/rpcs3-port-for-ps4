@@ -671,7 +671,8 @@ void test_reopen_folder()
 void test_user_folders()
 {
     const auto at = [](std::string_view name) { return static_cast<std::size_t>(std::find_if(fr::key_folders.begin(), fr::key_folders.end(), [&](const char* k) { return name == k; }) - fr::key_folders.begin()); };
-    CHECK(fr::key_folders.size() == 23 && at("dev_hdd0/home") < at("dev_hdd0/home/00000001") && at("dev_hdd0/home/00000001") < at("dev_hdd0/home/00000001/exdata"));
+    CHECK(fr::key_folders.size() == 24 && at("dev_hdd0/home") < at("dev_hdd0/home/00000001") && at("dev_hdd0/home/00000001") < at("dev_hdd0/home/00000001/exdata"));
+    CHECK(at("keys") < fr::key_folders.size());
     CHECK(at("cheats") < fr::key_folders.size());
     CHECK(at("dev_hdd0/home/00000001/exdata") < fr::key_folders.size());
     CHECK(fr::in_savedata("dev_hdd0/home/00000001/savedata") && fr::in_savedata("dev_hdd0/home/00000001/savedata/BLUS30443-SAVE") && !fr::in_savedata("dev_hdd0/home/00000001"));
@@ -691,6 +692,38 @@ void test_user_folders()
     CHECK(contains(r.key_blocked, "dev_hdd0/home/00000001"));
     CHECK(contains(sites, "SITE CHMOD 777 /data/rpcs3/dev_hdd0/home/00000001") && contains(sites, "SITE CHMOD 666 /data/rpcs3/dev_hdd0/home/00000001/localusername"));
     CHECK(contains(sites, "SITE CHMOD 666 /data/rpcs3/dev_hdd0/home/00000001/savedata/BLUS30443-SAVE/USR-DATA"));
+    CHECK(!r.blocked());
+}
+
+// The disc key inbox /data/rpcs3/keys: made 0777 by the app when missing (FTP uploads land in it); made over FTP it is
+// opened like any key folder, but nothing below it (the player's key files, lists, IRDs and their folders) is ever sent
+// a SITE CHMOD or chmod'ed by the app
+void test_key_inbox()
+{
+    CHECK(fr::in_inbox("keys/a.txt") && fr::in_inbox("keys/sub/x.dkey") && !fr::in_inbox("keys") && !fr::in_inbox("keysx/a") && !fr::in_inbox("data/keys/a"));
+    world fresh;
+    fresh.dir("/data", 0, 0777);
+    fresh.dir("/data/rpcs3", app_uid, 0777);
+    const fr::report made = fresh.run();
+    CHECK(contains(made.created, "keys") && fresh.find("/data/rpcs3/keys") && fresh.find("/data/rpcs3/keys")->uid == app_uid &&
+        fresh.find("/data/rpcs3/keys")->mode == 0777);
+
+    world w;
+    w.dir("/data", 0, 0777);
+    w.dir("/data/rpcs3", app_uid, 0777);
+    for (const char* rel : fr::key_folders)
+        if (*rel) w.dir(fr::full_path(rel), app_uid, 0777);
+    w.dir("/data/rpcs3/keys", ftp_uid, 0755);
+    w.file("/data/rpcs3/keys/meus-discos.txt", ftp_uid, 0644);
+    w.file("/data/rpcs3/keys/BLES01876.dkey", ftp_uid, 0644);
+    w.dir("/data/rpcs3/keys/ird", ftp_uid, 0755);
+    w.file("/data/rpcs3/keys/ird/FIFA 14.ird", ftp_uid, 0644);
+    const fr::report r = w.run();
+    const auto sites = w.sites();
+    CHECK(contains(sites, "SITE CHMOD 777 /data/rpcs3/keys") && contains(r.key_blocked, "keys"));
+    for (const std::string& c : sites) CHECK(c.find("/data/rpcs3/keys/") == std::string::npos);
+    CHECK(w.find("/data/rpcs3/keys/meus-discos.txt")->mode == 0644 && w.find("/data/rpcs3/keys/ird")->mode == 0755 &&
+        w.find("/data/rpcs3/keys/ird/FIFA 14.ird")->mode == 0644);
     CHECK(!r.blocked());
 }
 
@@ -989,6 +1022,7 @@ int main()
     test_cache_moved_aside();
     test_reopen_folder();
     test_user_folders();
+    test_key_inbox();
     std::printf("%s: %d checks, %d failures\n", g_failures ? "FAIL" : "PASS", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

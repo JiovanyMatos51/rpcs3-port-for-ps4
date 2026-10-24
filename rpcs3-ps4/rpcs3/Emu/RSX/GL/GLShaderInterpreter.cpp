@@ -10,14 +10,37 @@
 #include "Emu/RSX/Program/GLSLCommon.h"
 #include "Emu/localized_string.h"
 
+#ifdef RPCS3_PS4
+#include "util/ps4_rsx_programs.hpp"
+#include "util/ps4_safe_mode.hpp"
+#endif
+
 namespace gl
 {
 	using glsl::shader;
 	using enum program_common::interpreter::compiler_option;
 	using enum program_common::interpreter::cached_pipeline_flags;
 
+#ifdef RPCS3_PS4
+	// Feature interp_step_bound (kill: interpreter-unbounded.flag): the interpreter loops of both stages end after
+	// interp_step_limit steps (util/ps4_rsx_programs.hpp); without the define the GLSL keeps the upstream loop. Read per
+	// program build (the value changes only between boots).
+	static void ps4_insert_step_limit(std::stringstream& builder)
+	{
+		if (utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::interp_step_bound))
+		{
+			builder << utils::ps4::rsx_programs::interp_step_define;
+		}
+	}
+#endif
+
 	void shader_interpreter::create(rsx::shader_loading_dialog* dlg)
 	{
+#ifdef RPCS3_PS4
+		ps4_startup_checkpoint(utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::interp_step_bound)
+			? fmt::format("OpenGL: interpreter step limit %u (interpreter-unbounded.flag removes it)", utils::ps4::rsx_programs::interp_step_limit).c_str()
+			: "OpenGL: interpreter loops unbounded, as upstream (interp_step_bound off: interpreter-unbounded.flag)");
+#endif
 		dlg->create(get_localized_string(localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS), get_localized_string(localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_TITLE));
 
 		const auto variants = program_common::interpreter::get_interpreter_variants();
@@ -262,6 +285,9 @@ namespace gl
 		::glsl::insert_glsl_legacy_function(builder, properties);
 		::glsl::insert_vertex_input_fetch(builder, ::glsl::glsl_rules::glsl_rules_opengl4);
 
+#ifdef RPCS3_PS4
+		ps4_insert_step_limit(builder);
+#endif
 		builder << program_common::interpreter::get_vertex_interpreter();
 		const std::string s = builder.str();
 
@@ -418,6 +444,9 @@ namespace gl
 		};
 
 		::glsl::insert_glsl_legacy_function(builder, properties);
+#ifdef RPCS3_PS4
+		ps4_insert_step_limit(builder);
+#endif
 		builder << program_common::interpreter::get_fragment_interpreter();
 		const std::string s = builder.str();
 

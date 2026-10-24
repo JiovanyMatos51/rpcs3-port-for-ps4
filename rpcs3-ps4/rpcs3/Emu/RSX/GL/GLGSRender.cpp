@@ -15,7 +15,9 @@
 #ifdef RPCS3_PS4
 #include "ps4_launcher.h"
 #include "Utilities/File.h"
+#include "util/ps4_policy.hpp"
 #include "util/ps4_rsx_programs.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 #include <chrono>
 
@@ -81,6 +83,11 @@ GLGSRender::~GLGSRender()
 	// Force-release ZCULL-ctrl since it is a pointer to self.
 	zcull_ctrl.release();
 
+#ifdef RPCS3_PS4
+	// gl_state (this object's state tracker) is destroyed with the renderer: nothing released later may reach it
+	gl::ps4_clear_command_context();
+#endif
+
 	if (m_frame)
 	{
 		m_frame->reset();
@@ -131,7 +138,9 @@ void GLGSRender::on_init_thread()
 		shadermode = shader_mode::recompiler;
 	};
 
-	if (shadermode != shader_mode::recompiler && !fs::is_file(utils::ps4::rsx_programs::gl_async_flag))
+	// The console's platform rule (util/ps4_policy.hpp, apply_platform_limits): the boot policy and the settings
+	// browser show the same mode, so the row says what runs.
+	if (utils::ps4::platform_gl_shader_mode(shadermode, fs::is_file(utils::ps4::rsx_programs::gl_async_flag)) != shadermode)
 	{
 		ps4_compile_inline("asynchronous compilation needs /data/rpcs3/gl-async.flag");
 	}
@@ -185,6 +194,19 @@ void GLGSRender::on_init_thread()
 
 	gl::init();
 	gl::set_command_context(gl_state);
+
+#ifdef RPCS3_PS4
+	// gl_vram_guard (glutils/image.cpp): a texture whose storage could not be allocated first lets this renderer's
+	// texture cache give back what it can (try-locked: nothing when the failure comes from inside the cache).
+	gl::ps4_set_vram_relief([]() -> bool
+	{
+		auto* const renderer = dynamic_cast<GLGSRender*>(rsx::get_current_renderer());
+		return renderer && renderer->is_current_thread() && renderer->m_gl_texture_cache.ps4_try_release_memory();
+	});
+	ps4_startup_checkpoint(utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::gl_vram_guard)
+		? "OpenGL: a texture Zink cannot allocate releases cached textures and is tried once more, then the game stops with 'use Vulkan' (gl_vram_guard; gl-vram-guard-off.flag: as upstream)"
+		: "OpenGL: texture allocation failures are not checked, as upstream (gl_vram_guard off: gl-vram-guard-off.flag)");
+#endif
 
 	update_swap_interval();
 
@@ -674,6 +696,12 @@ void GLGSRender::on_exit()
         m_context = nullptr;
         if (!m_continuous_mode) m_frame->hide();
     }
+
+    // The context is gone: a GL object released after this point (a teardown after an RSX fatal) makes no GL call
+    // and never reaches this renderer's state tracker.
+    gl::ps4_clear_command_context();
+    gl::ps4_set_vram_relief(nullptr);
+    rsx_log.notice("PS4 GL: renderer GL context and state tracker released");
 #endif
 }
 

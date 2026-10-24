@@ -12,6 +12,7 @@
 //    key, typed values, the console's own file read back
 //  6 import naming: serial from the file name / directive / metadata / header, title matching, cheats.yml split
 //  7 robustness: 10^5 random lines and random bytes never crash and never pass a cap
+//  8 stat failures: EIO for a file under a missing folder is "not there", EIO inside an existing folder a read error
 // (the CHT strings are checked by i18n_test, area CHT)
 // Build and run from the repo root (llvm-mingw, as the other host tests):
 //   clang++ -std=c++20 -O2 -static -Wall -Wextra -I rpcs3 ps4-port/tests/cheats_test.cpp -o cheats_test.exe
@@ -876,6 +877,23 @@ void test_robustness()
         (void)ch::detail::eval_script(script, 0x10000, [](u32, u32& v) { v = 0x10000; return true; }, out, 0);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// A failed stat() of a cheats file: not there (no note) vs a read error (CHT_ERRO_LER note, import keeps a backup)
+void test_stat_missing()
+{
+    // the folder itself is missing: the console answers EIO for every file under it
+    CHECK(ch::stat_failure_is_missing(EIO, false));
+    // EIO inside an existing folder stays a read error
+    CHECK(!ch::stat_failure_is_missing(EIO, true));
+    // the plain answers do not depend on the folder
+    CHECK(ch::stat_failure_is_missing(ENOENT, true) && ch::stat_failure_is_missing(ENOENT, false));
+    CHECK(ch::stat_failure_is_missing(ENOTDIR, true) && ch::stat_failure_is_missing(ENOTDIR, false));
+    // other errors are read errors with or without the folder
+    for (const int error : {EACCES, EPERM, ENAMETOOLONG, EINVAL, ENOMEM, 0})
+        CHECK(!ch::stat_failure_is_missing(error, true) && !ch::stat_failure_is_missing(error, false));
+    static_assert(ch::stat_failure_is_missing(EIO, false) && !ch::stat_failure_is_missing(EIO, true));
+}
 } // namespace
 
 int main()
@@ -887,6 +905,7 @@ int main()
     test_state_and_game();
     test_import_naming();
     test_robustness();
+    test_stat_missing();
     std::printf("cheats_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

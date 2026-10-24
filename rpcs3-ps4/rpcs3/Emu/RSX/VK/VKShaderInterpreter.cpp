@@ -21,6 +21,7 @@
 #include "Emu/system_config.h"
 #include "Utilities/File.h"
 #include "util/ps4_rsx_programs.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -104,6 +105,45 @@ namespace vk
 
 			auto holder = std::make_unique<std::shared_ptr<glsl::program>>(std::move(program));
 			vk::get_gc()->dispose(holder);
+		}
+
+		// Feature interp_step_bound (kill: interpreter-unbounded.flag): the interpreter loops of both stages end after
+		// rp::interp_step_limit steps; without the define the GLSL keeps the upstream loop. Read per variant build (the
+		// value changes only between boots).
+		bool ps4_step_bound_on() noexcept
+		{
+			return utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::interp_step_bound);
+		}
+
+		// A vertex program that samples vertex textures asked for an interpreter variant: the interpreter cannot sample
+		// them (TXL is not implemented), so its draws are wrong while its pipeline compiles. One line per program (by
+		// its shape: ucode length, texture and input masks), at most ps4_vtx_texture_notes_max per process. The
+		// generic form enables the vertex-texture option for every link, so the variant build itself says nothing.
+		constexpr u32 ps4_vtx_texture_notes_max = 32;
+		std::array<u64, ps4_vtx_texture_notes_max> s_ps4_vtx_texture_seen{};
+		u32 s_ps4_vtx_texture_notes = 0; // RSX thread only
+
+		void ps4_note_vertex_textures(const program_hash_util::vertex_program_utils::vertex_program_metadata& vp) noexcept
+		{
+			const u64 id = (u64{vp.ucode_length} << 32) ^ (u64{vp.referenced_textures_mask} << 16) ^ vp.referenced_inputs_mask;
+
+			for (u32 i = 0; i < s_ps4_vtx_texture_notes; i++)
+			{
+				if (s_ps4_vtx_texture_seen[i] == id)
+				{
+					return;
+				}
+			}
+
+			if (s_ps4_vtx_texture_notes >= ps4_vtx_texture_notes_max)
+			{
+				return;
+			}
+
+			s_ps4_vtx_texture_seen[s_ps4_vtx_texture_notes++] = id;
+			rsx_log.warning("PS4 RSX: vertex program (ucode %u bytes, textures 0x%x, inputs 0x%x) samples vertex textures; the shader interpreter cannot (TXL unimplemented)%s",
+				vp.ucode_length, vp.referenced_textures_mask, vp.referenced_inputs_mask,
+				s_ps4_vtx_texture_notes == ps4_vtx_texture_notes_max ? " (last such line of this process)" : "");
 		}
 	}
 
@@ -338,11 +378,15 @@ namespace vk
 		"	uvec4 vp_instructions[];\n"
 		"};\n\n";
 
+#ifndef RPCS3_PS4
+		// On the PS4 the note is made once per vertex program that samples vertex textures (shader_interpreter::get):
+		// the generic form sets this option for every link, so this line said nothing about the game.
 		if (compiler_options & COMPILER_OPT_ENABLE_VTX_TEXTURES)
 		{
 			// FIXME: Unimplemented
 			rsx_log.todo("Vertex textures are currently not implemented for the shader interpreter.");
 		}
+#endif
 
 		if (compiler_options & COMPILER_OPT_ENABLE_INSTANCING)
 		{
@@ -358,6 +402,12 @@ namespace vk
 		::glsl::insert_vertex_input_fetch(builder, ::glsl::glsl_rules::glsl_rules_vulkan);
 		comp.insertFSExport(builder);
 
+#ifdef RPCS3_PS4
+		if (ps4_step_bound_on())
+		{
+			builder << rp::interp_step_define;
+		}
+#endif
 		builder << program_common::interpreter::get_vertex_interpreter();
 		const std::string s = builder.str();
 
@@ -540,6 +590,12 @@ namespace vk
 			"	float alpha_ref = fs_contexts[_fs_context_offset].alpha_ref;\n\n";
 
 		::glsl::insert_glsl_legacy_function(builder, properties);
+#ifdef RPCS3_PS4
+		if (ps4_step_bound_on())
+		{
+			builder << rp::interp_step_define;
+		}
+#endif
 		builder << program_common::interpreter::get_fragment_interpreter();
 		const std::string s = builder.str();
 
@@ -605,6 +661,9 @@ namespace vk
 			m_ps4_lru ? fmt::format("at most %u pipelines kept, least recently used released (interpreter-no-lru.flag keeps all)",
 				rp::interpreter_cap(s_ps4_cap_request.load(std::memory_order_relaxed)))
 				: std::string("every pipeline kept (interpreter-no-lru.flag)")).c_str());
+		ps4_startup_checkpoint(ps4_step_bound_on()
+			? fmt::format("Vulkan: interpreter step limit %u (interpreter-unbounded.flag removes it)", rp::interp_step_limit).c_str()
+			: "Vulkan: interpreter loops unbounded, as upstream (interp_step_bound off: interpreter-unbounded.flag)");
 #endif
 	}
 
@@ -787,6 +846,11 @@ namespace vk
 			return m_current_interpreter.get();
 		}
 #ifdef RPCS3_PS4
+		if (vp_metadata.referenced_textures_mask)
+		{
+			ps4_note_vertex_textures(vp_metadata);
+		}
+
 		return ps4_get(key);
 #else
 		else

@@ -53,6 +53,23 @@
 // console limits: Exit RPCS3 when process finishes, Assume External Debugger, Initialize Directories and Automatically
 // start games after boot keep their upstream defaults.
 //
+// 0.40: changes for every game run the 0.38 values unless their row of util/ps4_safe_mode.hpp is turned on: the 34 ms
+// audio reserve (audio_reserve_64: 64 ms), the strict ZCULL pair on OpenGL (gl_relaxed_zcull: relaxed), English (US)
+// as the automatic game language (game_language_ps4, or the row value 'Idioma do PS4': the PS4 language). Profile
+// version 40 migrates the 64 ms reserve and the relaxed OpenGL pair that profile 39 (0.39) saved back. The per-game
+// safe mode (util/ps4_adapt.hpp safe_status) adds its boot items: the lighter thread budget after a thread failure, the
+// Async Recompiler after a GPU failure, from level 2 online off, one compile thread and the title's config database
+// entry skipped (config-database-off.flag skips it for every title), at level 3 the Async Recompiler without the
+// shader interpreter. Modo online without an RPCN account in rpcn.yml boots offline (online-without-account.flag:
+// the network stays up). The boot toast names the level and the failure.
+// Also in 0.40: a thread failure keeps the title's database entry at every level; Resolution Scale runs at most 200 %
+// and Audio Renderer 'Null' runs as Cubeb (console limits); the platform step (apply_platform_limits) shows what the
+// renderer would replace anyway (OpenGL without gl-async.flag: the legacy recompiler); the disk cache bound follows the
+// free space of /data; after a device loss the title's next boots split command buffers (adapt cb_split); a game boot
+// logs which values of the player's files run otherwise ('settings:'), and a game's own format-1 values the profile
+// replaces get one toast per build pointing at the Converter; legacy_choices() offers the global layer's own values to
+// the settings menu, which pins them only on the player's request.
+//
 // Never construct a cfg_root in this header: System.cpp is compiled without HAVE_VULKAN, and cfg_root's inline
 // constructor (default renderer) may only be emitted by TUs that agree on it (system_config.cpp #error, ODR).
 // Do not use HAVE_VULKAN here either, for the same reason (these inline functions are shared by both TUs).
@@ -67,12 +84,15 @@
 #include "Utilities/File.h"
 #include "util/sysinfo.hpp"
 #include "util/ps4_adapt.hpp"
+#include "util/ps4_build_version.hpp"
 #include "util/ps4_config_db.hpp"
 #include "util/ps4_cool_mode.hpp"
 #include "util/ps4_i18n.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -80,6 +100,15 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
+
+#ifdef RPCS3_PS4
+#include <sys/statvfs.h>
+
+#include "util/logs.hpp"
+
+// The RPCS3.log copy of the boot's 'settings:' line (testers often send RPCS3.log alone).
+LOG_CHANNEL(ps4_policy_log, "PS4");
+#endif
 
 // PS4 frontend (ps4_fatal.cpp, ps4_launcher.cpp); the same declarations as ps4_fatal.h and ps4_launcher.h.
 // Only the real boot path (apply_boot_policy) calls them, never the menu preview.
@@ -171,8 +200,10 @@ inline constexpr char vk_compile_3_flag[] = "/data/rpcs3/vk-compile-3.flag";
 // instead of the PC defaults. Per-title rows and config database entries still decide over both.
 inline constexpr char shader_skip_draws_flag[] = "/data/rpcs3/shader-skip-draws.flag";
 inline constexpr char zcull_relaxed_flag[] = "/data/rpcs3/zcull-relaxed.flag";
-// 0.39: OpenGL runs the relaxed ZCULL pair by default (through Zink every strict occlusion query is a blocking
-// glGetQueryObjectiv round trip on the RSX thread); this escape file keeps the strict pair there.
+// 0.39: OpenGL ran the relaxed ZCULL pair by default (through Zink every strict occlusion query is a blocking
+// glGetQueryObjectiv round trip on the RSX thread); this escape file keeps the strict pair there. 0.40: the relaxed
+// OpenGL pair is the opt-in row gl_relaxed_zcull (gl-relaxed-zcull.flag, util/ps4_safe_mode.hpp), whose kill flag
+// this file is.
 inline constexpr char zcull_strict_gl_flag[] = "/data/rpcs3/zcull-strict-gl.flag";
 // 0.39: an asynchronous OpenGL compile worker on a shared EGL context is available (the GL renderer reads the same
 // file, util/ps4_rsx_programs.hpp); without it the GL renderer falls back to the legacy recompiler.
@@ -198,16 +229,27 @@ inline bool profile_zcull_relaxed()
     return fs::is_file(zcull_relaxed_flag);
 }
 
-// 0.39: the same for one renderer: OpenGL also runs the relaxed pair unless zcull-strict-gl.flag exists.
+// 0.40: the feature rows (util/ps4_safe_mode.hpp) the policy decides with when the caller has no runtime_inputs: the
+// flag files, features.txt, the global safe mode and the title's safe-mode level now (defined after
+// read_runtime_inputs). An empty title gives the files at level 0.
+inline u64 policy_features(std::string_view title_id = {});
+
+// 0.39: the same for one renderer: OpenGL also runs the relaxed pair with the feature mask's gl_relaxed_zcull (0.40:
+// off by default, the 0.38 strict pair; zcull-strict-gl.flag is its kill flag).
+inline bool profile_zcull_relaxed(video_renderer renderer, u64 features)
+{
+    return profile_zcull_relaxed() || (renderer == video_renderer::opengl && safe_mode::enabled_in(features, safe_mode::feature::gl_relaxed_zcull));
+}
+
 inline bool profile_zcull_relaxed(video_renderer renderer)
 {
-    return profile_zcull_relaxed() || (renderer == video_renderer::opengl && !fs::is_file(zcull_strict_gl_flag));
+    return profile_zcull_relaxed(renderer, policy_features());
 }
 
 // 0.37: version of the automatic profile. The settings menu appends 'PS4 automatic profile: N' to every YAML it saves
 // (cfg skips unknown keys when it loads a config); a saved YAML without it was written by profile 36 or older.
-// 0.39: 39 (0.37 and 0.38 wrote 37).
-inline constexpr unsigned automatic_profile_version = 39;
+// 0.39: 39 (0.37 and 0.38 wrote 37). 0.40: 40 (the 34 ms reserve and the strict OpenGL pair are the defaults again).
+inline constexpr unsigned automatic_profile_version = 40;
 inline constexpr std::string_view profile_stamp_key = "PS4 automatic profile";
 
 namespace policy_detail
@@ -590,6 +632,35 @@ inline constexpr u32 vram_min_mb = 256, vram_max_mb = 65536; // 'VRAM allocation
 // would lose its cache on every boot and copy it again.
 inline constexpr s64 disk_cache_max_mb = 4096;
 inline constexpr s64 disk_cache_floor_mb = 1024;
+// 0.40: the upper bound follows the free space of /data (row disk_cache_order; disk-cache-upstream.flag keeps 4096 MB):
+// 10 % of it, at least 4096 MB and at most 16384 MB, so first-boot PPU builds (10-59 min each) survive longer on a
+// console with room. Disk use is not guest-visible. The setting itself holds at most disk_cache_setting_max_mb.
+inline constexpr s64 disk_cache_cap_max_mb = 16384;
+inline constexpr s64 disk_cache_setting_max_mb = 10240;
+
+// The cap for 'data_free_mb' MB free on /data (0 = unknown: 4096 MB)
+constexpr s64 disk_cache_cap_mb(u64 data_free_mb) noexcept
+{
+    const u64 tenth = data_free_mb / 10;
+    if (tenth <= static_cast<u64>(disk_cache_max_mb)) return disk_cache_max_mb;
+    return tenth >= static_cast<u64>(disk_cache_cap_max_mb) ? disk_cache_cap_max_mb : static_cast<s64>(tenth);
+}
+
+// Free MB on /data now, 0 when unknown (statvfs refused, or numbers that cannot be right: the same plausibility rules
+// as the health checks). Host builds always answer 0.
+inline u64 data_free_mb() noexcept
+{
+#ifdef RPCS3_PS4
+    struct ::statvfs st{};
+    if (::statvfs("/data/rpcs3/", &st) != 0) return 0;
+    const u64 unit = st.f_frsize ? static_cast<u64>(st.f_frsize) : static_cast<u64>(st.f_bsize);
+    const u64 blocks = static_cast<u64>(st.f_blocks), avail = static_cast<u64>(st.f_bavail);
+    if (!unit || (unit & (unit - 1)) || blocks > ~u64{0} / unit || unit * blocks < (u64{1} << 30) || avail > blocks) return 0;
+    return (unit * avail) >> 20;
+#else
+    return 0;
+#endif
+}
 
 inline bool online_enabled()
 {
@@ -1120,6 +1191,58 @@ inline const unsafe_option* unsafe_option_for(cfg_root& cfg, const cfg::_base& s
     return nullptr;
 }
 
+// 0.40: one value with no meaning on PS4 that a saved file can still hold, for a setting whose other values stay as
+// chosen: the boot replaces only that value, in every mode but keep-user-settings.flag. Found by setting key, so a
+// config tree without the setting skips the row.
+struct unsafe_value
+{
+    std::string_view key;   // setting_key()
+    std::string_view value; // the YAML text it replaces
+    std::string_view safe;  // the YAML text that runs instead (the upstream default)
+    std::string_view why;   // RPCS3.log and the startup.log console-limit line
+    i18n::str menu;         // the settings browser's reason
+};
+
+inline constexpr unsafe_value unsafe_values[] =
+{
+    // The PS4 frontend always opens its own AudioOut backend, so 'Null' never muted anything: cellAudio only turned its
+    // buffering off for it, and the unbuffered period clock then fired whole catch-up bursts after the boot wait and
+    // after pauses (thousands of dropped blocks per boot). Cubeb is the upstream default; Master Volume mutes.
+    {"Audio > Renderer", "Null", "Cubeb",
+        "the PS4 has one sound output: Null did not mute, it only turned buffering off and the sound stuttered (use Master Volume)",
+        i18n::str::CFGR_AUDIO_NULL_PS4},
+};
+
+// The unsafe_values row for 'setting', or nullptr.
+inline const unsafe_value* unsafe_value_for(const cfg::_base& setting)
+{
+    const std::string key = setting_key(setting);
+    for (const unsafe_value& item : unsafe_values)
+        if (item.key == key) return &item;
+    return nullptr;
+}
+
+// 0.40: Resolution Scale above this runs at it (a pin, a saved file, the in-game menu's last value): render targets
+// grow with the square of the scale, and a live 650 % ended the RSX in VK_ERROR_OUT_OF_DEVICE_MEMORY within a frame.
+// A hard-limit guard derived from the 768 MB device-local cap (200 % = 4x the surface memory of 100 %); the in-game
+// slider stops at resolution_scale_slider_max_percent. The PC config database cap of 100 % stays in
+// apply_config_database.
+inline constexpr u64 resolution_scale_cap_percent = 200;
+inline constexpr u64 resolution_scale_slider_max_percent = 150;
+
+namespace policy_detail
+{
+// A leaf of 'cfg' by setting key, nullptr when this tree has none
+inline cfg::_base* find_leaf(cfg_root& cfg, std::string_view key)
+{
+    std::vector<const cfg::_base*> leaves;
+    collect_leaves(cfg.get_nodes(), leaves);
+    for (const cfg::_base* leaf : leaves)
+        if (setting_key(*leaf) == key) return const_cast<cfg::_base*>(leaf); // a member of the mutable tree 'cfg'
+    return nullptr;
+}
+} // namespace policy_detail
+
 // 0.32: the unsafe options and the compile-thread limits (change_kind::console), after the automatic profile or the
 // per-title rows and before the runtime section (whose adaptation may still lower the thread counts to 1).
 template <typename OnChange>
@@ -1149,6 +1272,68 @@ u32 apply_console_limits(cfg_root& cfg, OnChange&& on_change)
     // and its legacy mode does not read the value, so 0 stays there.
     limit(cfg.video.shader_compiler_threads_count, cfg.video.renderer == video_renderer::vulkan ? 1 : 0,
         "at most 2 shader compile threads on PS4 (0 = up to 6 extra threads on Vulkan)");
+    // 0.40: single values without a PS4 meaning (unsafe_values) and the Resolution Scale cap
+    for (const unsafe_value& item : unsafe_values)
+    {
+        cfg::_base* setting = policy_detail::find_leaf(cfg, item.key);
+        if (!setting || setting->to_string() != item.value || !setting->from_string(item.safe)) continue;
+        policy_detail::report(on_change, static_cast<const cfg::_base&>(*setting), std::string(item.value), item.why, change_kind::console);
+        changed++;
+    }
+    if (cfg.video.resolution_scale_percent.get() > resolution_scale_cap_percent)
+    {
+        const std::string old = cfg.video.resolution_scale_percent.to_string();
+        cfg.video.resolution_scale_percent.set(u64{resolution_scale_cap_percent});
+        policy_detail::report(on_change, static_cast<const cfg::_base&>(cfg.video.resolution_scale_percent), old,
+            std::string_view{"above 200 % the render targets outgrow the 768 MB video memory cap of the PS4 (out of device memory)"},
+            change_kind::console);
+        changed++;
+    }
+    return changed;
+}
+
+// 0.40: platform decisions: values the renderer or the backends of this console replace or ignore whatever a file says.
+// One place for the boot (run_boot_policy), the settings browser's preview and the renderers, so a row shows what runs.
+// - OpenGL Shader Mode: without gl-async.flag (no validated asynchronous worker on a shared EGL context) every mode is
+//   the legacy recompiler; GLGSRender keeps the same rule for its own start.
+// - VSync on Vulkan: the console's surface presents with FIFO whatever the mode (every logged swapchain used it); OpenGL
+//   goes through Zink and is not proven, so its row stays editable.
+// - Enable Buffering off: cellAudio's unbuffered clock skips sound after loads and pauses (a warned value, kept).
+constexpr shader_mode platform_gl_shader_mode(shader_mode wanted, bool gl_async) noexcept
+{
+    return gl_async ? wanted : shader_mode::recompiler;
+}
+
+constexpr bool platform_vsync_ignored(video_renderer renderer) noexcept
+{
+    return renderer == video_renderer::vulkan;
+}
+
+constexpr bool platform_buffering_warned(bool enable_buffering) noexcept
+{
+    return !enable_buffering;
+}
+
+inline constexpr std::string_view platform_reason_prefix = "platform: ";
+inline constexpr std::string_view platform_gl_shader_why =
+    "platform: OpenGL compiles shaders with the legacy recompiler without /data/rpcs3/gl-async.flag (the renderer switches at start)";
+
+// Reported as change_kind::console with a reason that starts with "platform: ".
+template <typename OnChange>
+u32 apply_platform_limits(cfg_root& cfg, OnChange&& on_change)
+{
+    u32 changed = 0;
+    if (cfg.video.renderer == video_renderer::opengl)
+    {
+        const shader_mode runs = platform_gl_shader_mode(cfg.video.shadermode.get(), fs::is_file(gl_async_flag));
+        if (runs != cfg.video.shadermode.get())
+        {
+            const std::string old = cfg.video.shadermode.to_string();
+            cfg.video.shadermode.set(runs);
+            policy_detail::report(on_change, static_cast<const cfg::_base&>(cfg.video.shadermode), old, platform_gl_shader_why, change_kind::console);
+            changed++;
+        }
+    }
     return changed;
 }
 
@@ -1160,6 +1345,7 @@ enum class database_use
     rejected,      // the entry has a key or value this build does not know: none of it runs (PC drops it too)
     manual,        // user-tuned game: its saved YAML runs as saved
     custom_config, // automatic configuration off and the game has its own YAML (PC: a custom config wins)
+    skipped,       // 0.40: not applied for this title (config-database-off.flag, or the per-game safe mode level 2)
 };
 
 struct database_result
@@ -1170,6 +1356,9 @@ struct database_result
     std::string capped;  // what it asked above the console's caps ("Resolution 1920x1080")
     bool host_sleep = false; // 0.34: the applied entry writes 'Sleep Timers Accuracy: As Host' explicitly
     u32 keys = 0;        // 0.37: settings the applied entry lists (entry_keys)
+    // 0.40: what the applied entry lists, as 'Name=value' with the final value's fate ("Keyboard=Basic, Multithreaded
+    // RSX=true (capped)"), filled by the boot policy once every step ran (database_items)
+    std::string items;
 };
 
 // Every reason the database step reports starts with this, so the settings menu can tell its values from the rows'.
@@ -1284,6 +1473,69 @@ inline u32 entry_keys(std::string_view yaml)
     }
     return keys;
 }
+
+// 0.40: the settings a database entry's YAML text lists, with their setting key ("Video > Multithreaded RSX", the
+// sections by indentation) and the value it asks (a set's '- item' lines joined by ", ", as setting_text writes a set).
+struct entry_item
+{
+    std::string key, value;
+};
+
+inline std::vector<entry_item> entry_items(std::string_view yaml)
+{
+    const auto trim = [](std::string_view s)
+    {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.remove_suffix(1);
+        return s;
+    };
+    const auto unquote = [](std::string_view s)
+    {
+        if (s.size() >= 2 && (s.front() == '"' || s.front() == '\'') && s.back() == s.front()) return s.substr(1, s.size() - 2);
+        return s;
+    };
+    std::vector<entry_item> out;
+    std::vector<std::pair<std::size_t, std::string>> sections; // indentation, name of the open 'name:' headers
+    const auto path = [&](std::string_view leaf)
+    {
+        std::string key;
+        for (const auto& section : sections) key += section.second + " > ";
+        if (leaf.empty() && !key.empty()) key.resize(key.size() - 3);
+        return key + std::string(leaf);
+    };
+    bool in_set = false; // the last entry of 'out' is the set the following '- item' lines belong to
+    while (!yaml.empty())
+    {
+        const auto nl = yaml.find('\n');
+        std::string_view line = yaml.substr(0, nl);
+        yaml.remove_prefix(nl == std::string_view::npos ? yaml.size() : nl + 1);
+        std::size_t indent = 0;
+        while (indent < line.size() && line[indent] == ' ') indent++;
+        line = trim(line);
+        if (line.empty() || line.front() == '#') continue;
+        if (line.starts_with("- ") || line == "-")
+        {
+            // The 'name:' header above the items names a set (it stays open until a line at its indentation)
+            if (sections.empty()) continue;
+            if (!in_set) out.push_back({path({}), {}});
+            in_set = true;
+            const std::string_view item = unquote(trim(line.substr(1)));
+            if (!out.back().value.empty()) out.back().value += ", ";
+            out.back().value += item;
+            continue;
+        }
+        in_set = false;
+        if (const auto hash = line.find(" #"); hash != std::string_view::npos) line = trim(line.substr(0, hash));
+        const auto colon = line.find(':');
+        if (colon == std::string_view::npos) continue;
+        while (!sections.empty() && sections.back().first >= indent) sections.pop_back();
+        const std::string_view name = trim(line.substr(0, colon));
+        const std::string_view value = unquote(trim(line.substr(colon + 1)));
+        if (value.empty()) sections.push_back({indent, std::string(name)});
+        else out.push_back({path(name), std::string(value)});
+    }
+    return out;
+}
 } // namespace policy_detail
 
 // 0.33: the title's PC config database entry (util/ps4_config_db.hpp) over cfg, after the automatic profile, like PC
@@ -1299,15 +1551,20 @@ inline u32 entry_keys(std::string_view yaml)
 // - A setting the player pinned for this game is put back like a row's (a global pin is not: PC RPCS3 also puts the
 //   database over its global config).
 // The console limits and the runtime limits still run after this step (e.g. 'Multithreaded RSX: true' of an entry).
+// 0.40: with the row config_db_entry off in 'features' (config-database-off.flag, or the per-game safe mode level 2) the
+// entry is skipped: nothing of it runs and the title's fallback rows apply, as without a database.
 template <typename OnChange>
 u32 apply_config_database(cfg_root& cfg, std::string_view title_id, OnChange&& on_change, bool automatic, database_result* out = nullptr,
-    const pinned_settings* pins = nullptr)
+    const pinned_settings* pins = nullptr, std::optional<u64> features = std::nullopt)
 {
+    const u64 mask = features ? *features : policy_features(title_id);
+    config_db::set_skipped(title_id, !safe_mode::enabled_in(mask, safe_mode::feature::config_db_entry));
     const auto game_pinned = [&](const cfg::_base& setting) { return pins && pins->for_game(setting); };
     database_result result;
     const config_db::entry entry = config_db::lookup(title_id);
     result.entry = !entry.config.empty();
     if (entry.rejected) result.use = database_use::rejected;
+    if (entry.skipped && result.entry) result.use = database_use::skipped;
     if (!entry.usable())
     {
         if (out) *out = std::move(result);
@@ -1382,8 +1639,8 @@ u32 apply_config_database(cfg_root& cfg, std::string_view title_id, OnChange&& o
         changed++;
     }
     // 0.39: and the OpenGL ZCULL pair of the profile (relaxed unless zcull-strict-gl.flag) for each of the two settings
-    // that neither the entry writes nor a row decides.
-    if (renderer_set && cfg.video.renderer == video_renderer::opengl && profile_zcull_relaxed(video_renderer::opengl))
+    // that neither the entry writes nor a row decides. 0.40: only with gl_relaxed_zcull.
+    if (renderer_set && cfg.video.renderer == video_renderer::opengl && profile_zcull_relaxed(video_renderer::opengl, mask))
     {
         const auto relax = [&](cfg::_bool& setting, bool value)
         {
@@ -1415,10 +1672,15 @@ u32 apply_config_database(cfg_root& cfg, std::string_view title_id, OnChange&& o
 // Returns the number of values changed; 'database' receives what the database step did.
 // 'pins': the profile leaves every pinned setting (global or this game's) alone; the rows and the database entry only
 // the game's pins (see apply_title_compat, apply_config_database).
+// 0.40: 'features' is the feature mask of util/ps4_safe_mode.hpp the boot decides with (runtime_inputs::features);
+// without it, policy_features(title_id) reads the files and the title's level.
 template <typename OnChange>
 u32 apply_performance_policy(cfg_root& cfg, const std::string& title_id, OnChange&& on_change, database_result* database = nullptr,
-    const pinned_settings* pins = nullptr)
+    const pinned_settings* pins = nullptr, std::optional<u64> features = std::nullopt)
 {
+    const u64 mask = features ? *features : policy_features(title_id);
+    // Before the rows: a skipped database entry makes the title's fallback rows run (title_row_active)
+    config_db::set_skipped(title_id, !safe_mode::enabled_in(mask, safe_mode::feature::config_db_entry));
     // 0.31: per-title rows first and the profile skips their settings, so a row like 'OpenGL' is neither
     // overwritten nor reported twice (Vulkan, then OpenGL again), and the Vulkan-only block below sees the
     // renderer that will run.
@@ -1534,8 +1796,8 @@ u32 apply_performance_policy(cfg_root& cfg, const std::string& title_id, OnChang
     // query; hard ZCULL syncs were a candidate for the 0.25 Minecraft RSX freeze). Forced, not left alone, because the
     // YAMLs the 0.29-0.36 menu saved carry that pair.
     // 0.39: OpenGL (a per-title row) runs the relaxed pair unless zcull-strict-gl.flag exists: through Zink each strict
-    // query result is a blocking glGetQueryObjectiv on the RSX thread.
-    const bool zcull_relaxed = profile_zcull_relaxed(cfg.video.renderer);
+    // query result is a blocking glGetQueryObjectiv on the RSX thread. 0.40: only with gl_relaxed_zcull (opt-in).
+    const bool zcull_relaxed = profile_zcull_relaxed(cfg.video.renderer, mask);
     force(cfg.video.precise_zpass_count, !zcull_relaxed);
     force(cfg.video.relaxed_zcull_sync, zcull_relaxed);
     // Desktop debugging switches (upstream defaults: off): Vulkan validation output and per-program dumps to disk.
@@ -1544,12 +1806,13 @@ u32 apply_performance_policy(cfg_root& cfg, const std::string& title_id, OnChang
 
     // --- Audio (upstream defaults) ---
     // Buffered output; time stretching off as a setting (SoundTouch costs CPU on Jaguar; 0.39: cellAudio engages its
-    // automatic continuity by itself when the game falls behind, unless audio-no-stretch.flag); float samples (the PS4
-    // AudioOut backend takes both formats).
+    // automatic continuity by itself when the game falls behind, 0.40: only with audio_continuity); float samples (the
+    // PS4 AudioOut backend takes both formats).
     // 0.39: a 64 ms reserve instead of the upstream 34 ms: cellAudio waits for a late game block while the output still
     // holds more than 16 ms, so the deeper ring turns late blocks into waits instead of skips and silence (+30 ms latency).
+    // 0.40: the upstream 34 ms of 0.29-0.38 unless audio_reserve_64 (audio-reserve-64.flag) is on.
     force(cfg.audio.enable_buffering, true);
-    force(cfg.audio.desired_buffer_duration, s64{64});
+    force(cfg.audio.desired_buffer_duration, safe_mode::enabled_in(mask, safe_mode::feature::audio_reserve_64) ? s64{64} : s64{34});
     force(cfg.audio.enable_time_stretching, false);
     force(cfg.audio.convert_to_s16, false);
     force(cfg.audio.disable_sampling_skip, false);
@@ -1557,15 +1820,21 @@ u32 apply_performance_policy(cfg_root& cfg, const std::string& title_id, OnChang
     // --- 0.33: the title's PC config database entry ---
     // After the profile, so its per-title values (e.g. Write Color Buffers, Relaxed ZCULL Sync off, the PPU
     // interpreter) replace the profile's global ones exactly as on PC; the rows above keep precedence over it.
-    changed += apply_config_database(cfg, title_id, on_change, true, database, pins);
+    changed += apply_config_database(cfg, title_id, on_change, true, database, pins, mask);
     return changed;
 }
 
 // 0.39: the language PS3 games get from the system (Configurações > Idioma dos jogos -> 'Language', CELL_SYSUTIL_LANG_*
 // 0..19). game-language.txt holds the global choice, custom_configs/<TITLE_ID>.game-language one game's; each holds
 // 'auto' or a number. Absent global file = automatic; absent marker = the global choice.
+// 0.40: 'Automático' is English (US) again, as in 0.25-0.38 (0.39 followed the PS4 language, and God of War: Ascension
+// then looked for BR_PORTUGUESE.PSARC, which its disc does not have, and mounted no language pack); features.txt
+// game_language_ps4 brings back the 0.39 automatic value. The value 'ps4' ('Idioma do PS4') asks for that value for
+// the boots of its scope: it turns the row game_language_ps4 on like an enable flag, so the safe mode reverts it. A
+// language number stays absolute.
 inline constexpr char game_language_path[] = "/data/rpcs3/game-language.txt";
 inline constexpr std::int32_t game_language_auto = -1;
+inline constexpr std::int32_t game_language_system = -2; // 'ps4': the PS4 language (the 0.39 automatic value)
 inline constexpr std::int32_t game_language_count = i18n::cell_lang_count;
 
 inline std::string game_language_marker(std::string_view title_id)
@@ -1574,12 +1843,14 @@ inline std::string game_language_marker(std::string_view title_id)
     return rpcs3::utils::get_custom_config_dir() + std::string(title_id) + ".game-language";
 }
 
-// "auto" -> game_language_auto, "0".."19" -> that language; nullopt for anything else (blanks and CR/LF trimmed)
+// "auto" -> game_language_auto, "ps4" -> game_language_system, "0".."19" -> that language; nullopt for anything else
+// (blanks and CR/LF trimmed)
 inline std::optional<std::int32_t> parse_game_language(std::string_view text)
 {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t' || text.front() == '\r' || text.front() == '\n')) text.remove_prefix(1);
     while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' || text.back() == '\n')) text.remove_suffix(1);
     if (text == "auto") return game_language_auto;
+    if (text == "ps4") return game_language_system;
     if (text.empty() || text.size() > 2) return std::nullopt;
     std::int32_t value = 0;
     for (const char c : text)
@@ -1593,6 +1864,7 @@ inline std::optional<std::int32_t> parse_game_language(std::string_view text)
 
 inline const char* game_language_token(std::int32_t value, char (&buffer)[4])
 {
+    if (value == game_language_system) return "ps4";
     if (value < 0 || value >= game_language_count) return "auto";
     buffer[0] = char('0' + value / 10);
     buffer[1] = char('0' + value % 10);
@@ -1605,7 +1877,7 @@ enum class game_language_source : std::uint8_t { automatic, global, game };
 
 struct game_language_choice
 {
-    std::int32_t value = game_language_auto; // a CELL_SYSUTIL_LANG_* value or game_language_auto
+    std::int32_t value = game_language_auto; // a CELL_SYSUTIL_LANG_* value, game_language_auto or game_language_system
     game_language_source source = game_language_source::automatic;
 };
 
@@ -1621,7 +1893,7 @@ inline game_language_choice read_game_language(std::string_view title_id, bool g
             choice.source = game_language_source::game;
             return choice;
         }
-    if (const auto value = parse_game_language(policy_detail::read_small(game_language_path, 64)); value && *value >= 0)
+    if (const auto value = parse_game_language(policy_detail::read_small(game_language_path, 64)); value && *value != game_language_auto)
     {
         choice.value = *value;
         choice.source = game_language_source::global;
@@ -1636,7 +1908,7 @@ inline bool set_game_language(std::string_view title_id, std::optional<std::int3
     char buffer[4];
     if (title_id.empty())
     {
-        if (!value || *value < 0) return !fs::is_file(game_language_path) || fs::remove_file(game_language_path);
+        if (!value || *value == game_language_auto) return !fs::is_file(game_language_path) || fs::remove_file(game_language_path);
         return policy_detail::write_note(game_language_path, std::string(game_language_token(*value, buffer)) + "\n");
     }
     const std::string marker = game_language_marker(title_id);
@@ -1644,6 +1916,71 @@ inline bool set_game_language(std::string_view title_id, std::optional<std::int3
     if (!value) return !fs::is_file(marker) || fs::remove_file(marker);
     fs::create_path(rpcs3::utils::get_custom_config_dir());
     return policy_detail::write_note(marker, std::string(game_language_token(*value, buffer)) + "\n");
+}
+
+// 0.40: rpcn.yml (beside config.yml, where cfg_rpcn and the PS4 account service keep it) holds an RPCN account: an NPID
+// and a stored password in the derived form, 64 hex digits (the rule of util/ps4_rpcn_account.hpp is_derived_password;
+// that header needs the wolfSSL ABI of the NP target, so it cannot be included here). Read as text, not through
+// cfg_rpcn: its load() rewrites a version-1 file and get_npid() invents and saves an NPID, and a menu preview must
+// write nothing. A version-1 file counts as no account (load() clears its password).
+inline std::string rpcn_config_path()
+{
+    return fs::get_config_dir(true) + "rpcn.yml";
+}
+
+namespace policy_detail
+{
+// The top-level 'key: value' scalar of a YAML text (plain, single or double quoted); nullopt when the key is absent.
+inline std::optional<std::string> top_level_text(std::string_view yaml, std::string_view key)
+{
+    while (!yaml.empty())
+    {
+        const auto nl = yaml.find('\n');
+        const std::string_view line = yaml.substr(0, nl);
+        yaml.remove_prefix(nl == std::string_view::npos ? yaml.size() : nl + 1);
+        if (!line.starts_with(key) || line.substr(key.size(), 1) != ":") continue;
+        std::string_view rest = line.substr(key.size() + 1);
+        std::string value;
+        if (!take_scalar(rest, value, {})) return std::nullopt;
+        return value;
+    }
+    return std::nullopt;
+}
+
+constexpr bool derived_password(std::string_view value) noexcept
+{
+    if (value.size() != 64) return false;
+    for (const char c : value)
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) return false;
+    return true;
+}
+
+// Overwrites a string that held a stored password before it is released.
+inline void wipe(std::string& s) noexcept
+{
+    volatile char* p = s.data();
+    for (std::size_t i = 0; i < s.size(); i++) p[i] = 0;
+    s.clear();
+}
+} // namespace policy_detail
+
+// The rule on the text of an rpcn.yml (host tests).
+inline bool rpcn_account_present_in(std::string_view yaml)
+{
+    std::optional<std::string> npid = policy_detail::top_level_text(yaml, "NPID");
+    std::optional<std::string> password = policy_detail::top_level_text(yaml, "Password");
+    const bool present = npid && !npid->empty() && password && policy_detail::derived_password(*password) &&
+        policy_detail::top_level_number(yaml, "Version") != 1;
+    if (password) policy_detail::wipe(*password);
+    return present;
+}
+
+inline bool rpcn_account_present()
+{
+    std::string text = policy_detail::read_small(rpcn_config_path(), 64 * 1024);
+    const bool present = rpcn_account_present_in(text);
+    policy_detail::wipe(text);
+    return present;
 }
 
 // 0.31: what the runtime section reads from /data/rpcs3 for one boot. read_runtime_inputs() reads the files;
@@ -1657,12 +1994,62 @@ struct runtime_inputs
     unsigned adapt_boots_left = 0;  // boots, the next one included, before the last active key expires
     bool cool = false;              // 0.34: 'Modo frio' (cool-mode.flag; System.cpp re-reads it on every boot)
     bool compile_3 = false;         // 0.34: vk-compile-3.flag
-    // 0.39: game language: the choice of the menu row, and the automatic value (the PS4 system language while the
-    // interface follows it, else the interface language; English (US) before the interface language is known)
+    // 0.39: game language: the choice of the menu row
     game_language_choice game_language;
+    // 0.40: what 'Automático' runs: English (US), or with features.txt game_language_ps4 the 0.39 automatic value (the
+    // PS4 system language while the interface follows it, else the interface language)
     std::int32_t game_language_auto = 1;
+    // 0.40: what 'Idioma do PS4' runs (the 0.39 automatic value), and whether this boot honours it: the per-game and the
+    // global safe mode turn the row value off like an enable flag
+    std::int32_t game_language_system = 1;
+    bool game_language_system_on = true;
     std::int32_t system_language = -1; // ORBIS_SYSTEM_PARAM_LANG_* the automatic value came from (-1 unknown)
+    // 0.40: rpcn.yml holds an RPCN account (read only while the online switch is on)
+    bool rpcn_account = true;
+    // 0.40: the feature rows of util/ps4_safe_mode.hpp the policy decides with for this boot, and the inputs they came
+    // from (the reasons of the startup.log lines)
+    safe_mode::inputs features_in{};
+    u64 features = safe_mode::default_mask;
+    // 0.40: the title's per-game safe mode (util/ps4_adapt.hpp safe_status): its level 0..3, the failure kind, the boots
+    // it still applies (the next one included), level 3 failed again; and the global safe mode (safe-mode.flag)
+    u8 safe_level = 0;
+    safe_mode::fail_kind safe_kind = safe_mode::fail_kind::none;
+    unsigned safe_boots_left = 0;
+    bool safe_exhausted = false;
+    bool global_safe = false;
+    // 0.40: free MB on /data (data_free_mb, 0 = unknown), for the disk cache cap
+    u64 data_free_mb = 0;
 };
+
+namespace policy_detail
+{
+// The per-game safe-mode state of an adapt file's text into 'in'.
+inline void set_safe_level(runtime_inputs& in, std::string_view adapt_text)
+{
+    const adapt::safe_state safe = adapt::safe_status(adapt_text);
+    in.safe_level = static_cast<u8>(std::min<unsigned>(safe.level, safe_mode::max_level));
+    in.safe_kind = in.safe_level ? safe_mode::kind_from_name(safe.kind) : safe_mode::fail_kind::none;
+    in.safe_boots_left = in.safe_level ? safe.boots_left : 0;
+    in.safe_exhausted = in.safe_level && safe.exhausted;
+}
+
+// The feature mask of 'in' from the files safe_mode::read_inputs() found, at the title's level. The game language row
+// value 'Idioma do PS4' counts as the enable of game_language_ps4 for that value only; 'Automático' follows the files.
+inline void set_features(runtime_inputs& in, safe_mode::inputs files)
+{
+    using safe_mode::feature;
+    files.title_level = in.safe_level;
+    files.kind = in.safe_kind;
+    in.global_safe = files.global_safe;
+    const bool automatic_ps4 = safe_mode::enabled_in(safe_mode::compute(files), feature::game_language_ps4);
+    if (in.game_language.value == game_language_system) files.enable_files |= safe_mode::bit(feature::game_language_ps4);
+    in.features_in = files;
+    in.features = safe_mode::compute(files);
+    in.game_language_system = i18n::game_language_auto();
+    in.game_language_system_on = safe_mode::enabled_in(in.features, feature::game_language_ps4);
+    in.game_language_auto = automatic_ps4 ? in.game_language_system : 1;
+}
+} // namespace policy_detail
 
 inline runtime_inputs read_runtime_inputs(std::string_view title_id)
 {
@@ -1673,16 +2060,69 @@ inline runtime_inputs read_runtime_inputs(std::string_view title_id)
     in.cool = cool_mode::enabled();
     in.compile_3 = fs::is_file(vk_compile_3_flag);
     in.game_language = read_game_language(title_id);
-    in.game_language_auto = i18n::game_language_auto();
     in.system_language = i18n::system_language();
+    in.rpcn_account = !in.online || rpcn_account_present();
+    in.data_free_mb = data_free_mb();
+    const std::string adapt_text = title_id.empty() ? std::string() : adapt::read_text(title_id);
+    policy_detail::set_safe_level(in, adapt_text);
+    // 0.40: with the title's own custom_configs/<TITLE_ID>.features (the rows it turns on for its boots only)
+    policy_detail::set_features(in, safe_mode::read_inputs(nullptr, title_id));
     if (title_id.empty()) return in;
-    for (adapt::entry& e : adapt::parse(adapt::read_text(title_id)))
+    for (adapt::entry& e : adapt::parse(adapt_text))
     {
         if (!adapt::is_active(e)) continue;
-        in.adapt_boots_left = std::max(in.adapt_boots_left, adapt::expiry_boots - e.boots_since);
+        // boots_left: the safe family lives 8 boots, so 3 - boots_since would wrap around
+        in.adapt_boots_left = std::max(in.adapt_boots_left, adapt::boots_left(e));
         in.adapt.push_back(std::move(e.key));
     }
     return in;
+}
+
+inline u64 policy_features(std::string_view title_id)
+{
+    runtime_inputs in;
+    in.game_language = read_game_language(title_id);
+    if (!title_id.empty()) policy_detail::set_safe_level(in, adapt::read_text(title_id));
+    policy_detail::set_features(in, safe_mode::read_inputs(nullptr, title_id));
+    return in.features;
+}
+
+inline bool feature_on(const runtime_inputs& in, safe_mode::feature f)
+{
+    return safe_mode::enabled_in(in.features, f);
+}
+
+// 0.40: the boot items of the per-game safe mode (util/ps4_safe_mode.hpp items_for) at the level this boot runs (the
+// title's, at least 1 with the global safe mode, which adds no item of its own: it has no failure kind).
+inline bool safe_item(const runtime_inputs& in, safe_mode::item i)
+{
+    const u8 level = in.global_safe && in.safe_level < 1 ? u8{1} : in.safe_level;
+    return (safe_mode::items_for(level, in.safe_kind) & safe_mode::item_bit(i)) != 0;
+}
+
+// "per-game safe mode level 2 (threads)", "global safe mode (safe-mode.flag)" or empty, for the change reasons.
+inline std::string safe_reason(const runtime_inputs& in)
+{
+    if (!in.safe_level) return in.global_safe ? "global safe mode (safe-mode.flag)" : std::string();
+    std::string text = "per-game safe mode level " + std::to_string(in.safe_level);
+    if (in.safe_kind != safe_mode::fail_kind::none) text += " (" + std::string(safe_mode::kind_name(in.safe_kind)) + ")";
+    return text;
+}
+
+// 0.40: the interface text of a failure kind (the boot toast, the settings rows); none reads as the player's choice.
+inline i18n::str fail_text(safe_mode::fail_kind kind)
+{
+    using i18n::str;
+    switch (kind)
+    {
+    case safe_mode::fail_kind::crash: return str::POL_FAIL_CRASH;
+    case safe_mode::fail_kind::threads: return str::POL_FAIL_THREADS;
+    case safe_mode::fail_kind::stall: return str::POL_FAIL_STALL;
+    case safe_mode::fail_kind::gpu: return str::POL_FAIL_GPU;
+    case safe_mode::fail_kind::user:
+    case safe_mode::fail_kind::none: break;
+    }
+    return str::POL_FAIL_USER;
 }
 
 inline bool adapt_has(const runtime_inputs& in, std::string_view key)
@@ -1690,17 +2130,28 @@ inline bool adapt_has(const runtime_inputs& in, std::string_view key)
     return adapt::has(in.adapt, key);
 }
 
-// A thread was refused, or a compile ran out of memory: compile on one thread.
+// A thread was refused, or a compile ran out of memory: compile on one thread. 0.40: also while the per-game safe mode
+// runs the lighter thread budget (a thread failure) or one compile thread (level 2 and up).
 inline bool adapt_fewer_threads(const runtime_inputs& in)
 {
-    return adapt_has(in, adapt::key_threads_low) || adapt_has(in, adapt::key_llvm_threads_1);
+    return adapt_has(in, adapt::key_threads_low) || adapt_has(in, adapt::key_llvm_threads_1) || safe_item(in, safe_mode::item::threads_low) ||
+        safe_item(in, safe_mode::item::compile_threads_1);
 }
 
 // The online switch is on, but this title last died from thread exhaustion. Online adds the RPCN client threads
-// and NP workers, so the title stays offline until its adjustment expires.
+// and NP workers, so the title stays offline until its adjustment expires. 0.40: also while its per-game safe mode
+// runs the lighter thread budget or is at level 2 or more.
 inline bool online_blocked(const runtime_inputs& in)
 {
-    return in.online && adapt_has(in, adapt::key_threads_low);
+    return in.online && (adapt_has(in, adapt::key_threads_low) || safe_item(in, safe_mode::item::threads_low) || safe_item(in, safe_mode::item::online_off));
+}
+
+// 0.40: the online switch is on, but rpcn.yml holds no RPCN account: the boot stays offline (no NP sign-in can work, and
+// a game that sees the network up and NP offline may wait for a server forever). online-without-account.flag (kill of
+// online_needs_account) keeps the 0.39 state: the network up, NP offline.
+inline bool online_no_account(const runtime_inputs& in)
+{
+    return in.online && !online_blocked(in) && !in.rpcn_account && feature_on(in, safe_mode::feature::online_needs_account);
 }
 
 // Device-local video memory limit without the adaptation: vram.flag device_mb= when present, else the configured
@@ -1718,22 +2169,57 @@ inline u64 vram_limit_for(u64 configured, const runtime_inputs& in)
     return adapt_has(in, adapt::key_vram_low) ? std::min<u64>(limit, vram_low_cap_mb) : limit;
 }
 
+// 0.40: the largest disk cache limit a boot keeps: the free-space cap (disk_cache_cap_mb) with the row
+// disk_cache_order, else 4096 MB; never above what the setting holds.
+inline s64 disk_cache_limit_max_mb(const runtime_inputs& in)
+{
+    if (!feature_on(in, safe_mode::feature::disk_cache_order)) return disk_cache_max_mb;
+    return std::min(disk_cache_cap_mb(in.data_free_mb), disk_cache_setting_max_mb);
+}
+
 // 0.39: the game language a boot runs with: the menu row's choice, else the automatic value while the YAML holds the
-// upstream default English (US); -1 = the YAML's value stays.
+// upstream default English (US); -1 = the YAML's value stays. 0.40: 'Idioma do PS4' runs the PS4 language while the
+// boot honours it, else the automatic value.
 inline std::int32_t game_language_for(const runtime_inputs& in, std::int32_t current)
 {
     if (in.game_language.value >= 0 && in.game_language.value < game_language_count) return in.game_language.value;
-    if (current != 1 || in.game_language_auto < 0 || in.game_language_auto >= game_language_count) return -1;
-    return in.game_language_auto;
+    const std::int32_t automatic = in.game_language.value == game_language_system && in.game_language_system_on ? in.game_language_system
+                                                                                                              : in.game_language_auto;
+    if (current != 1 || automatic < 0 || automatic >= game_language_count) return -1;
+    return automatic;
 }
 
 // 0.39: the GPU stopped responding in an earlier session of the title (adapt gpu_hang): on Vulkan its next boots run
 // the Async Recompiler, which skips a draw whose pipeline is still compiling instead of drawing it with the shader
-// interpreter (shader-skip-draws.flag does the same for every title).
+// interpreter (shader-skip-draws.flag does the same for every title). 0.40: also while the per-game safe mode follows a
+// GPU failure, and at level 3 whatever the failure was.
 inline bool adapt_no_shader_interpreter(const runtime_inputs& in)
 {
-    return adapt_has(in, adapt::key_gpu_hang);
+    return adapt_has(in, adapt::key_gpu_hang) || safe_item(in, safe_mode::item::gpu_async) || safe_item(in, safe_mode::item::async_no_interpreter);
 }
+
+// 0.40: the reason of that switch: a GPU failure ('async recompiler after a GPU hang') or the safe-mode level 3.
+inline std::string no_interpreter_reason(const runtime_inputs& in)
+{
+    if (adapt_has(in, adapt::key_gpu_hang)) return "the GPU stopped responding in an earlier session (adapt gpu_hang): async recompiler after a GPU hang";
+    if (in.safe_kind == safe_mode::fail_kind::gpu)
+        return "the GPU stopped responding in an earlier session (" + safe_reason(in) + "): async recompiler after a GPU hang";
+    return safe_reason(in) + ": async recompiler without the shader interpreter";
+}
+
+// 0.40: the command-buffer split of the Vulkan renderer for the booted title (adapt key cb_split, written after a GPU
+// device loss; row cb_split_after_loss). The decision belongs to the boot, which reads the adapt file before it appends
+// this boot's "boot" line, so the renderer reads the stored decision instead of the file. Lock-free, any thread; false
+// while no boot stored a decision.
+namespace policy
+{
+inline std::atomic<bool> g_cb_split_boot{false};
+
+inline bool cb_split_for_title() noexcept
+{
+    return g_cb_split_boot.load(std::memory_order_relaxed) && safe_mode::enabled(safe_mode::feature::cb_split_after_loss);
+}
+} // namespace policy
 
 // 0.31: limits that hold in every mode except keep-user-settings.flag, applied after the automatic profile or the
 // per-title rows (so after the per-game YAML too). OnChange gets change_kind::runtime, or change_kind::adapt for
@@ -1757,15 +2243,28 @@ u32 apply_runtime_limits(cfg_root& cfg, const runtime_inputs& in, OnChange&& on_
     force(cfg.vfs.host_root, false, "the guest must never reach the console's file system", change_kind::runtime);
     // The boot trims dev_hdd1/caches above this size (cache_utils.cpp), oldest first.
     force(cfg.vfs.limit_cache_size, true, "disk cache limited so it cannot fill the console's drive", change_kind::runtime);
-    force(cfg.vfs.cache_max_size, std::clamp<s64>(cfg.vfs.cache_max_size.get(), disk_cache_floor_mb, disk_cache_max_mb),
-        "disk cache limit kept between 1024 and 4096 MB", change_kind::runtime);
+    // 0.40: the upper bound follows the free space of /data (disk_cache_limit_max_mb); the player's value inside the
+    // bounds runs as chosen
+    const s64 cache_max = disk_cache_limit_max_mb(in);
+    const std::string cache_why = cache_max > disk_cache_max_mb
+        ? "disk cache limit kept between 1024 and " + std::to_string(cache_max) + " MB (10 % of the free space of /data)"
+        : !feature_on(in, safe_mode::feature::disk_cache_order) ? std::string("disk cache limit kept between 1024 and 4096 MB (disk-cache-upstream.flag)")
+        : std::string("disk cache limit kept between 1024 and 4096 MB");
+    force(cfg.vfs.cache_max_size, std::clamp<s64>(cfg.vfs.cache_max_size.get(), disk_cache_floor_mb, cache_max), cache_why, change_kind::runtime);
 
     // --- Network: online-rpcn.flag decides ---
+    // 0.40: a title on the lighter thread budget or at safe-mode level 2 or more stays offline, and so does every boot
+    // while rpcn.yml holds no RPCN account (online_no_account).
     const bool blocked = online_blocked(in);
-    const bool online = in.online && !blocked;
-    const std::string_view net_why = online ? "online switch on (PlayStation Network > Modo online)"
-        : blocked ? "online skipped for this title: thread budget (adapt threads=low)"
-        : "online switch off (PlayStation Network > Modo online)";
+    const bool no_account = online_no_account(in);
+    const bool online = in.online && !blocked && !no_account;
+    const std::string blocked_why = adapt_has(in, adapt::key_threads_low) ? std::string("online skipped for this title: thread budget (adapt threads=low)")
+                                                                         : "online skipped for this title: " + safe_reason(in);
+    const std::string_view net_why = online ? std::string_view("online switch on (PlayStation Network > Modo online)")
+        : blocked ? std::string_view(blocked_why)
+        : no_account ? std::string_view("online switch on, but rpcn.yml holds no RPCN account: this boot is offline (PlayStation Network > Entrar com "
+                                        "uma conta RPCN; online-without-account.flag keeps the network up)")
+        : std::string_view("online switch off (PlayStation Network > Modo online)");
     const change_kind net_kind = blocked ? change_kind::adapt : change_kind::runtime;
     force(cfg.net.net_active, online ? np_internet_status::enabled : np_internet_status::disabled, net_why, net_kind);
     force(cfg.net.psn_status, online ? np_psn_status::psn_rpcn : np_psn_status::disabled, net_why, net_kind);
@@ -1788,16 +2287,21 @@ u32 apply_runtime_limits(cfg_root& cfg, const runtime_inputs& in, OnChange&& on_
     // A language chosen in the menu runs whatever the YAML says; the automatic value only replaces the upstream default
     // English (US), so a language written into a YAML by hand stays.
     if (const std::int32_t lang = game_language_for(in, cfg.sys.language.get()); lang >= 0)
-        force(cfg.sys.language, static_cast<CellSysutilLang>(lang), in.game_language.value >= 0 ? "game language: Configurações > Idioma dos jogos"
-            : "game language: automatic (Configurações > Idioma dos jogos)", change_kind::runtime);
+    {
+        const std::string_view why = in.game_language.value >= 0 ? std::string_view("game language: Configurações > Idioma dos jogos")
+            : in.game_language.value == game_language_system && in.game_language_system_on
+                ? std::string_view("game language: the PS4 language (Configurações > Idioma dos jogos: Idioma do PS4)")
+                : std::string_view("game language: automatic (Configurações > Idioma dos jogos)");
+        force(cfg.sys.language, static_cast<CellSysutilLang>(lang), why, change_kind::runtime);
+    }
 
     // --- Per-title adaptation ---
     if (adapt_fewer_threads(in))
     {
         // One LLVM worker also gives the SPU cache build one worker (rpcs3::utils::get_max_threads).
-        const std::string_view why = adapt_has(in, adapt::key_threads_low)
-            ? "a thread was refused in an earlier session (adapt threads=low)"
-            : "a compile ran out of memory in an earlier session (adapt llvm_threads=1)";
+        const std::string why = adapt_has(in, adapt::key_threads_low) ? std::string("a thread was refused in an earlier session (adapt threads=low)")
+            : adapt_has(in, adapt::key_llvm_threads_1) ? std::string("a compile ran out of memory in an earlier session (adapt llvm_threads=1)")
+            : safe_reason(in) + ": one compile thread";
         force(cfg.core.llvm_threads, s64{1}, why, change_kind::adapt);
         force(cfg.video.shader_compiler_threads_count, s64{1}, why, change_kind::adapt);
     }
@@ -1811,8 +2315,7 @@ u32 apply_runtime_limits(cfg_root& cfg, const runtime_inputs& in, OnChange&& on_
     // 0.39: a title whose GPU stopped responding boots without the shader interpreter (a mode chosen otherwise stays).
     if (adapt_no_shader_interpreter(in) && cfg.video.renderer == video_renderer::vulkan && cfg.video.shadermode == shader_mode::async_with_interpreter)
     {
-        force(cfg.video.shadermode, shader_mode::async_recompiler,
-            "the GPU stopped responding in an earlier session (adapt gpu_hang): async recompiler after a GPU hang", change_kind::adapt);
+        force(cfg.video.shadermode, shader_mode::async_recompiler, no_interpreter_reason(in), change_kind::adapt);
     }
     return changed;
 }
@@ -1894,12 +2397,15 @@ inline const std::string* final_value(const std::vector<recorded_change>& change
 // reports are compared and put back (no YAML round trip of g_cfg); cfg is left unchanged.
 // 0.33: the automatic path includes the title's config database entry, so a save that only repeats it stays automatic.
 // The automatic path honours the pins, as the automatic boot would.
-inline bool saved_equals_automatic(cfg_root& cfg, const std::string& title_id, const pinned_settings* pins = nullptr)
+// 0.40: 'features' as for apply_performance_policy.
+inline bool saved_equals_automatic(cfg_root& cfg, const std::string& title_id, const pinned_settings* pins = nullptr,
+    std::optional<u64> features = std::nullopt)
 {
     using policy_detail::recorded_change;
+    const u64 mask = features ? *features : policy_features(title_id);
     const std::vector<recorded_change> automatic = policy_detail::dry_run([&](auto&& record)
     {
-        apply_performance_policy(cfg, title_id, record, nullptr, pins);
+        apply_performance_policy(cfg, title_id, record, nullptr, pins, mask);
         apply_console_limits(cfg, record);
     });
     const std::vector<recorded_change> tuned = policy_detail::dry_run([&](auto&& record)
@@ -1942,49 +2448,62 @@ inline std::string saved_settings_text(std::string_view title_id)
 // and stays, and so does a value the title's own row or database entry asks for (e.g. God of War: Ascension's
 // 'Accurate ZCULL stats: false'). Reported as change_kind::migration; 'lines' receives the startup.log text. Returns
 // the number of values changed. A pinned setting is the player's choice and never migrates.
+// 0.40: a rule may also start at a version (forced_from): the values only profile 39 forced (the 64 ms reserve, the
+// relaxed OpenGL pair) go back for a YAML stamped 39 while their rows are off. 'features' as for
+// apply_performance_policy.
 template <typename OnChange>
 u32 apply_profile_migration(cfg_root& cfg, const std::string& title_id, std::string_view saved_yaml, OnChange&& on_change, std::vector<std::string>* lines = nullptr,
-    const pinned_settings* pins = nullptr)
+    const pinned_settings* pins = nullptr, std::optional<u64> features = std::nullopt)
 {
     if (saved_yaml.empty()) return 0;
     const unsigned saved = saved_profile_version(saved_yaml);
+    const u64 mask = features ? *features : policy_features(title_id);
     u32 changed = 0;
     // The automatic configuration's changes to the saved values, computed once before any migration
     std::vector<policy_detail::recorded_change> automatic;
     bool automatic_known = false;
-    const auto migrate = [&](auto& setting, auto old_value, unsigned forced_until)
+    const auto migrate = [&](auto& setting, auto old_value, unsigned forced_from, unsigned forced_until)
     {
-        if (saved > forced_until || setting.get() != old_value || (pins && pins->any(setting))) return;
+        if (saved < forced_from || saved > forced_until || setting.get() != old_value || (pins && pins->any(setting))) return;
         if (!automatic_known)
         {
-            automatic = policy_detail::dry_run([&](auto&& record) { apply_performance_policy(cfg, title_id, record, nullptr, pins); });
+            automatic = policy_detail::dry_run([&](auto&& record) { apply_performance_policy(cfg, title_id, record, nullptr, pins, mask); });
             automatic_known = true;
         }
         // Not changed by the automatic configuration: an escape file or the title's row or entry keeps the old value
         const std::string* value = policy_detail::final_value(automatic, &setting);
         const std::string old = setting.to_string();
         if (!value || *value == old || !setting.from_string(*value)) return;
-        const std::string reason = "saved by automatic profile <=" + std::to_string(forced_until) + ", which forced this value; automatic profile " +
+        const std::string versions = forced_from == 0 ? "<=" + std::to_string(forced_until)
+            : forced_from == forced_until ? std::to_string(forced_until) : std::to_string(forced_from) + "-" + std::to_string(forced_until);
+        const std::string reason = "saved by automatic profile " + versions + ", which forced this value; automatic profile " +
             std::to_string(automatic_profile_version) + " value";
         policy_detail::report(on_change, static_cast<const cfg::_base&>(setting), old, std::string_view{reason}, change_kind::migration);
         if (lines)
         {
-            lines->push_back("profile: '" + setting.get_name() + "' saved by automatic profile <=" + std::to_string(forced_until) + " ('" + old +
+            lines->push_back("profile: '" + setting.get_name() + "' saved by automatic profile " + versions + " ('" + old +
                 "') -> " + std::to_string(automatic_profile_version) + " ('" + setting.to_string() + "')");
         }
         changed++;
     };
     // 0.27-0.36 forced 'Async Recompiler' on Vulkan only; 0.26-0.36 forced the relaxed ZCULL pair.
     if (cfg.video.renderer == video_renderer::vulkan)
-        migrate(cfg.video.shadermode, shader_mode::async_recompiler, 36);
+        migrate(cfg.video.shadermode, shader_mode::async_recompiler, 0, 36);
     // 0.39: on OpenGL the relaxed pair is the current profile value (nothing to migrate from <=36); the strict pair that
     // profile 37 (0.37-0.38) forced into OpenGL saves becomes the relaxed one, unless zcull-strict-gl.flag, the title's
-    // row or its database entry decides the setting.
-    const bool gl_relaxed = cfg.video.renderer == video_renderer::opengl && profile_zcull_relaxed(video_renderer::opengl);
+    // row or its database entry decides the setting. 0.40: that is the opt-in gl_relaxed_zcull; without it OpenGL runs
+    // the strict pair as in 0.38, and the relaxed pair profile 39 forced into OpenGL saves goes back to strict.
+    const bool opengl = cfg.video.renderer == video_renderer::opengl;
+    const bool gl_relaxed = opengl && profile_zcull_relaxed(video_renderer::opengl, mask);
     if (!gl_relaxed)
     {
-        migrate(cfg.video.relaxed_zcull_sync, true, 36);
-        migrate(cfg.video.precise_zpass_count, false, 36);
+        migrate(cfg.video.relaxed_zcull_sync, true, 0, 36);
+        migrate(cfg.video.precise_zpass_count, false, 0, 36);
+        if (opengl)
+        {
+            migrate(cfg.video.relaxed_zcull_sync, true, 39, 39);
+            migrate(cfg.video.precise_zpass_count, false, 39, 39);
+        }
     }
     else if (saved == 37)
     {
@@ -1998,7 +2517,7 @@ u32 apply_profile_migration(cfg_root& cfg, const std::string& title_id, std::str
             const std::string old = setting.to_string();
             setting.set(!strict_value);
             policy_detail::report(on_change, static_cast<const cfg::_base&>(setting), old,
-                std::string_view{"saved by automatic profile <=37, which forced the strict ZCULL pair; OpenGL profile value (zcull-strict-gl.flag keeps it)"},
+                std::string_view{"saved by automatic profile <=37, which forced the strict ZCULL pair; OpenGL value of gl_relaxed_zcull (zcull-strict-gl.flag keeps it strict)"},
                 change_kind::migration);
             if (lines)
             {
@@ -2010,8 +2529,10 @@ u32 apply_profile_migration(cfg_root& cfg, const std::string& title_id, std::str
         relax(cfg.video.relaxed_zcull_sync, false);
         relax(cfg.video.precise_zpass_count, true);
     }
-    // 0.29-0.38 forced the upstream 34 ms audio reserve; 0.39 runs 64 ms.
-    migrate(cfg.audio.desired_buffer_duration, s64{34}, 37);
+    // 0.29-0.38 forced the upstream 34 ms audio reserve; 0.39 ran 64 ms. 0.40: 34 ms again unless audio_reserve_64, so the
+    // first rule changes nothing by default, and the 64 ms profile 39 forced goes back to 34 ms.
+    migrate(cfg.audio.desired_buffer_duration, s64{34}, 0, 37);
+    migrate(cfg.audio.desired_buffer_duration, s64{64}, 39, 39);
     return changed;
 }
 
@@ -2049,8 +2570,8 @@ inline std::vector<std::string> conversion_pins(cfg_root& saved, cfg_root& autom
     pin_set global;
     global.global = global_pins;
     const pinned_settings pins = resolve_pins(automatic, global);
-    apply_performance_policy(automatic, title_id, none, nullptr, policy_detail::pins_or_null(pins));
-    apply_profile_migration(saved, title_id, saved_yaml, none);
+    apply_performance_policy(automatic, title_id, none, nullptr, policy_detail::pins_or_null(pins), in.features);
+    apply_profile_migration(saved, title_id, saved_yaml, none, nullptr, nullptr, in.features);
     apply_title_compat(saved, title_id, none, false);
     for (cfg_root* side : {&automatic, &saved})
     {
@@ -2064,6 +2585,74 @@ inline std::vector<std::string> conversion_pins(cfg_root& saved, cfg_root& autom
     return keys;
 }
 
+namespace policy_detail
+{
+inline std::string default_text(cfg::_base& setting);
+} // namespace policy_detail
+
+// 0.40: the player's own values in the global layer while it is of format 1 (config.yml, or a ps4-settings.yml without
+// the format key): settings whose saved value is not the upstream default and that the automatic configuration still
+// replaces after the profile migration and the limits, the global pins left out (they run already). Nothing here runs
+// on its own: the settings menu lists them and pins them with the saved values only on the player's X ('Usar meus
+// valores salvos'). Both trees hold the global files' values and are changed. A format-2 global file is a full dump of
+// what the menu showed (the profile's values with the pins), so it has no other choices to offer.
+inline std::vector<std::string> legacy_choices(cfg_root& saved, cfg_root& automatic, const runtime_inputs& in, std::string_view global_yaml,
+    const std::vector<std::string>& global_pins = {})
+{
+    if (!global_yaml.empty() && saved_settings_format(global_yaml) >= settings_format_version) return {};
+    std::vector<const cfg::_base*> a, s;
+    policy_detail::collect_leaves(automatic.get_nodes(), a);
+    policy_detail::collect_leaves(saved.get_nodes(), s);
+    std::vector<std::size_t> candidates;
+    for (std::size_t i = 0; i < a.size() && i < s.size(); i++)
+    {
+        switch (s[i]->get_type())
+        {
+        case cfg::type::map:
+        case cfg::type::node_map:
+        case cfg::type::log:
+        case cfg::type::device: continue;
+        default: break;
+        }
+        const std::string key = setting_key(*s[i]);
+        if (std::find(global_pins.begin(), global_pins.end(), key) != global_pins.end()) continue;
+        cfg::_base& leaf = const_cast<cfg::_base&>(*s[i]); // a member of the mutable tree 'saved'
+        if (setting_text(leaf) != policy_detail::default_text(leaf)) candidates.push_back(i);
+    }
+    if (candidates.empty()) return {};
+
+    const auto none = [](const cfg::_base&, const std::string&, std::string_view, change_kind) {};
+    pin_set pins;
+    pins.global = global_pins;
+    const pinned_settings resolved = resolve_pins(automatic, pins);
+    const std::string no_title;
+    apply_performance_policy(automatic, no_title, none, nullptr, policy_detail::pins_or_null(resolved), in.features);
+    apply_profile_migration(saved, no_title, global_yaml, none, nullptr, nullptr, in.features);
+    for (cfg_root* side : {&automatic, &saved})
+    {
+        apply_console_limits(*side, none);
+        apply_platform_limits(*side, none);
+        apply_runtime_limits(*side, in, none);
+        apply_hardware_limits(*side, none);
+    }
+    std::vector<std::string> keys;
+    for (const std::size_t i : candidates)
+        if (setting_text(*a[i]) != setting_text(*s[i])) keys.push_back(setting_key(*s[i]));
+    return keys;
+}
+
+// 0.40: one setting a game boot runs with another value than the player's settings files hold (the 'settings:' line
+// of startup.log and RPCS3.log): the files' value, the value that runs, and who replaced it.
+struct settings_diff
+{
+    std::string key;      // setting_key()
+    std::string name;     // the setting's own name, for the line
+    std::string file;     // the value the settings files gave
+    std::string now;      // the value the boot runs
+    std::string_view who; // automático, limite do PS4, após falha, base do PC, correção do jogo, interruptor, plataforma, perfil antigo
+    change_kind kind = change_kind::profile; // the last step that changed it
+};
+
 struct policy_result
 {
     policy_mode mode = policy_mode::automatic;
@@ -2074,7 +2663,12 @@ struct policy_result
     u32 console_changes = 0; // 0.32: options unavailable on PS4 and compile-thread limits
     bool stale_marker = false;   // 0.32: a user-tuned marker ignored because the saved values equal the automatic ones
     bool online = false;         // this boot goes online (RPCN)
-    bool online_skipped = false; // the online switch is on, but this title stays offline (thread budget)
+    bool online_skipped = false; // the online switch is on, but this title stays offline (thread budget; 0.40: safe mode)
+    bool online_no_account = false; // 0.40: the online switch is on, but rpcn.yml holds no RPCN account: offline
+    // 0.40: the title's per-game safe mode (util/ps4_adapt.hpp safe_status), for safe_mode::set_for_boot in System.cpp;
+    // set in every mode, keep-user-settings.flag included (the feature rows are code paths, not settings)
+    u8 safe_level = 0;
+    safe_mode::fail_kind safe_kind = safe_mode::fail_kind::none;
     std::vector<std::string> adapt_keys; // active adaptation keys of the title
     database_result database;    // 0.33: the PC config database step (its changes are also in title_changes)
     // 0.34: the title's PC database entry, applied or held by its fallback rows, asks 'Sleep Timers Accuracy: As Host'
@@ -2088,10 +2682,148 @@ struct policy_result
     bool spu_decoder_from_database = false;
     // The player's own choices in effect: settings pinned in the game's YAML and in ps4-settings.yml
     u32 pinned_game = 0, pinned_global = 0;
+    // 0.40 (boots only): the values of the player's files this boot replaced, in the order the steps changed them; and
+    // how many of them the game's own format-1 YAML holds and the automatic profile replaced (the toast that points at
+    // the per-game Converter)
+    std::vector<settings_diff> settings_diffs;
+    u32 legacy_game_values = 0;
 };
 
 namespace policy_detail
 {
+// 0.40: who replaced a value, in the words of the 'settings:' line
+inline std::string_view diff_who(const cfg_root& cfg, const cfg::_base& setting, std::string_view why, change_kind kind)
+{
+    switch (kind)
+    {
+    case change_kind::profile: return "automático";
+    case change_kind::migration: return "perfil antigo";
+    case change_kind::title: return is_database_reason(why) ? "base do PC" : "correção do jogo";
+    case change_kind::adapt: return "após falha";
+    case change_kind::console: return why.starts_with(platform_reason_prefix) ? "plataforma" : "limite do PS4";
+    case change_kind::runtime:
+        if (&setting == &cfg.core.use_accurate_dfma) return "plataforma";
+        if (&setting == &cfg.net.net_active || &setting == &cfg.net.psn_status || &setting == &cfg.net.upnp_enabled || &setting == &cfg.sys.language ||
+            &setting == &cfg.io.pad_sleep)
+            return "interruptor";
+        return "limite do PS4";
+    }
+    return "limite do PS4";
+}
+
+// A change a boot's policy steps reported, per setting: the value before the first step and who changed it last
+struct diff_note
+{
+    const cfg::_base* setting;
+    std::string old;
+    std::string_view who;
+    change_kind kind;
+};
+
+inline void note_diff(std::vector<diff_note>& notes, const cfg_root& cfg, const cfg::_base& setting, const std::string& old, std::string_view why,
+    change_kind kind)
+{
+    const std::string_view who = diff_who(cfg, setting, why, kind);
+    for (diff_note& n : notes)
+        if (n.setting == &setting)
+        {
+            n.who = who;
+            n.kind = kind;
+            return;
+        }
+    notes.push_back({&setting, old, who, kind});
+}
+
+// The upstream default of a leaf as setting_text writes it (the leaf keeps its value)
+inline std::string default_text(cfg::_base& setting)
+{
+    const std::string now = setting_text(setting);
+    setting.from_default();
+    std::string def = setting_text(setting);
+    if (setting_text(setting) != now) restore_setting_text(setting, now);
+    return def;
+}
+
+// The emulator's own pass of the current boot (no title): its replacements of the global files' values, which the game
+// pass merges (the game's YAML is loaded over that pass's result, so it starts from the replaced values). Boot thread
+// only; every emulator pass replaces the list.
+inline std::vector<settings_diff> g_emulator_pass_diffs;
+
+// The diffs of one boot pass once every step ran ('cfg' holds the final values): the emulator pass keeps its own for
+// the game pass and returns none; the game pass adds the emulator pass's replacements its YAML did not override. A
+// value equal to its upstream default is not the player's (a generated config.yml holds them all) and is left out.
+inline std::vector<settings_diff> finish_diffs(cfg_root& cfg, std::string_view title_id, const std::vector<diff_note>& notes)
+{
+    std::vector<settings_diff> out;
+    for (const diff_note& n : notes)
+    {
+        const cfg::_base& setting = *n.setting;
+        out.push_back({setting_key(setting), setting.get_name(), n.old, setting_text(setting), n.who, n.kind});
+    }
+    if (title_id.empty())
+    {
+        g_emulator_pass_diffs = std::move(out);
+        return {};
+    }
+    for (const settings_diff& first : g_emulator_pass_diffs)
+    {
+        const auto it = std::find_if(out.begin(), out.end(), [&](const settings_diff& d) { return d.key == first.key; });
+        if (it != out.end())
+        {
+            // Changed again by this pass: when it started from the emulator pass's value, the files held the earlier one
+            if (it->file == first.now) it->file = first.file;
+            continue;
+        }
+        cfg::_base* leaf = find_leaf(cfg, first.key);
+        // The game's YAML gave it another value after that pass, or the setting is unknown to this tree
+        if (!leaf || setting_text(*leaf) != first.now) continue;
+        out.push_back(first);
+    }
+    std::erase_if(out, [&](const settings_diff& d)
+    {
+        if (d.file == d.now) return true;
+        cfg::_base* leaf = find_leaf(cfg, d.key);
+        return !leaf || default_text(*leaf) == d.file;
+    });
+    return out;
+}
+
+// A value for the line: at most 40 bytes, never cut inside a UTF-8 sequence
+inline std::string diff_value(std::string_view text)
+{
+    if (text.size() <= 40) return text.empty() ? std::string("\"\"") : std::string(text);
+    std::size_t cut = 37;
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) cut--;
+    return std::string(text.substr(0, cut)) + "...";
+}
+
+inline constexpr std::size_t settings_diff_shown = 12;
+
+// "settings: BLUS30645: 2 valor(es) rodando diferente dos seus arquivos: Frame limit Off->Auto (automático), Resolution
+// Scale 900->200 (limite do PS4)": at most 12, then '(+N)'; empty when nothing differs.
+inline std::string settings_diff_line(std::string_view title_id, const std::vector<settings_diff>& diffs)
+{
+    if (diffs.empty()) return {};
+    std::string line = "settings: " + std::string(title_id) + ": " + std::to_string(diffs.size()) + " valor(es) rodando diferente dos seus arquivos:";
+    for (std::size_t i = 0; i < diffs.size() && i < settings_diff_shown; i++)
+        line += (i ? ", " : " ") + diffs[i].name + " " + diff_value(diffs[i].file) + "->" + diff_value(diffs[i].now) + " (" + std::string(diffs[i].who) + ")";
+    if (diffs.size() > settings_diff_shown) line += " (+" + std::to_string(diffs.size() - settings_diff_shown) + ")";
+    return line;
+}
+
+// How many diffs are values of the game's own format-1 YAML ('yaml') that the automatic profile replaced
+inline u32 legacy_game_values(const std::vector<settings_diff>& diffs, std::string_view yaml)
+{
+    if (yaml.empty() || saved_settings_format(yaml) >= settings_format_version) return 0;
+    const std::vector<entry_item> items = entry_items(yaml);
+    u32 n = 0;
+    for (const settings_diff& d : diffs)
+        if (d.kind == change_kind::profile &&
+            std::any_of(items.begin(), items.end(), [&](const entry_item& item) { return item.key == d.key && item.value == d.file; }))
+            n++;
+    return n;
+}
+
 // The startup.log line of the player's own choices for a game boot (empty when there are none): the game's pins with the
 // value they run with (at most 8, then '+N'), the count of global pins, and the listed keys this build does not know.
 inline std::string pins_line(const std::string& title_id, const pinned_settings& pins)
@@ -2117,9 +2849,54 @@ inline std::string pins_line(const std::string& title_id, const pinned_settings&
     return line;
 }
 
+// 0.40: the applied entry's settings for its startup.log line, once every policy step ran: 'Name=value' as the entry
+// asks it, then what became of it: '(row)' a per-title row decides the setting, '(pinned)' the player pinned it for
+// this game, '(capped)' a later step (a console cap or limit, the runtime section) runs another value; '(unknown)'
+// names no setting of this build. At most 16 items, then '+N'.
+inline std::string database_items(cfg_root& cfg, std::string_view title_id, std::string_view yaml, bool automatic, const pinned_settings* pins)
+{
+    std::vector<const cfg::_base*> leaves;
+    collect_leaves(cfg.get_nodes(), leaves);
+    const auto same = [](const cfg::_base& setting, const std::string& asked)
+    {
+        if (setting.get_type() != cfg::type::set) return setting.to_string() == asked;
+        // A set: the same items in any order
+        std::vector<std::string> want;
+        for (std::string_view rest = asked; !rest.empty();)
+        {
+            const auto comma = rest.find(", ");
+            want.emplace_back(rest.substr(0, comma));
+            rest.remove_prefix(comma == std::string_view::npos ? rest.size() : comma + 2);
+        }
+        std::vector<std::string> have = setting.to_list();
+        std::sort(want.begin(), want.end());
+        std::sort(have.begin(), have.end());
+        return want == have;
+    };
+    constexpr std::size_t shown_max = 16;
+    std::string out;
+    std::size_t shown = 0, total = 0;
+    for (const entry_item& item : entry_items(yaml))
+    {
+        total++;
+        if (shown >= shown_max) continue;
+        const auto gt = item.key.rfind(" > ");
+        std::string text = item.key.substr(gt == std::string::npos ? 0 : gt + 3) + "=" + item.value;
+        const auto it = std::find_if(leaves.begin(), leaves.end(), [&](const cfg::_base* leaf) { return setting_key(*leaf) == item.key; });
+        if (it == leaves.end()) text += " (unknown)";
+        else if (title_entry_for(cfg, title_id, **it, automatic, pins)) text += " (row)";
+        else if (pins && pins->for_game(**it)) text += " (pinned)";
+        else if (!same(**it, item.value)) text += " (capped)";
+        out += (shown++ ? ", " : "") + text;
+    }
+    if (total > shown) out += " (+" + std::to_string(total - shown) + ")";
+    return out;
+}
+
 // 0.33: the startup.log line of the config database step for a game boot. 0.37: the copies' line
 // (config_db::describe) comes first; this one says what the title's entry did and is empty when no copy is usable.
-inline std::string database_line(const std::string& title_id, const database_result& db, const config_db::file_info& file)
+// 0.40: an applied entry lists its settings (database_result::items); 'skip_reason' says why an entry was skipped.
+inline std::string database_line(const std::string& title_id, const database_result& db, const config_db::file_info& file, std::string_view skip_reason = {})
 {
     if (file.state != config_db::file_state::loaded) return {};
     std::string line = "config database: ";
@@ -2127,14 +2904,55 @@ inline std::string database_line(const std::string& title_id, const database_res
     {
     case database_use::none: line += title_id + (db.entry ? " entry not used" : " has no entry"); break;
     case database_use::applied:
-        line += "applied " + title_id + " (" + std::to_string(db.keys) + " keys), " + std::to_string(db.changes) + " value(s) changed";
+        line += "applied " + title_id;
+        if (!db.items.empty()) line += ": " + db.items;
+        line += " · " + std::to_string(db.keys) + " keys, " + std::to_string(db.changes) + " value(s) changed";
         if (!db.capped.empty()) line += " (capped on PS4: " + db.capped + ")";
         break;
     case database_use::rejected: line += title_id + " entry not valid for this build (unknown key or value), not applied"; break;
     case database_use::manual: line += title_id + " entry not applied: settings saved from the per-game menu run as saved"; break;
     case database_use::custom_config: line += title_id + " entry not applied: automatic configuration off and the game has its own config (as on PC)"; break;
+    case database_use::skipped:
+        line += title_id + " entry skipped";
+        if (!skip_reason.empty()) line += " (" + std::string(skip_reason) + ")";
+        line += ": the title runs as without a database (its fallback rows included)";
+        break;
     }
     return line;
+}
+
+// 0.40: why config_db_entry is off for a boot: its kill flag or the safe-mode level.
+inline std::string database_skip_reason(const runtime_inputs& in)
+{
+    const safe_mode::info& row = safe_mode::row(safe_mode::feature::config_db_entry);
+    switch (safe_mode::why(in.features_in, row))
+    {
+    case safe_mode::reason::kill_flag: return row.kill_flag;
+    case safe_mode::reason::safe_level: return safe_reason(in);
+    default: break;
+    }
+    return {};
+}
+
+// 0.40: custom_configs/<TITLE_ID>.settings-notice holds the build version whose boot toast about the game's replaced
+// legacy values was shown; true (and the version written) when this build has not shown it yet.
+inline std::string legacy_notice_marker(std::string_view title_id)
+{
+    if (title_id.empty()) return {};
+    return rpcs3::utils::get_custom_config_dir() + std::string(title_id) + ".settings-notice";
+}
+
+inline bool legacy_notice_due(std::string_view title_id)
+{
+    const std::string marker = legacy_notice_marker(title_id);
+    if (marker.empty()) return false;
+    std::string shown = policy_detail::read_small(marker, 64);
+    while (!shown.empty() && (shown.back() == '\n' || shown.back() == '\r' || shown.back() == ' ')) shown.pop_back();
+    if (shown == ps4_build_version) return false;
+    fs::create_path(rpcs3::utils::get_custom_config_dir());
+    // Shown also when the marker cannot be written: the next boot then shows it again
+    policy_detail::write_note(marker, std::string(ps4_build_version) + "\n");
+    return true;
 }
 
 // After the policy ran for a game boot: a startup.log line with the runtime state, the adaptation bookkeeping
@@ -2144,7 +2962,11 @@ inline void record_boot(const std::string& title_id, const cfg_root& cfg, const 
 {
     if (title_id.empty()) return;
     std::string line = "Política PS4 para " + title_id + ": ";
-    line += result.online ? "online RPCN ligado" : result.online_skipped ? "online pulado (limite de threads)" : "offline";
+    line += result.online ? "online RPCN ligado"
+        : result.online_skipped ? (adapt_has(in, adapt::key_threads_low) ? "online pulado (limite de threads)" : "online pulado (modo seguro nível " +
+                                       std::to_string(std::max<unsigned>(in.safe_level, in.global_safe ? 1u : 0u)) + ")")
+        : result.online_no_account ? "online RPCN sem conta (offline neste boot)"
+        : "offline";
     line += cfg.net.upnp_enabled ? ", UPnP ligado" : ", UPnP desligado";
     line += " · VRAM até " + std::to_string(cfg.video.vk.vram_allocation_limit.get()) + " MB";
     line += " · cache de disco até " + std::to_string(cfg.vfs.cache_max_size.get()) + " MB";
@@ -2152,21 +2974,58 @@ inline void record_boot(const std::string& title_id, const cfg_root& cfg, const 
     // 0.39: the shader mode (and why, after a GPU hang), the OpenGL ZCULL pair and the game language with its source
     line += " · shader=" + cfg.video.shadermode.to_string();
     if (adapt_no_shader_interpreter(in) && cfg.video.renderer == video_renderer::vulkan && cfg.video.shadermode == shader_mode::async_recompiler)
-        line += " (async recompiler after a GPU hang: adapt gpu_hang)";
+    {
+        line += adapt_has(in, adapt::key_gpu_hang) ? std::string(" (async recompiler after a GPU hang: adapt gpu_hang)")
+            : in.safe_kind == safe_mode::fail_kind::gpu ? " (async recompiler after a GPU hang: " + safe_reason(in) + ")"
+            : " (async recompiler without the shader interpreter: " + safe_reason(in) + ")";
+    }
     if (cfg.video.renderer == video_renderer::opengl)
-        line += std::string(" · OpenGL ZCULL ") + (cfg.video.relaxed_zcull_sync.get() ? "relaxed" : "strict") + (fs::is_file(zcull_strict_gl_flag) ? " (zcull-strict-gl.flag)" : "");
+    {
+        // 0.40: the strict pair unless gl_relaxed_zcull (its file, or features.txt); zcull-strict-gl.flag is its kill flag
+        line += std::string(" · OpenGL ZCULL ") + (cfg.video.relaxed_zcull_sync.get() ? "relaxed" : "strict");
+        const safe_mode::info& row = safe_mode::row(safe_mode::feature::gl_relaxed_zcull);
+        if (feature_on(in, row.f)) line += " (gl_relaxed_zcull)";
+        else if (safe_mode::why(in.features_in, row) == safe_mode::reason::kill_flag) line += " (zcull-strict-gl.flag)";
+    }
+    // 0.40: 'auto' is English (US); the PS4 language comes from 'Idioma do PS4' or features.txt game_language_ps4
     line += " · idioma do jogo " + cfg.sys.language.to_string();
+    const std::int32_t running_language = static_cast<std::int32_t>(cfg.sys.language.get());
     if (in.game_language.value >= 0)
         line += in.game_language.source == game_language_source::game ? " (este jogo)" : " (Configurações)";
-    else if (static_cast<std::int32_t>(cfg.sys.language.get()) == in.game_language_auto)
-        line += " (auto, PS4 " + std::to_string(in.system_language) + ")";
+    else if (in.game_language.value == game_language_system && in.game_language_system_on && running_language == in.game_language_system)
+        line += " (Idioma do PS4, PS4 " + std::to_string(in.system_language) + ")";
+    else if (running_language == in.game_language_auto)
+    {
+        if (in.game_language.value == game_language_system) line += " (auto: Idioma do PS4 desligado pelo modo seguro)";
+        else if (feature_on(in, safe_mode::feature::game_language_ps4)) line += " (auto, PS4 " + std::to_string(in.system_language) + ": game_language_ps4)";
+        else line += " (auto)";
+    }
     else line += " (YAML)";
+    // 0.40: the per-game safe mode (the boot items above) and the global one
+    if (in.safe_level)
+    {
+        line += " · modo seguro nível " + std::to_string(in.safe_level) + " (" + i18n::tr(fail_text(in.safe_kind), i18n::lang::pt_br) + ", este boot e mais " +
+            std::to_string(in.safe_boots_left ? in.safe_boots_left - 1 : 0) + ")";
+        if (in.safe_exhausted) line += ": o nível 3 falhou de novo";
+        if (in.global_safe) line += " · modo seguro global";
+    }
+    else if (in.global_safe)
+        line += " · modo seguro global (safe-mode.flag)";
     ps4_startup_checkpoint(line.c_str());
     if (const std::string own = pins_line(title_id, pins); !own.empty()) ps4_startup_checkpoint(own.c_str());
+    // 0.40: the values of the player's files that run otherwise, and who replaced them (also in RPCS3.log)
+    if (const std::string diff = settings_diff_line(title_id, result.settings_diffs); !diff.empty())
+    {
+        ps4_startup_checkpoint(diff.c_str());
+#ifdef RPCS3_PS4
+        ps4_policy_log.notice("%s", diff);
+#endif
+    }
     for (const std::string& note : result.notes) ps4_startup_checkpoint(note.c_str());
     const config_db::file_info database_file = config_db::status();
     ps4_startup_checkpoint(config_db::describe(database_file).c_str());
-    if (const std::string db_line = database_line(title_id, result.database, database_file); !db_line.empty()) ps4_startup_checkpoint(db_line.c_str());
+    if (const std::string db_line = database_line(title_id, result.database, database_file, database_skip_reason(in)); !db_line.empty())
+        ps4_startup_checkpoint(db_line.c_str());
 
     // A game that starts another of its executables, or a restart from the home menu, is still the same session:
     // only a boot from the XMB (the title was cleared on the way back) counts toward the expiry.
@@ -2197,6 +3056,13 @@ inline void record_boot(const std::string& title_id, const cfg_root& cfg, const 
         }
     }
     if (same_session) return;
+
+    // 0.40: Modo online without an RPCN account: one toast per boot from the XMB
+    if (result.online_no_account) ps4_notify(i18n::trf(i18n::str::POL_ONLINE_SEM_CONTA, {title_id}).c_str());
+    // 0.40: values of the game's own format-1 YAML the automatic configuration replaced: one toast per title and build
+    // version, pointing at the per-game Converter (which turns them into the player's pins on request)
+    if (result.legacy_game_values && legacy_notice_due(title_id))
+        ps4_notify(i18n::trf(i18n::str::POL_AJUSTES_ARQUIVO_SEM_EFEITO, {result.legacy_game_values}).c_str());
 
     if (in.adapt.empty())
     {
@@ -2231,7 +3097,25 @@ inline void record_boot(const std::string& title_id, const cfg_root& cfg, const 
         if (cfg.video.renderer == video_renderer::vulkan && cfg.video.shadermode == shader_mode::async_recompiler) add("gpu_hang shader=async_recompiler", str::POL_SHADERS_SEM_INTERPRETADOR);
         else add("gpu_hang=recorded", str::count_);
     }
+    // 0.40: after a device loss the Vulkan renderer splits command buffers (row cb_split_after_loss, kill cb-split-off.flag)
+    if (adapt_has(in, adapt::key_cb_split))
+    {
+        if (!feature_on(in, safe_mode::feature::cb_split_after_loss)) add("cb_split=off(cb-split-off.flag)", str::count_);
+        else if (cfg.video.renderer == video_renderer::vulkan) add("cb_split=384_draws", str::POL_COMANDOS_GPU_DIVIDIDOS);
+        else add("cb_split=vulkan_only", str::count_);
+    }
     ps4_startup_checkpoint(line.c_str());
+    // 0.40: a safe-mode level names the level and the failure instead of the adjustments: level 3 that failed again
+    // asks for the logs, a level the player chose says so
+    if (in.safe_level)
+    {
+        const std::string safe_toast = in.safe_exhausted ? i18n::trf(str::POL_SAFE_MODE_EXHAUSTED, {title_id})
+            : in.safe_kind == safe_mode::fail_kind::user || in.safe_kind == safe_mode::fail_kind::none
+                ? i18n::trf(str::POL_SAFE_MODE_USER_TOAST, {title_id, unsigned{in.safe_level}})
+                : i18n::trf(str::POL_SAFE_MODE_TOAST, {title_id, fail_text(in.safe_kind), unsigned{in.safe_level}});
+        ps4_notify(safe_toast.c_str());
+        return;
+    }
     if (!toast.empty())
     {
         toast = i18n::trf(str::POL_ADAPT_TOAST, {title_id, i18n::raw(toast)});
@@ -2247,8 +3131,33 @@ policy_result run_boot_policy(cfg_root& cfg, const std::string& title_id, const 
 {
     policy_result result;
     result.mode = get_policy_mode(title_id);
-    if (result.mode == policy_mode::keep_user_settings) return result;
     const runtime_inputs in = given ? *given : read_runtime_inputs(title_id);
+    // 0.40: the title's safe-mode level for set_for_boot, in every mode; the game language row's 'Idioma do PS4' turns
+    // game_language_ps4 on for that boot (nothing is forced with keep-user-settings.flag, so neither is the language)
+    result.safe_level = in.safe_level;
+    result.safe_kind = in.safe_kind;
+    if (boot)
+    {
+        const bool language_row = result.mode != policy_mode::keep_user_settings && in.game_language.value == game_language_system;
+        safe_mode::set_boot_enables(language_row ? safe_mode::bit(safe_mode::feature::game_language_ps4) : 0);
+        // 0.40: the command-buffer split after a device loss of this title (adapt cb_split, 8 boots), for the renderer of
+        // this boot; read here, before record_boot counts the boot, in every mode (a renderer code path, not a setting).
+        // The emulator's own pass (no title) clears the previous game's decision.
+        policy::g_cb_split_boot.store(!title_id.empty() && adapt_has(in, adapt::key_cb_split), std::memory_order_relaxed);
+    }
+    if (result.mode == policy_mode::keep_user_settings)
+    {
+        // The level's feature rows run in this mode too, so its boots from the XMB count toward its 8-boot expiry
+        // (record_boot, which counts them otherwise, does not run: nothing is forced)
+        char running[adapt::title_size];
+        if (boot && in.safe_level && !title_id.empty() && !(adapt::current_title(running) && title_id == running)) adapt::note_boot(title_id);
+        if (boot && title_id.empty()) g_emulator_pass_diffs.clear();
+        return result;
+    }
+    // 0.40: what the steps of a boot replace, for the 'settings:' line (none for the menu's preview)
+    std::vector<diff_note> diff_notes;
+    // Before any step that reads the database: a skipped entry makes the title's fallback rows run (title_row_active)
+    config_db::set_skipped(title_id, !feature_on(in, safe_mode::feature::config_db_entry));
     const pinned_settings pinned = resolve_pins(cfg, given_pins ? *given_pins : read_pins(title_id));
     const pinned_settings* pins = pins_or_null(pinned);
     result.pinned_game = static_cast<u32>(pinned.game.size());
@@ -2271,12 +3180,17 @@ policy_result run_boot_policy(cfg_root& cfg, const std::string& title_id, const 
         case change_kind::runtime: result.runtime_changes++; break;
         case change_kind::console:
             result.console_changes++;
-            // 0.37: an unavailable option replaced (a copied config, a database entry) gets a startup.log line.
-            if (unsafe_option_for(cfg, setting))
+            // 0.37: an unavailable option replaced (a copied config, a database entry) gets a startup.log line. 0.40: so does
+            // a single unsafe value and the Resolution Scale cap.
+            if (unsafe_option_for(cfg, setting) || unsafe_value_for(setting) || &setting == &cfg.video.resolution_scale_percent)
                 result.notes.push_back("console limit: '" + setting.get_name() + "' = '" + setting_text(setting) + "' (was '" + old + "'): " + std::string(why));
+            else if (why.starts_with(platform_reason_prefix))
+                result.notes.push_back("platform: '" + setting.get_name() + "' = '" + setting_text(setting) + "' (was '" + old + "'): " +
+                    std::string(why.substr(platform_reason_prefix.size())));
             break;
         case change_kind::migration: result.migrated_changes++; break;
         }
+        if (boot) note_diff(diff_notes, cfg, setting, old, why, kind);
         report(on_change, setting, old, why, kind);
     };
     // 0.37: values of a saved YAML that an older profile forced get the current profile's values. Before the marker
@@ -2284,41 +3198,55 @@ policy_result run_boot_policy(cfg_root& cfg, const std::string& title_id, const 
     if (result.mode != policy_mode::automatic)
     {
         std::vector<std::string> lines;
-        apply_profile_migration(cfg, title_id, saved_settings_text(title_id), counted, &lines, pins);
+        apply_profile_migration(cfg, title_id, saved_settings_text(title_id), counted, &lines, pins, in.features);
         result.notes.insert(result.notes.end(), lines.begin(), lines.end());
     }
     // 0.32: a marker whose saved YAML runs exactly like the automatic configuration (e.g. Demon's Souls saved with
     // Write Color Buffers on, which its automatic row now sets) no longer keeps the game out of it. The marker file
     // stays until the next menu save or 'Voltar para automático'.
-    if (result.mode == policy_mode::user_tuned && saved_equals_automatic(cfg, title_id, pins))
+    if (result.mode == policy_mode::user_tuned && saved_equals_automatic(cfg, title_id, pins, in.features))
     {
         result.mode = policy_mode::automatic;
         result.stale_marker = true;
     }
-    if (result.mode == policy_mode::automatic) apply_performance_policy(cfg, title_id, counted, &result.database, pins);
+    if (result.mode == policy_mode::automatic) apply_performance_policy(cfg, title_id, counted, &result.database, pins, in.features);
     else
     {
         // 0.33: PC RPCS3 adds the database entry only to a game without a custom config. User-tuned games never get
         // it; with the automatic configuration off, only a game without its own YAML does (before its every-mode rows,
         // which keep precedence).
         if (result.mode == policy_mode::auto_config_off && !has_custom_config(title_id))
-            apply_config_database(cfg, title_id, counted, false, &result.database, pins);
-        else if (!config_db::lookup(title_id).config.empty())
+            apply_config_database(cfg, title_id, counted, false, &result.database, pins, in.features);
+        else if (const config_db::entry entry = config_db::lookup(title_id); !entry.config.empty())
         {
             result.database.entry = true;
-            result.database.use = result.mode == policy_mode::user_tuned ? database_use::manual : database_use::custom_config;
+            result.database.use = entry.skipped ? database_use::skipped
+                : result.mode == policy_mode::user_tuned ? database_use::manual : database_use::custom_config;
         }
         apply_title_compat(cfg, title_id, counted, false, pins);
     }
     apply_console_limits(cfg, counted);
+    // 0.40: what the renderer would replace at start anyway, so the preview and the logs show it
+    apply_platform_limits(cfg, counted);
     apply_runtime_limits(cfg, in, counted);
     if (result.mode == policy_mode::automatic) apply_cool_mode(cfg, in, counted, pins);
     // After the database step: a rejected entry no longer counts, and its fallback rows are then active.
     result.host_sleep_requested = (result.database.use == database_use::applied && result.database.host_sleep) ||
         title_rows_ask_host_sleep(title_id, result.mode == policy_mode::automatic, &cfg, pins);
     result.online_skipped = online_blocked(in);
-    result.online = in.online && !result.online_skipped;
+    result.online_no_account = online_no_account(in);
+    result.online = in.online && !result.online_skipped && !result.online_no_account;
     result.adapt_keys = in.adapt;
+    // 0.40: what the applied database entry asked and what runs now (the startup.log line), after every step
+    if (boot && result.database.use == database_use::applied)
+        result.database.items = database_items(cfg, title_id, config_db::lookup(title_id).config, result.mode == policy_mode::automatic, pins);
+    if (boot)
+    {
+        result.settings_diffs = finish_diffs(cfg, title_id, diff_notes);
+        if (result.mode == policy_mode::automatic && has_custom_config(title_id))
+            result.legacy_game_values = legacy_game_values(result.settings_diffs,
+                read_small(rpcs3::utils::get_custom_config_path(title_id), settings_text_limit));
+    }
     if (boot) record_boot(title_id, cfg, in, result, pinned);
     return result;
 }

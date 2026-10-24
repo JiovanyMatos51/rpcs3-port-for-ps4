@@ -27,6 +27,18 @@
 // (find_key_for_image): its own key names and the IRDs next to it come first, and the key is also written under the
 // image's name.
 //
+// A disc must also work without internet once its key was known on this console or the player supplies it
+// (environment::offline_keys, the default; off: the search above, unchanged):
+//   - every verified key is also kept as <TITLE_ID>-<identity>.dkey (identity: FNV-1a of sectors 0-1, one per
+//     pressing), so another pressing of the same title id never pushes it out; those copies, the copies of the title
+//     id's other pressings and the files a wrong key was moved aside to (*.bad) are searched before anything else;
+//   - the player's own files: /data/rpcs3/keys (one level of subfolders) and USB:/keys next to USB:/redump and
+//     USB:/ird, decided by content: key files, IRDs of this disc (product code read from the file) and key lists
+//     (scan_key_list); every value is tried as the key and as data1;
+//   - the network is asked only when it can answer (network_usable: an IP address and a plausible clock); otherwise
+//     the rest of USB is searched and the result says why nothing was downloaded (no_internet, clock_wrong).
+// The player's files are only read; the search writes below /data/rpcs3 only (may_write), never into the inbox.
+//
 // Layout: IRD, index, link, disc and verification logic need only the standard library, zlib and Crypto/aes (host
 // tested in ps4-port/tests/disc_key_test.cpp); obtain() takes its file, disc and network access as functions.
 // PS4 only: HTTPS through libcurl with the packaged root certificates, console file access, and service: request()
@@ -72,6 +84,14 @@ inline constexpr std::size_t max_key_files = 8192;          // per folder (a red
 inline constexpr std::size_t max_ird_files = 256;           // per folder
 inline constexpr std::size_t text_limit = 110;              // XMB line
 inline constexpr int fetch_attempts = 3;                     // a download that failed on the way (TLS, reset, HTTP 5xx)
+inline constexpr char inbox_dir[] = "/data/rpcs3/keys/";    // the player's own key files (FTP); only read
+inline constexpr std::size_t max_inbox_key_files = 16384;   // per folder of the inbox and of USB:/keys
+inline constexpr std::size_t list_limit = 8u << 20;         // bytes of one key list
+inline constexpr std::size_t max_list_files = 64;           // key lists read by one search
+inline constexpr std::size_t max_list_values = 65536;       // values taken from key lists by one search
+inline constexpr std::size_t max_subfolders = 64;           // subfolders of the inbox / USB:/keys walked
+inline constexpr std::size_t max_pressing_copies = 64;      // copies of other pressings of one title id tested
+inline constexpr std::size_t ird_peek_bytes = 4096;         // read to learn an IRD's product code
 
 // Data1 -> disc key: AES-128-CBC encryption with these (PS3 Disc Dumper Decrypter.cs, LibIRD IRD.cs D1AesKey/IV)
 inline constexpr key128 d1_key{0x38, 0x0b, 0xcf, 0x0b, 0x53, 0x45, 0x5b, 0x3c, 0x78, 0x17, 0xab, 0x4f, 0xa3, 0xba, 0x90, 0xed};
@@ -160,16 +180,7 @@ inline std::string gigabytes(std::uint64_t bytes)
 // "2026-10-16" of a time in unix seconds (UTC), "an unknown date" for a negative one
 inline std::string date_text(std::int64_t unix_seconds)
 {
-    if (unix_seconds < 0) return "an unknown date";
-    // Civil date of a day count (H. Hinnant's days_from_civil inverse)
-    const std::int64_t z = unix_seconds / 86400 + 719468;
-    const std::int64_t era = z / 146097, doe = z - era * 146097;
-    const std::int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const std::int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
-    const std::int64_t day = doy - (153 * mp + 2) / 5 + 1, month = mp < 10 ? mp + 3 : mp - 9, year = yoe + era * 400 + (month <= 2);
-    char text[32];
-    std::snprintf(text, sizeof(text), "%04lld-%02lld-%02lld", static_cast<long long>(year), static_cast<long long>(month), static_cast<long long>(day));
-    return text;
+    return disc_stream::detail::utc_text(unix_seconds);
 }
 
 // At most 'limit' bytes, cut on a UTF-8 character boundary
@@ -219,6 +230,230 @@ inline std::optional<key128> key_from_file(const byte* data, std::size_t size)
     const auto nibble = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
     for (std::size_t i = 0; i < 16; ++i) key[i] = static_cast<byte>((nibble(text[i * 2]) << 4) | nibble(text[i * 2 + 1]));
     return key;
+}
+
+// The search writes only below /data/rpcs3, and never into the player's key inbox: USB and the inbox are only read
+inline bool may_write(std::string_view path) noexcept
+{
+    return path.starts_with("/data/rpcs3/") && path.find("/../") == std::string_view::npos && path.find("/./") == std::string_view::npos &&
+        !path.starts_with(inbox_dir);
+}
+
+// "BLES01876-0123456789abcdef.dkey": the copy of a verified key kept for one pressing (identity: FNV-1a of its sectors
+// 0-1). The ISO loader looks keys up by exact names, so these copies never stand in its way.
+inline std::string pressing_file_name(std::string_view title_id, std::uint64_t identity)
+{
+    char hex[24];
+    std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(identity));
+    return std::string(title_id) + "-" + hex + ".dkey";
+}
+
+// A pressing copy of 'title_id' (any pressing)
+inline bool is_pressing_file(std::string_view name, std::string_view title_id) noexcept
+{
+    if (title_id.empty() || name.size() != title_id.size() + 1 + 16 + 5 || !key_detail::iequals(name.substr(0, title_id.size()), title_id) ||
+        name[title_id.size()] != '-' || !key_detail::iends_with(name, ".dkey"))
+        return false;
+    for (const char c : name.substr(title_id.size() + 1, 16))
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+    return true;
+}
+
+// What a value of the player's (a key file, a list) stands for: the disc key itself, or data1 the key derives from
+struct value_match
+{
+    key128 key{};
+    bool data1 = false;
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// The network, offline
+
+// The boot TLS self-test (Emu/NP/ps4_tls_selftest.h): clock_refused when it found no root certificate valid at the
+// console's date, the signature of a wrong clock
+enum class tls_state
+{
+    unknown, // not finished, not run
+    ok,
+    failed,
+    clock_refused,
+};
+
+enum class net_state
+{
+    usable,
+    no_link,     // no IP address
+    clock_wrong, // no certificate can be checked at the console's date
+};
+
+inline const char* to_string(net_state state)
+{
+    switch (state)
+    {
+    case net_state::usable: return "usable";
+    case net_state::no_link: return "offline";
+    case net_state::clock_wrong: return "clock wrong";
+    }
+    return "?";
+}
+
+// Whether a download can work before trying one: an IP address (or a NetCtl state that is unknown, which the download
+// then decides) and a clock no earlier than the day before 'build_date' ("YYYY-MM-DD"). A negative 'now' is unknown.
+inline net_state network_usable(int link, std::int64_t now, std::string_view build_date, tls_state tls) noexcept
+{
+    if (!disc_stream::clock_plausible(now, build_date) || tls == tls_state::clock_refused) return net_state::clock_wrong;
+    if (link >= 0 && link != disc_stream::netctl_ip_obtained) return net_state::no_link;
+    return net_state::usable;
+}
+
+// The boot TLS self-test's answer (ps4_tls_selftest_ok, ps4_tls_selftest_line): a failure whose CA bundle kept no root
+// because of the roots' dates ("148 roots in 31 ms (0 accepted, 148 not yet valid)") is the console clock
+inline tls_state tls_from_selftest(std::optional<bool> ok, std::string_view line) noexcept
+{
+    if (!ok) return tls_state::unknown;
+    if (*ok) return tls_state::ok;
+    const bool dated = line.find(" not yet valid") != std::string_view::npos || line.find(" expired") != std::string_view::npos;
+    return dated && line.find("(0 accepted") != std::string_view::npos ? tls_state::clock_refused : tls_state::failed;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Key lists
+
+// One candidate value of a key list
+struct list_value
+{
+    key128 value{};
+    std::size_t line = 0; // 1-based
+    bool named = false;   // its line names the disc
+};
+
+struct list_stats
+{
+    std::size_t lines = 0;   // lines of the text (comments included)
+    std::size_t values = 0;  // 32-hex values found
+    std::size_t named = 0;   // of those, on lines naming the disc
+    std::size_t offered = 0; // values handed to the test: at most the bound
+    bool truncated = false;  // the bound left values out
+    bool accepted = false;   // the test took a value
+};
+
+namespace list_detail
+{
+inline bool hex_digit(char c) noexcept
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+inline bool word_char(char c) noexcept
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+// The line names 'id' (canonical "BLES01876"), written "BLES01876", "bles-01876", "BLES_01876" or "BLES 01876", not
+// inside a longer word or number
+inline bool names(std::string_view line, std::string_view id) noexcept
+{
+    if (id.size() != 9 || line.size() < 9) return false;
+    for (std::size_t i = 0; i + 9 <= line.size(); ++i)
+    {
+        if (i > 0 && word_char(line[i - 1])) continue;
+        bool same = true;
+        for (std::size_t k = 0; k < 4 && same; ++k) same = key_detail::upper(line[i + k]) == id[k];
+        if (!same) continue;
+        std::size_t at = i + 4;
+        if (line[at] == '-' || line[at] == '_' || line[at] == ' ') ++at;
+        if (at + 5 > line.size()) continue;
+        for (std::size_t k = 0; k < 5 && same; ++k) same = line[at + k] == id[4 + k];
+        if (same && (at + 5 == line.size() || !(line[at + 5] >= '0' && line[at + 5] <= '9'))) return true;
+    }
+    return false;
+}
+
+// "#", ";" or "//" after optional blanks
+inline bool comment(std::string_view line) noexcept
+{
+    std::size_t at = 0;
+    while (at < line.size() && (line[at] == ' ' || line[at] == '\t')) ++at;
+    const std::string_view rest = line.substr(at);
+    return rest.starts_with('#') || rest.starts_with(';') || rest.starts_with("//");
+}
+}
+
+// The candidate values of a key list in any reasonable layout ("BLES01876 3F2A...", "BLES-01876;FIFA 14;3F2A...",
+// "\"FIFA 14 (Europe)\",\"3F2A...\"", "FIFA 14.dkey = 3F2A...", a bare column, GetKey "data1:" lines): every run of
+// exactly 32 hexadecimal characters (any other character separates; a longer run, e.g. a 64-hex hash, is no value).
+// UTF-8 or ASCII, BOM skipped, LF or CRLF, comment lines skipped. Lines naming the disc's product code or header id
+// come first, the others after them. 'test' gets each value (at most 'max_values'); true stops the scan.
+template <typename Test>
+inline list_stats scan_key_list(std::string_view text, std::string_view product_code, std::string_view header_id, std::size_t max_values, Test&& test)
+{
+    list_stats out;
+    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
+    for (int pass = 0; pass < 2 && !out.accepted; ++pass)
+    {
+        std::string_view rest = text;
+        std::size_t number = 0;
+        while (!rest.empty() && !out.accepted)
+        {
+            const std::size_t eol = rest.find('\n');
+            std::string_view line = rest.substr(0, eol);
+            rest.remove_prefix(eol == std::string_view::npos ? rest.size() : eol + 1);
+            ++number;
+            if (pass == 0) ++out.lines;
+            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+            if (line.empty() || list_detail::comment(line)) continue;
+            const bool named = list_detail::names(line, product_code) || (header_id != product_code && list_detail::names(line, header_id));
+            if (named != (pass == 0)) continue;
+            for (std::size_t i = 0; i < line.size() && !out.accepted;)
+            {
+                if (!list_detail::hex_digit(line[i]))
+                {
+                    ++i;
+                    continue;
+                }
+                std::size_t end = i;
+                while (end < line.size() && list_detail::hex_digit(line[end])) ++end;
+                if (end - i == 32)
+                {
+                    ++out.values;
+                    out.named += named;
+                    if (out.offered >= max_values) out.truncated = true;
+                    else
+                    {
+                        ++out.offered;
+                        list_value v;
+                        if (const auto key = key_from_file(reinterpret_cast<const byte*>(line.data() + i), 32)) v.value = *key;
+                        v.line = number;
+                        v.named = named;
+                        if (test(static_cast<const list_value&>(v))) out.accepted = true;
+                    }
+                }
+                i = end;
+            }
+        }
+    }
+    return out;
+}
+
+// How the search reads a file of the player's by its name: key files, IRDs, key lists (text, or no extension); hidden
+// files and anything else are left alone. The content decides in the end (a list name holding one key is a key file).
+enum class user_file
+{
+    key,
+    ird,
+    list,
+    other,
+};
+
+inline user_file user_file_type(std::string_view name) noexcept
+{
+    using key_detail::iends_with;
+    if (name.empty() || name.front() == '.') return user_file::other;
+    if (iends_with(name, ".dkey") || iends_with(name, ".key")) return user_file::key;
+    if (iends_with(name, ".ird")) return user_file::ird;
+    for (const std::string_view extension : {".txt", ".csv", ".lst", ".dat", ".keys"})
+        if (iends_with(name, extension)) return user_file::list;
+    return name.find('.') == std::string_view::npos ? user_file::list : user_file::other;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -894,6 +1129,7 @@ struct disc_identity
     std::string app_version;  // PARAM.SFO APP_VER
     std::uint32_t plain_regions = 0;
     std::uint64_t size = 0;   // bytes, end of the last plain region
+    std::uint64_t identity = 0; // FNV-1a of sectors 0-1, as disc_stream::disc_status::identity: tells pressings apart
     std::array<byte, 2048> sector0{};
     std::vector<magic_block> blocks;
 
@@ -935,6 +1171,7 @@ inline identity_status read_identity(const read_fn& read, disc_identity& out, st
     std::memcpy(out.sector0.data(), head.data(), out.sector0.size());
     out.plain_regions = table.plain_regions;
     out.size = table.size_bytes();
+    out.identity = ds::detail::fnv1a64(head.data(), head.size());
 
     std::array<byte, sector_size> pvd{};
     if (!read(16 * sector_size, pvd.data(), pvd.size()))
@@ -1062,17 +1299,22 @@ inline std::vector<index_entry> rank_candidates(std::vector<index_entry> entries
 // ---------------------------------------------------------------------------------------------------------------
 // The search
 
+// Every success comes before 'network', every failure after it (succeeded())
 enum class outcome
 {
     not_needed,      // the disc's files read in the clear
     already_present, // <TITLE_ID>.dkey (or .key) decrypts the disc
+    cache_pressing,  // a copy this console kept for this pressing (or for another pressing of the title id)
     local_key,       // another key file of the redump folder decrypts it; copied as <TITLE_ID>.dkey
     cached_ird,      // an IRD downloaded earlier
+    inbox_key,       // a file of /data/rpcs3/keys (key file, IRD or key list)
     usb_key,         // USB:/redump
     usb_ird,         // USB:/ird
+    usb_list,        // a key list on USB, or any file of USB:/keys
     image_ird,       // an IRD next to the ISO file
     network,         // the IRD database
     no_internet,
+    clock_wrong,     // the console clock is wrong: no download can verify the server
     not_in_database,
     no_matching_key, // IRDs found, none decrypts the disc
     server_error,    // HTTP error or an unreadable index
@@ -1084,19 +1326,28 @@ enum class outcome
     cancelled,
 };
 
+inline constexpr outcome last_outcome = outcome::cancelled;
+static_assert(outcome::cache_pressing < outcome::network && outcome::inbox_key < outcome::network && outcome::usb_list < outcome::network &&
+        outcome::network < outcome::no_internet && outcome::network < outcome::clock_wrong,
+    "succeeded() counts every outcome up to 'network' as a success: successes before it, failures after it");
+
 inline const char* to_string(outcome what)
 {
     switch (what)
     {
     case outcome::not_needed: return "not needed";
     case outcome::already_present: return "already present";
+    case outcome::cache_pressing: return "kept for this pressing";
     case outcome::local_key: return "redump folder";
     case outcome::cached_ird: return "cached IRD";
+    case outcome::inbox_key: return "keys inbox";
     case outcome::usb_key: return "USB key";
     case outcome::usb_ird: return "USB IRD";
+    case outcome::usb_list: return "USB keys or key list";
     case outcome::image_ird: return "IRD next to the ISO";
     case outcome::network: return "IRD database";
     case outcome::no_internet: return "no internet";
+    case outcome::clock_wrong: return "console clock wrong";
     case outcome::not_in_database: return "not in the database";
     case outcome::no_matching_key: return "no matching key";
     case outcome::server_error: return "server error";
@@ -1117,10 +1368,11 @@ inline bool succeeded(outcome what) noexcept
 }
 
 // A search that failed for the network or the database server is repeated for the same disc while it stays in the
-// drive (the console may get its connection after the disc went in); every other answer stands until the disc changes
+// drive (the console may get its connection after the disc went in, or its clock set right); every other answer stands
+// until the disc changes
 inline bool retry_later(outcome what) noexcept
 {
-    return what == outcome::no_internet || what == outcome::server_error || what == outcome::fetch_failed;
+    return what == outcome::no_internet || what == outcome::server_error || what == outcome::fetch_failed || what == outcome::clock_wrong;
 }
 
 // 1 min, then doubled up to 10 min
@@ -1144,6 +1396,7 @@ struct fetch_reply
 
     kind status = kind::failed;
     long http = 0;
+    int curl = 0;      // the curl code of a failed transfer (60, 77: a certificate check), 0 when none
     std::string body;
     std::string log;   // startup.log detail: host, address, curl code, timing
     std::string cause; // short pt-BR cause for the XMB
@@ -1171,6 +1424,17 @@ struct environment
     std::vector<std::string> image_key_files;
     std::string image_name;
     std::vector<std::string> image_ird_folders;
+    // Offline: the per-pressing copies, the player's files (inbox, USB:/keys, key lists, data1 values) and the network
+    // asked only when usable. False: the search as 0.39 made it (the disc_keys_offline feature row).
+    bool offline_keys = true;
+    std::string inbox_dir;                          // inbox_dir on the console; "" leaves the inbox out
+    std::function<int()> link_state;                // NetCtl state now (3: an IP address), -1 unknown; empty: not asked
+    std::function<std::int64_t()> clock;            // the console clock (unix seconds); empty: not judged
+    std::string build_date;                         // "YYYY-MM-DD" of this build, for the clock
+    std::function<tls_state()> tls;                 // the boot TLS self-test; empty: unknown
+    std::function<bool(const std::string& folder)> reopen; // opens a folder that refused a write (fs repair); empty: none
+    // The first 'bytes' of a file (fewer when it is shorter); empty: the whole file is read through read_file
+    std::function<bool(const std::string& path, std::size_t bytes, std::vector<byte>& out)> read_head;
 };
 
 struct result
@@ -1186,14 +1450,56 @@ struct result
     std::string check_value; // AES-ECB(key, zeros), 4 bytes in hex; never the key
     std::uint32_t tested = 0; // IRDs tried from the database
     std::optional<key128> key; // the verified key (in memory only)
+    std::uint32_t local_tested = 0; // files of this console and of USB tested (key files, IRDs, key lists)
+    std::string summary;            // the "disc key: sources tested: ..." line ("" when no source was searched)
+};
+
+// What one search looked at, for its summary line
+struct source_tally
+{
+    bool started = false;
+    std::uint32_t cache = 0, redump = 0, inbox = 0, usb = 0, ird = 0, lists = 0;
+    std::uint64_t list_values = 0;
+    std::uint32_t requests = 0;            // downloads asked for
+    std::string network = "not needed";
+
+    std::uint32_t local() const noexcept { return cache + redump + inbox + usb + ird; }
+
+    // "cache 1, redump 12, inbox 0, usb 3, lists 1 (214 values), ird 0, network skipped (offline: netctl state 1)"
+    std::string text() const
+    {
+        return "cache " + std::to_string(cache) + ", redump " + std::to_string(redump) + ", inbox " + std::to_string(inbox) + ", usb " + std::to_string(usb) +
+            ", lists " + std::to_string(lists) + " (" + std::to_string(list_values) + " values), ird " + std::to_string(ird) + ", network " + network;
+    }
 };
 
 // Byte limit of a result line in the interface language: text_limit, twice that in Arabic (two bytes per letter; the
 // XMB fits the line to the screen)
 inline std::size_t line_limit() noexcept { return i18n::rtl() ? 2 * text_limit : text_limit; }
 
-// Text of an outcome in the interface language. 'title_id', 'count', 'http' and 'cause' fill the texts that name them.
-inline std::string outcome_text(outcome what, std::string_view title_id = {}, std::uint32_t count = 0, long http = 0, std::string_view cause = {})
+// "Chave do disco encontrada em <source> e guardada neste PS4" within line_limit(): a long path keeps its end (the file
+// name), "..." marking the cut
+inline std::string found_in_text(std::string_view source)
+{
+    using i18n::str;
+    if (source.empty()) source = "?";
+    // The frame around the path, with the marks an argument gets in Arabic
+    const std::size_t frame = i18n::trf(str::DKEY_CHAVE_ENCONTRADA_EM, {std::string_view("x")}).size() - 1;
+    const std::size_t budget = line_limit() > frame + 8 ? line_limit() - frame : 8;
+    std::string shown(source);
+    if (shown.size() > budget)
+    {
+        std::size_t from = shown.size() - (budget - 3);
+        while (from < shown.size() && (static_cast<unsigned char>(shown[from]) & 0xc0) == 0x80) ++from;
+        shown = "..." + shown.substr(from);
+    }
+    return i18n::trf(str::DKEY_CHAVE_ENCONTRADA_EM, {shown});
+}
+
+// Text of an outcome in the interface language. 'title_id', 'count', 'http', 'cause' and 'source' (the file of the
+// offline sources) fill the texts that name them. 'count' with no_internet: the files tested locally.
+inline std::string outcome_text(outcome what, std::string_view title_id = {}, std::uint32_t count = 0, long http = 0, std::string_view cause = {},
+    std::string_view source = {})
 {
     using i18n::str;
     std::string text;
@@ -1201,13 +1507,17 @@ inline std::string outcome_text(outcome what, std::string_view title_id = {}, st
     {
     case outcome::not_needed: text = i18n::tr(str::DKEY_ESTE_DISCO_NAO_PRECISA_CHAVE); break;
     case outcome::already_present: text = i18n::tr(str::DKEY_CHAVE_DISCO_JA_ESTA_CONSOLE); break;
+    case outcome::cache_pressing: text = i18n::tr(str::DKEY_CHAVE_GUARDADA_PRENSAGEM); break;
     case outcome::local_key: text = i18n::tr(str::DKEY_CHAVE_DISCO_ENCONTRADA_DATA_RPCS3); break;
     case outcome::cached_ird: text = i18n::tr(str::DKEY_CHAVE_DISCO_OBTIDA_AUTOMATICAMENTE_IRD); break;
+    case outcome::inbox_key:
+    case outcome::usb_list: text = found_in_text(source); break;
     case outcome::usb_key: text = i18n::tr(str::DKEY_CHAVE_DISCO_IMPORTADA_USB_REDUMP); break;
     case outcome::usb_ird: text = i18n::tr(str::DKEY_CHAVE_DISCO_OBTIDA_IRD); break;
     case outcome::image_ird: text = i18n::tr(str::DKEY_CHAVE_OBTIDA_IRD_LADO_ISO); break;
     case outcome::network: text = i18n::tr(str::DKEY_CHAVE_DISCO_OBTIDA_AUTOMATICAMENTE); break;
-    case outcome::no_internet: text = i18n::tr(str::DKEY_SEM_INTERNET_NAO_FOI_POSSIVEL); break;
+    case outcome::no_internet: text = count ? i18n::trf(str::DKEY_SEM_INTERNET_TESTADOS, {count}) : std::string(i18n::tr(str::DKEY_SEM_INTERNET_NAO_FOI_POSSIVEL)); break;
+    case outcome::clock_wrong: text = i18n::tr(str::DKEY_RELOGIO_ERRADO); break;
     case outcome::not_in_database:
         text = title_id.empty() ? std::string(i18n::tr(str::DKEY_ESTE_DISCO_NAO_ESTA_BASE)) : i18n::trf(str::DKEY_ESTE_DISCO_NAO_ESTA_BASE_ID, {title_id});
         break;
@@ -1231,6 +1541,9 @@ inline result obtain(const environment& env)
 {
     result r;
     std::vector<std::string> wrong_files; // key files under the target name that do not decrypt the disc
+    std::vector<std::string> copies_tested; // pressing copies tested before the redump folder's scan
+    source_tally count;
+    const bool offline_on = env.offline_keys;
     const auto log = [&env](const std::string& line)
     {
         if (env.log) env.log("disc key: " + line);
@@ -1241,6 +1554,12 @@ inline result obtain(const environment& env)
         r.what = what;
         r.ok = succeeded(what);
         r.text = clip(std::move(text), line_limit());
+        if (count.started)
+        {
+            r.local_tested = count.local();
+            r.summary = "disc key: sources tested: " + count.text();
+            if (env.log) env.log(r.summary);
+        }
         r.line = "disc key: result: " + r.text + " | " + std::string(to_string(what)) + (detail.empty() ? std::string{} : "; " + detail);
         if (env.log) env.log(r.line);
         return std::move(r);
@@ -1249,6 +1568,17 @@ inline result obtain(const environment& env)
     {
         data.clear();
         return env.read_file && env.read_file(path, limit, data);
+    };
+    // The first 'bytes' of a file; without read_head the whole file up to 'limit'
+    const auto read_head = [&env, &read_small](const std::string& path, std::size_t bytes, std::size_t limit, std::vector<byte>& data)
+    {
+        data.clear();
+        if (env.read_head) return env.read_head(path, bytes, data);
+        return read_small(path, limit, data);
+    };
+    const auto write = [&env](const std::string& path, const void* bytes, std::size_t size)
+    {
+        return may_write(path) && env.write_file && env.write_file(path, bytes, size);
     };
 
     disc_identity disc;
@@ -1268,27 +1598,74 @@ inline result obtain(const environment& env)
     if (r.title_id.empty()) return finish(outcome::disc_unreadable, outcome_text(outcome::disc_unreadable), "no title id in sector 1 or PARAM.SFO");
     if (disc.blocks.empty()) return finish(outcome::cannot_verify, outcome_text(outcome::cannot_verify), "nothing to test a key against");
     if (!disc.needs_key()) return finish(outcome::not_needed, outcome_text(outcome::not_needed), "LIC.DAT/EBOOT.BIN read in the clear");
+    count.started = true;
 
     const std::string stem = env.key_dir + r.title_id;
     r.key_path = stem + ".dkey";
+    // The copy kept for this pressing (offline): never renamed or removed by the app
+    const std::string pressing_path = offline_on && disc.identity ? env.key_dir + pressing_file_name(r.title_id, disc.identity) : std::string{};
     std::vector<byte> data;
 
-    // Writes the verified key as <TITLE_ID>.dkey (32 hex characters, the form the loader reads first)
-    const auto install = [&](const key128& key, outcome what, const std::string& source) -> result
+    // A value as the disc key or, offline, as data1 the key derives from (people often hold data1: IRDs, GetKey dumps)
+    const auto test_value = [&](const key128& value) -> std::optional<value_match>
+    {
+        if (decrypts_all(value, disc.blocks)) return value_match{value, false};
+        if (offline_on)
+            if (const key128 derived = derive_key(value); decrypts_all(derived, disc.blocks)) return value_match{derived, true};
+        return std::nullopt;
+    };
+
+    // Writes 'hex' as 'path' and reads it back. Offline, a folder that refuses it is opened once (the permission repair
+    // of the frontend) and the write tried again; the key stays usable from memory either way.
+    const auto write_key = [&](const std::string& path, const std::string& hex) -> bool
+    {
+        std::vector<byte> back;
+        const auto attempt = [&] { return write(path, hex.data(), hex.size()) && read_small(path, key_file_limit, back) && std::string(back.begin(), back.end()) == hex; };
+        if (attempt()) return true;
+        if (!offline_on || !env.reopen || !may_write(path)) return false;
+        const std::string folder = path.substr(0, path.rfind('/'));
+        const bool opened = env.reopen(folder);
+        log("could not write " + path + (opened ? ": " + folder + " opened again, writing once more" : ": " + folder + " could not be opened"));
+        return opened && attempt();
+    };
+
+    // The copy of a verified key for this pressing, written when it is missing or holds another value; its path when written
+    const auto keep_pressing_copy = [&](const std::string& hex) -> std::string
+    {
+        if (pressing_path.empty() || pressing_path == r.key_path) return {};
+        std::vector<byte> held;
+        if (read_small(pressing_path, key_file_limit, held) && std::string(held.begin(), held.end()) == hex) return {};
+        if (write(pressing_path, hex.data(), hex.size())) return pressing_path;
+        log("could not write " + pressing_path + " (the copy kept for this pressing)");
+        return {};
+    };
+
+    // Writes the verified key as <TITLE_ID>.dkey (32 hex characters, the form the loader reads first). 'shown': the file
+    // the result text names (the player's own files)
+    const auto install = [&](const key128& key, outcome what, const std::string& source, const std::string& shown = {}) -> result
     {
         r.source = source;
         r.check_value = check_value(key);
         r.key = key; // verified, so usable even when the file cannot be written
         for (const std::string& wrong : wrong_files)
         {
-            // Kept for the player to look at, out of the loader's way
-            if (env.rename_file && env.rename_file(wrong, wrong + ".bad")) log("moved " + wrong + " (does not decrypt this disc) to " + wrong + ".bad");
+            // Kept for the player to look at, out of the loader's way. Offline, an older file moved aside keeps its place
+            // (it may hold another pressing's key): this one gets a name of its own.
+            std::string aside = wrong + ".bad";
+            if (offline_on)
+            {
+                std::vector<byte> before, now;
+                if (read_small(aside, key_file_limit, before) && read_small(wrong, key_file_limit, now) && before != now)
+                {
+                    const auto held = key_from_file(now.data(), now.size());
+                    aside = wrong + "." + (held ? check_value(*held) : std::string("x")) + ".bad";
+                }
+            }
+            if (may_write(wrong) && may_write(aside) && env.rename_file && env.rename_file(wrong, aside)) log("moved " + wrong + " (does not decrypt this disc) to " + aside);
             else log("could not move " + wrong + " aside (it does not decrypt this disc)");
         }
         const std::string hex = to_hex(key.data(), key.size());
-        std::vector<byte> back;
-        if (!env.write_file || !env.write_file(r.key_path, hex.data(), hex.size()) || !read_small(r.key_path, key_file_limit, back) ||
-            std::string(back.begin(), back.end()) != hex)
+        if (!write_key(r.key_path, hex))
             return finish(outcome::write_failed, outcome_text(outcome::write_failed), "cannot write " + r.key_path + " (key " + r.check_value + " verified, from " + source + ")");
         r.changed = true;
         std::string also;
@@ -1298,11 +1675,13 @@ inline result obtain(const environment& env)
             const std::string copy = env.key_dir + env.image_name + ".dkey";
             if (copy != r.key_path)
             {
-                if (env.write_file(copy, hex.data(), hex.size())) also = " and " + copy;
+                if (write(copy, hex.data(), hex.size())) also = " and " + copy;
                 else log("could not write " + copy + " (the loader still finds " + r.key_path + ")");
             }
         }
-        return finish(what, outcome_text(what, r.title_id), "saved " + r.key_path + also + " (key check " + r.check_value + ", from " + source + ")");
+        const std::string pressing = keep_pressing_copy(hex);
+        return finish(what, outcome_text(what, r.title_id, 0, 0, {}, shown), "saved " + r.key_path + also + " (key check " + r.check_value + ", from " + source + ")" +
+            (pressing.empty() ? std::string{} : "; kept for this pressing as " + pressing));
     };
 
     // 1. The key already in place: for an ISO first the key files its loader looks up by the image's name. A wrong file
@@ -1312,44 +1691,103 @@ inline result obtain(const environment& env)
     for (const std::string& path : in_place)
     {
         if (!read_small(path, key_file_limit, data)) continue;
+        ++count.cache;
         const auto key = key_from_file(data.data(), data.size());
-        if (key && decrypts_all(*key, disc.blocks))
+        const std::optional<value_match> found = key ? test_value(*key) : std::nullopt;
+        if (found && !found->data1)
         {
-            if (!wrong_files.empty()) return install(*key, outcome::already_present, path);
+            if (!wrong_files.empty()) return install(found->key, outcome::already_present, path);
             r.key_path = path;
-            r.check_value = check_value(*key);
+            r.check_value = check_value(found->key);
             r.source = path;
-            r.key = key;
-            return finish(outcome::already_present, outcome_text(outcome::already_present), path + " verified (key check " + r.check_value + ")");
+            r.key = found->key;
+            // Keys cached before the pressing copies existed gain theirs the next time the disc is seen
+            const std::string pressing = keep_pressing_copy(to_hex(found->key.data(), found->key.size()));
+            return finish(outcome::already_present, outcome_text(outcome::already_present), path + " verified (key check " + r.check_value + ")" +
+                (pressing.empty() ? std::string{} : "; kept for this pressing as " + pressing));
         }
-        log(path + (key ? " does not decrypt this disc (key check " + check_value(*key) + ")" : " holds no key"));
         wrong_files.push_back(path);
+        // data1 where the loader wants the key: moved aside, the key written in its place
+        if (found) return install(found->key, outcome::local_key, path + " (data1)");
+        log(path + (key ? " does not decrypt this disc (key check " + check_value(*key) + ")" : " holds no key"));
     }
 
+    std::optional<std::vector<std::string>> redump_listing;
+    const auto redump_names = [&]() -> const std::vector<std::string>&
+    {
+        if (!redump_listing) redump_listing = env.list_files ? env.list_files(env.key_dir) : std::vector<std::string>{};
+        return *redump_listing;
+    };
+
+    // 1b. Offline: the copy kept for this pressing, then those of the title id's other pressings (a key shared by two
+    // pressings)
+    if (offline_on)
+    {
+        std::vector<std::string> copies;
+        if (!pressing_path.empty()) copies.push_back(pressing_path);
+        for (const std::string& name : redump_names())
+        {
+            if (copies.size() > max_pressing_copies) break;
+            if (is_pressing_file(name, r.title_id) && env.key_dir + name != pressing_path) copies.push_back(env.key_dir + name);
+        }
+        for (const std::string& path : copies)
+        {
+            if (stopped()) break;
+            copies_tested.push_back(path);
+            if (!read_small(path, key_file_limit, data)) continue;
+            ++count.cache;
+            const auto key = key_from_file(data.data(), data.size());
+            if (key && decrypts_all(*key, disc.blocks)) return install(*key, outcome::cache_pressing, path);
+        }
+    }
+
+    // 2. Other key files on the console (a key pack imported with its own names); offline then the files a wrong key was
+    // moved aside to (*.bad, also by 0.37-0.39), named after the disc first
     const auto test_key_files = [&](const std::string& folder, outcome what, const std::string& label) -> std::optional<result>
     {
         if (!env.list_files) return std::nullopt;
-        std::vector<std::string> names = env.list_files(folder);
+        std::vector<std::string> names = folder == env.key_dir ? redump_names() : env.list_files(folder);
         // The file named after the disc first
         std::stable_partition(names.begin(), names.end(), [&](const std::string& n) { return key_detail::iequals(n, r.title_id + ".dkey") || key_detail::iequals(n, r.title_id + ".key"); });
         std::size_t tried = 0;
+        const auto tested_before = [&](const std::string& path)
+        {
+            return std::find(wrong_files.begin(), wrong_files.end(), path) != wrong_files.end() || std::find(copies_tested.begin(), copies_tested.end(), path) != copies_tested.end();
+        };
         for (const std::string& name : names)
         {
             if (tried >= max_key_files || stopped()) break;
             if (!key_detail::iends_with(name, ".dkey") && !key_detail::iends_with(name, ".key")) continue;
             const std::string path = folder + name;
-            if (std::find(wrong_files.begin(), wrong_files.end(), path) != wrong_files.end()) continue;
+            if (tested_before(path)) continue;
             ++tried;
             if (!read_small(path, key_file_limit, data)) continue;
+            ++count.redump;
             const auto key = key_from_file(data.data(), data.size());
-            if (key && decrypts_all(*key, disc.blocks)) return install(*key, what, label + name);
+            const std::optional<value_match> found = key ? test_value(*key) : std::nullopt;
+            if (found) return install(found->key, what, label + name + (found->data1 ? " (data1)" : ""));
+        }
+        if (offline_on)
+        {
+            std::stable_partition(names.begin(), names.end(), [&](const std::string& n) { return n.size() > r.title_id.size() && key_detail::iequals(n.substr(0, r.title_id.size()), r.title_id); });
+            for (const std::string& name : names)
+            {
+                if (tried >= max_key_files || stopped()) break;
+                if (!key_detail::iends_with(name, ".bad")) continue;
+                ++tried;
+                if (!read_small(folder + name, key_file_limit, data)) continue;
+                ++count.redump;
+                const auto key = key_from_file(data.data(), data.size());
+                const std::optional<value_match> found = key ? test_value(*key) : std::nullopt;
+                if (found) return install(found->key, what, label + name + (found->data1 ? " (data1)" : ""));
+            }
         }
         if (tried) log(std::to_string(tried) + " key file(s) in " + folder + " tested, none decrypts this disc");
         return std::nullopt;
     };
 
     // Tests one IRD file; on success 'save_as' (when given) keeps a copy in the IRD folder
-    const auto test_ird = [&](const std::vector<byte>& bytes, const std::string& label, outcome what, const std::string& save_as) -> std::optional<result>
+    const auto test_ird = [&](const std::vector<byte>& bytes, const std::string& label, outcome what, const std::string& save_as, const std::string& shown = {}) -> std::optional<result>
     {
         ird file;
         const ird_status status = parse_ird(bytes.data(), bytes.size(), file);
@@ -1365,8 +1803,8 @@ inline result obtain(const environment& env)
             std::to_string(file.file_count) + " files, CRC ok, sector 0 " + (!file.has_sector0 ? "unknown" : file.sector0 == disc.sector0 ? "equal" : "differs") +
             "; key " + check_value(key) + (!same_code ? " not tested (another product code)" : ok ? " verified OK" : " does not decrypt this disc"));
         if (!ok) return std::nullopt;
-        if (!save_as.empty() && env.write_file && !env.write_file(save_as, bytes.data(), bytes.size())) log("could not keep a copy as " + save_as);
-        return install(key, what, label);
+        if (!save_as.empty() && !write(save_as, bytes.data(), bytes.size())) log("could not keep a copy as " + save_as);
+        return install(key, what, label, shown);
     };
 
     // 2. Other key files on the console (a key pack imported with its own names)
@@ -1391,12 +1829,14 @@ inline result obtain(const environment& env)
             if (!read_small(folder + name, ird_limit, data)) continue;
             const std::string code = peek_product_code(data.data(), data.size());
             if (!key_detail::iequals(code, disc.product_code) && !key_detail::iequals(code, disc.header_id)) continue;
+            ++count.ird;
             if (auto done = test_ird(data, folder + name, outcome::image_ird, env.ird_dir + cache_name("image/" + code + " " + name))) return std::move(*done);
         }
         if (tried) log(std::to_string(tried) + " IRD file(s) in " + folder + " looked at, none decrypts this disc");
     }
 
-    // 3. IRDs downloaded earlier
+    // 3. IRDs downloaded earlier; offline also those of other names whose product code (read from the file's head) is
+    // this disc's (an IRD the player put there over FTP)
     const std::vector<std::string> cached_names = env.list_files ? env.list_files(env.ird_dir) : std::vector<std::string>{};
     {
         std::size_t tried = 0;
@@ -1406,12 +1846,164 @@ inline result obtain(const environment& env)
             if (!key_detail::iends_with(name, ".ird") || !name_mentions(name, disc.product_code)) continue;
             ++tried;
             if (!read_small(env.ird_dir + name, ird_limit, data)) continue;
+            ++count.ird;
+            if (auto done = test_ird(data, env.ird_dir + name, outcome::cached_ird, {})) return std::move(*done);
+        }
+        for (const std::string& name : cached_names)
+        {
+            if (!offline_on || tried >= max_ird_files || stopped()) break;
+            if (!key_detail::iends_with(name, ".ird") || name_mentions(name, disc.product_code)) continue;
+            ++tried;
+            if (!read_head(env.ird_dir + name, ird_peek_bytes, ird_limit, data)) continue;
+            const std::string code = peek_product_code(data.data(), data.size());
+            if (!key_detail::iequals(code, disc.product_code) && !key_detail::iequals(code, disc.header_id)) continue;
+            if (!read_small(env.ird_dir + name, ird_limit, data)) continue;
+            ++count.ird;
             if (auto done = test_ird(data, env.ird_dir + name, outcome::cached_ird, {})) return std::move(*done);
         }
     }
 
-    // 4. USB drives (read only): redump/ (.dkey, .key) and ird/ (.ird), folder names in any case. Files named after the
-    // disc are tried before the download, the rest of those folders only when the database gave no key.
+    // The player's own files (offline): key lists, with every value tried as the key and as data1
+    std::size_t lists_read = 0, values_left = max_list_values;
+    const auto test_list = [&](const std::vector<byte>& text, const std::string& label, outcome what) -> std::optional<result>
+    {
+        // A file the size of a key file (a key with a name or a comment around it) holds one value at most: it does not
+        // count as one of the lists a search reads
+        const bool small = text.size() <= key_file_limit;
+        if ((!small && lists_read >= max_list_files) || !values_left)
+        {
+            log(label + ": not read (a search reads at most " + std::to_string(max_list_files) + " key lists and " + std::to_string(max_list_values) + " values)");
+            return std::nullopt;
+        }
+        lists_read += !small;
+        ++count.lists;
+        std::optional<std::pair<value_match, std::size_t>> hit;
+        const list_stats stats = scan_key_list(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()), disc.product_code, disc.header_id,
+            values_left, [&](const list_value& v)
+            {
+                if (const std::optional<value_match> found = test_value(v.value)) hit.emplace(*found, v.line);
+                return hit.has_value();
+            });
+        values_left -= std::min(values_left, stats.offered);
+        count.list_values += stats.offered;
+        if (hit) return install(hit->first.key, what, label + " (line " + std::to_string(hit->second) + (hit->first.data1 ? ", data1" : "") + ")", label);
+        log(label + ": " + std::to_string(stats.values) + " value(s) on " + std::to_string(stats.lines) + " line(s)" +
+            (stats.named ? " (" + std::to_string(stats.named) + " on lines naming " + r.title_id + ")" : std::string{}) +
+            (stats.truncated ? ", " + std::to_string(stats.offered) + " tested (the bound of one search)" : std::string{}) + ", none decrypts this disc");
+        return std::nullopt;
+    };
+
+    // Where a file of the player's lies: the outcome its key gets
+    enum class place
+    {
+        inbox,      // /data/rpcs3/keys
+        usb_redump, // USB:/redump: key files keep their 0.39 outcome
+        usb_ird,    // USB:/ird: IRDs keep theirs
+        usb_keys,   // USB:/keys
+    };
+    const auto outcome_for = [](place where, user_file type)
+    {
+        if (where == place::inbox) return outcome::inbox_key;
+        if (where == place::usb_redump && type == user_file::key) return outcome::usb_key;
+        if (where == place::usb_ird && type == user_file::ird) return outcome::usb_ird;
+        return outcome::usb_list;
+    };
+
+    // One file of the player's, decided by its content: a key file (16 bytes or 32 hex characters), an IRD (gzip or
+    // "3IRD") of this disc, else a key list. 'name' names the IRD copy kept from USB.
+    const auto test_content = [&](const std::vector<byte>& bytes, const std::string& label, const std::string& name, place where) -> std::optional<result>
+    {
+        if (const auto key = key_from_file(bytes.data(), bytes.size()))
+        {
+            const std::optional<value_match> found = test_value(*key);
+            if (!found) return std::nullopt;
+            return install(found->key, outcome_for(where, user_file::key), label + (found->data1 ? " (data1)" : ""), label);
+        }
+        if (bytes.size() >= 4 && (std::memcmp(bytes.data(), "3IRD", 4) == 0 || (bytes[0] == 0x1f && bytes[1] == 0x8b)))
+        {
+            const std::string code = peek_product_code(bytes.data(), bytes.size());
+            if (!key_detail::iequals(code, disc.product_code) && !key_detail::iequals(code, disc.header_id)) return std::nullopt;
+            return test_ird(bytes, label, outcome_for(where, user_file::ird), where == place::inbox ? std::string{} : env.ird_dir + cache_name("usb/" + code + " " + name), label);
+        }
+        return test_list(bytes, label, outcome_for(where, user_file::list));
+    };
+
+    // The player's files in 'folder' ("/.../"; with 'subfolders' also one level below it), only read. 'named_only': the
+    // files whose name (or subfolder) mentions the disc; false: the others. Bounded per folder and per search.
+    const auto scan_user_folder = [&](const std::string& folder, const std::string& shown, place where, bool named_only, bool subfolders) -> std::optional<result>
+    {
+        if (!env.list_files) return std::nullopt;
+        struct spot
+        {
+            std::string path, label;
+            bool named = false;
+        };
+        std::vector<spot> spots{{folder, shown, false}};
+        if (subfolders && env.list_folders)
+            for (const std::string& sub : env.list_folders(folder.substr(0, folder.size() - 1)))
+            {
+                if (spots.size() > max_subfolders) break;
+                spots.push_back({folder + sub + "/", shown + sub + "/", name_mentions(sub, disc.product_code) || name_mentions(sub, disc.header_id)});
+            }
+        std::uint32_t& counter = where == place::inbox ? count.inbox : count.usb;
+        const std::size_t key_cap = where == place::inbox || where == place::usb_keys ? max_inbox_key_files : max_key_files;
+        for (const spot& s : spots)
+        {
+            std::size_t keys = 0, irds = 0, texts = 0, tried = 0;
+            for (const std::string& name : env.list_files(s.path))
+            {
+                if (stopped()) return std::nullopt;
+                const bool named = s.named || name_mentions(name, disc.product_code) || name_mentions(name, disc.header_id);
+                if (named != named_only) continue;
+                const user_file type = user_file_type(name);
+                const std::string path = s.path + name, label = s.label + name;
+                switch (type)
+                {
+                case user_file::key:
+                    if (keys >= key_cap) continue;
+                    ++keys;
+                    // A key file holds a key; a bigger one is read as a key list
+                    if (!read_small(path, key_file_limit, data) && !read_small(path, list_limit, data)) continue;
+                    break;
+                case user_file::ird:
+                {
+                    if (irds >= max_ird_files) continue;
+                    ++irds;
+                    if (!read_head(path, ird_peek_bytes, ird_limit, data)) continue;
+                    const std::string code = peek_product_code(data.data(), data.size());
+                    if (!key_detail::iequals(code, disc.product_code) && !key_detail::iequals(code, disc.header_id)) continue;
+                    if (!read_small(path, ird_limit, data)) continue;
+                    break;
+                }
+                case user_file::list:
+                    // Tiny text files do not count as key lists (test_list): a folder of thousands is bounded here
+                    if (texts >= key_cap) continue;
+                    ++texts;
+                    if (!read_small(path, list_limit, data))
+                    {
+                        log(label + ": not read (unreadable, or larger than " + std::to_string(list_limit >> 20) + " MiB)");
+                        continue;
+                    }
+                    break;
+                case user_file::other: continue;
+                }
+                ++tried;
+                ++counter;
+                if (auto done = test_content(data, label, name, where)) return done;
+            }
+            if (tried) log(std::to_string(tried) + " file(s) in " + s.label + " tested" + (named_only ? " (named after the disc)" : "") + ", none decrypts this disc");
+        }
+        return std::nullopt;
+    };
+
+    // 4. The inbox /data/rpcs3/keys (offline): files named after the disc first, then the others
+    if (offline_on && !env.inbox_dir.empty())
+        for (const bool named : {true, false})
+            if (auto done = scan_user_folder(env.inbox_dir, env.inbox_dir, place::inbox, named, true)) return std::move(*done);
+
+    // 5. USB drives (read only): redump/ (.dkey, .key) and ird/ (.ird), folder names in any case; offline also keys/
+    // (one level of subfolders), and every kind of the player's files in all three. Files named after the disc are tried
+    // before the download, the rest of those folders only when the database gave no key (or no download can work).
     const auto test_usb = [&](bool named_only) -> std::optional<result>
     {
         if (!env.list_folders || !env.list_files) return std::nullopt;
@@ -1420,9 +2012,15 @@ inline result obtain(const environment& env)
             for (const std::string& folder : env.list_folders(root))
             {
                 const bool keys = key_detail::iequals(folder, "redump");
-                if (!keys && !key_detail::iequals(folder, "ird")) continue;
+                const bool inbox = offline_on && key_detail::iequals(folder, "keys");
+                if (!keys && !inbox && !key_detail::iequals(folder, "ird")) continue;
                 const std::string path = root + "/" + folder + "/";
                 const std::string shown = "USB" + std::string(root.empty() ? "" : root.substr(root.size() - 1)) + ":/" + folder + "/";
+                if (offline_on)
+                {
+                    if (auto done = scan_user_folder(path, shown, inbox ? place::usb_keys : keys ? place::usb_redump : place::usb_ird, named_only, inbox)) return done;
+                    continue;
+                }
                 std::size_t tried = 0;
                 for (const std::string& name : env.list_files(path))
                 {
@@ -1434,6 +2032,7 @@ inline result obtain(const environment& env)
                         if (!key_detail::iends_with(name, ".dkey") && !key_detail::iends_with(name, ".key")) continue;
                         ++tried;
                         if (!read_small(path + name, key_file_limit, data)) continue;
+                        ++count.usb;
                         const auto key = key_from_file(data.data(), data.size());
                         if (key && decrypts_all(*key, disc.blocks)) return install(*key, outcome::usb_key, shown + name);
                         continue;
@@ -1441,6 +2040,7 @@ inline result obtain(const environment& env)
                     if (!key_detail::iends_with(name, ".ird")) continue;
                     ++tried;
                     if (!read_small(path + name, ird_limit, data)) continue;
+                    ++count.usb;
                     const std::string code = peek_product_code(data.data(), data.size());
                     if (!key_detail::iequals(code, disc.product_code) && !key_detail::iequals(code, disc.header_id)) continue;
                     if (auto done = test_ird(data, shown + name, outcome::usb_ird, env.ird_dir + cache_name("usb/" + code + " " + name))) return done;
@@ -1453,7 +2053,28 @@ inline result obtain(const environment& env)
     if (auto done = test_usb(true)) return std::move(*done);
     if (stopped()) return finish(outcome::cancelled, outcome_text(outcome::cancelled), "before the download");
 
-    // 5. The IRD database. Its failure is kept while the rest of the USB folders are searched.
+    // Offline, nothing is downloaded when no download can work (no IP address, or a clock no certificate is valid at):
+    // the rest of USB is searched and the result says why, without the retries and time-outs of each URL
+    if (offline_on && env.fetch)
+    {
+        const int link = env.link_state ? env.link_state() : -1;
+        const std::int64_t now = env.clock ? env.clock() : -1;
+        const tls_state tls = env.tls ? env.tls() : tls_state::unknown;
+        const net_state net = network_usable(link, now, env.build_date, tls);
+        if (net != net_state::usable)
+        {
+            const std::string why = net == net_state::no_link ? "offline: netctl state " + std::to_string(link)
+                : !disc_stream::clock_plausible(now, env.build_date) ? "console clock " + date_text(now) + " is before this build (" + env.build_date + ")"
+                : std::string("the TLS self-test found no root certificate valid at the console's date");
+            count.network = "skipped (" + why + ")";
+            if (auto done = test_usb(false)) return std::move(*done);
+            if (stopped()) return finish(outcome::cancelled, outcome_text(outcome::cancelled), "after the USB folders");
+            const outcome what = net == net_state::clock_wrong ? outcome::clock_wrong : outcome::no_internet;
+            return finish(what, outcome_text(what, {}, count.local()), "nothing downloaded (" + why + ")");
+        }
+    }
+
+    // 6. The IRD database. Its failure is kept while the rest of the USB folders are searched.
     struct failure
     {
         outcome what = outcome::unavailable;
@@ -1479,12 +2100,17 @@ inline result obtain(const environment& env)
         case fetch_reply::kind::ok:
         case fetch_reply::kind::failed: break;
         }
+        // A certificate check that failed (curl 60, 77) while the boot TLS self-test found no root valid at the console's
+        // date: the clock, not the server (the self-test may have finished only after the check before the download)
+        if (offline_on && (reply.curl == 60 || reply.curl == 77) && env.tls && env.tls() == tls_state::clock_refused)
+            return fail(outcome::clock_wrong, outcome_text(outcome::clock_wrong), why + " (the TLS self-test found no root certificate valid at the console's date)");
         return fail(outcome::fetch_failed, outcome_text(outcome::fetch_failed, {}, 0, 0, reply.cause), why);
     };
     // A transfer that broke on the way or a server error is asked again (2 s, then 4 s later); no link, a refusal
     // (HTTP 4xx) or a stop is the answer at once
     const auto fetch = [&](const std::string& url, std::size_t limit, const std::string& what) -> fetch_reply
     {
+        ++count.requests;
         fetch_reply reply = env.fetch(url, limit);
         for (int attempt = 1; attempt < fetch_attempts && !stopped(); ++attempt)
         {
@@ -1493,8 +2119,10 @@ inline result obtain(const environment& env)
             log(what + ": attempt " + std::to_string(attempt) + " of " + std::to_string(fetch_attempts) + " failed (" + reply.log + "); trying again");
             if (env.pause) env.pause(2000ll << (attempt - 1));
             if (stopped()) break;
+            ++count.requests;
             reply = env.fetch(url, limit);
         }
+        count.network = "asked (" + std::to_string(count.requests) + " request(s))";
         return reply;
     };
     const auto database = [&]() -> std::optional<result>
@@ -1509,7 +2137,7 @@ inline result obtain(const environment& env)
         const bool fresh = index.status == fetch_reply::kind::ok && parse_index(index.body, disc.product_code, entries, &codes) == index_status::ok && codes;
         if (fresh)
         {
-            if (env.write_file && !env.write_file(index_copy, index.body.data(), index.body.size())) log("index: could not keep a copy as " + index_copy);
+            if (env.write_file && !write(index_copy, index.body.data(), index.body.size())) log("index: could not keep a copy as " + index_copy);
         }
         else if (index.status != fetch_reply::kind::cancelled && read_small(index_copy, index_limit, data) && !data.empty())
         {
@@ -1577,12 +2205,15 @@ inline result obtain(const environment& env)
         return fail(outcome::no_matching_key, outcome_text(outcome::no_matching_key, {}, downloaded),
             std::to_string(candidates.size()) + " IRD(s) listed, " + std::to_string(downloaded) + " downloaded, none decrypts " + r.title_id);
     };
+    if (!env.fetch) count.network = "not available in this build";
     if (auto done = database()) return std::move(*done);
 
-    // 6. The rest of the USB folders (key packs, IRDs named otherwise)
+    // 7. The rest of the USB folders (key packs, IRDs named otherwise)
     if (pending.what != outcome::cancelled && !stopped())
         if (auto done = test_usb(false)) return std::move(*done);
     if (stopped()) pending = {outcome::cancelled, outcome_text(outcome::cancelled), "after the download"};
+    // Offline the text counts the files that were tried
+    if (offline_on && pending.what == outcome::no_internet) pending.text = outcome_text(outcome::no_internet, {}, count.local());
     return finish(pending.what, std::move(pending.text), pending.detail);
 }
 } // namespace utils::ps4::disc_key
@@ -1590,9 +2221,15 @@ inline result obtain(const environment& env)
 #ifdef RPCS3_PS4
 
 #include "Utilities/File.h"
+#include "Emu/NP/ps4_tls_selftest.h"
+#include "util/ps4_build_version.hpp"
+#include "util/ps4_fs_repair.hpp"
 #include "util/ps4_net.hpp"
+#include "util/ps4_safe_mode.hpp"
 #include "util/sysinfo.hpp"
 #include "curl/curl/include/curl/curl.h"
+
+#include <ctime>
 
 namespace utils::ps4::disc_key
 {
@@ -1601,6 +2238,38 @@ inline constexpr char data_root[] = "/data/rpcs3/";
 
 namespace sys
 {
+// startup.log; the result and the summary of a search also go to RPCS3.log (disc_stream::log_mirror), where testers
+// look first. Neither line ever holds a key.
+inline void log_line(const std::string& line)
+{
+    ps4_startup_checkpoint(line.c_str());
+    if (line.starts_with("disc key: result: ") || line.starts_with("disc key: sources tested: ") || line.find("': result: ") != std::string::npos ||
+        line.find("': sources tested: ") != std::string::npos)
+        disc_stream::mirror(line);
+}
+
+// A folder of /data/rpcs3 that refused the key's write, opened at once as the frontend does after a refused write: the
+// app's own chmod, else SITE CHMOD through the console's FTP server (fs_repair::reopen_folder). Nothing is tried with
+// /data/rpcs3/no-fs-repair.flag or for an error other than a permission refusal.
+inline bool reopen(const std::string& folder)
+{
+#ifdef __ORBIS__
+    namespace fr = utils::ps4::fs_repair;
+    const fr::fs_ops calls = fr::sys::fs();
+    std::uint32_t owner = 0;
+    const int error = calls.probe(folder, owner);
+    if (!error) return true;
+    if (!fr::permission_error(error) || fs::is_file("/data/rpcs3/no-fs-repair.flag")) return false;
+    std::string line;
+    const bool opened = fr::reopen_folder(calls, disc_stream::sys::net(), fr::sys::server(), folder, line);
+    ps4_startup_checkpoint(line.c_str());
+    return opened;
+#else
+    (void)folder;
+    return false;
+#endif
+}
+
 // Cause of a curl result in the interface language
 inline std::string curl_cause(CURLcode code)
 {
@@ -1755,6 +2424,7 @@ inline fetch_reply https_get(const std::string& url, std::size_t limit, const st
     }
     if (code != CURLE_OK)
     {
+        out.curl = static_cast<int>(code);
         out.log += "; curl " + std::to_string(static_cast<int>(code)) + " '" + error.data() + "' [" + curl_easy_strerror(code) + "]";
         out.cause = curl_cause(code);
         const bool no_link = code == CURLE_COULDNT_RESOLVE_HOST || code == CURLE_COULDNT_CONNECT || (code == CURLE_OPERATION_TIMEDOUT && !http && t.body.empty());
@@ -1832,13 +2502,29 @@ inline environment console(std::shared_ptr<std::atomic<bool>> stop)
         fs::stat_t info{};
         return fs::get_stat(path, info) && !info.is_directory ? static_cast<std::int64_t>(info.mtime) : -1;
     };
-    env.log = [](const std::string& line) { ps4_startup_checkpoint(line.c_str()); };
+    env.log = log_line;
     env.key_dir = rpcs3::utils::get_redump_key_dir();
     if (env.key_dir.empty() || env.key_dir.back() != '/') env.key_dir += '/';
     constexpr std::string_view redump = "redump/";
     env.ird_dir = env.key_dir.ends_with(redump) ? env.key_dir.substr(0, env.key_dir.size() - redump.size()) + "ird/" : std::string("/data/rpcs3/data/ird/");
     for (unsigned i = 0; i < 8; ++i)
         if (const std::string root = "/mnt/usb" + std::to_string(i); fs::is_dir(root)) env.usb_roots.push_back(root);
+    // Offline sources and order (feature row disc_keys_offline; disc-keys-039.flag gives the search of 0.39)
+    env.offline_keys = utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::disc_keys_offline);
+    env.inbox_dir = disc_key::inbox_dir;
+    env.link_state = [] { return utils::ps4::net::link_state(); };
+    env.clock = [] { return static_cast<std::int64_t>(std::time(nullptr)); };
+    env.build_date = ps4_build_date;
+    env.tls = [] { return tls_from_selftest(ps4_tls_selftest_ok(), ps4_tls_selftest_line()); };
+    env.reopen = reopen;
+    env.read_head = [](const std::string& path, std::size_t bytes, std::vector<byte>& out)
+    {
+        const fs::file file(path);
+        if (!file) return false;
+        const u64 size = file.size();
+        out.resize(static_cast<std::size_t>(std::min<u64>(size, bytes)));
+        return out.empty() || file.read(out.data(), out.size()) == out.size();
+    };
     return env;
 }
 }
@@ -1883,7 +2569,7 @@ inline result find_key_for_image(const std::string& path, std::shared_ptr<std::a
     {
         constexpr std::string_view head = "disc key: ";
         const std::string_view text = std::string_view(line).starts_with(head) ? std::string_view(line).substr(head.size()) : std::string_view(line);
-        ps4_startup_checkpoint((prefix + std::string(text)).c_str());
+        sys::log_line(prefix + std::string(text));
     };
     return obtain(env);
 }
@@ -1936,7 +2622,9 @@ public:
             if (!m_retry_at || disc_stream::detail::now_ms() < m_retry_at) return false;
             m_automatic = true;
             ps4_startup_checkpoint(("disc key: searching again for " + disc_stream::canonical_title_id(status.title_id) +
-                (m_last_what == outcome::not_in_database ? " (it was not in the database a day ago)" : " (the last search failed for the network)")).c_str());
+                (m_last_what == outcome::not_in_database ? " (it was not in the database a day ago)"
+                    : m_last_what == outcome::clock_wrong ? " (the console clock was wrong at the last search)"
+                                                          : " (the last search failed for the network)")).c_str());
         }
         else
         {
@@ -1967,6 +2655,17 @@ public:
             m_handled = false;
             m_retry_at = 0;
         }
+    }
+
+    // A USB drive came: the next request() searches again for the disc in the drive when its last search found no key
+    // (the stick may hold it). True when that was the case; a key found, or a search running, is left alone.
+    bool forget_if_failed()
+    {
+        std::lock_guard lock(m_mutex);
+        if (m_running || !m_handled || !m_last_known || succeeded(m_last_what)) return false;
+        m_handled = false;
+        m_retry_at = 0;
+        return true;
     }
 
     bool busy() const

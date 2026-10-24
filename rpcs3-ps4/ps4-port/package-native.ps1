@@ -3,14 +3,18 @@ param(
     [string]$Sdk = [IO.Path]::GetFullPath("$PSScriptRoot/../../RoberixUSB/tools/OpenOrbis/PS4Toolchain").Replace('\', '/'),
     [string]$Build = "$PSScriptRoot/.build-abi",
     [ValidatePattern('^[0-9]{1,2}\.[0-9]{2}$')]
-    [string]$Version = '0.39',
+    [string]$Version = '0.40',
     [string]$Python = 'python',
     # llvm-nm/llvm-objdump used by the exit-policy validation (0.25 and later).
     [string]$LlvmTools = [IO.Path]::GetFullPath("$PSScriptRoot/../../ps4-usb-pad/tools/llvm-mingw-20240619-ucrt-x86_64/bin").Replace('\', '/'),
     # Optional: a PC RPCS3 GuiConfigs/config_database.dat shipped read-only as /app0/config_database.dat
-    # (rpcs3/util/ps4_config_db.hpp reads it when /data/rpcs3 has no newer copy). Off by default: pass it only
-    # after the licence question in ps4_config_db.hpp has been answered for redistribution.
-    [string]$ConfigDatabase = ''
+    # (rpcs3/util/ps4_config_db.hpp reads it when /data/rpcs3 has no newer copy). Off by default. Its publisher
+    # states no licence for it; THIRD_PARTY_NOTICES.md must keep its row while packages carry it.
+    [string]$ConfigDatabase = '',
+    # Optional: a folder outside the source tree that keeps the packaged ELF, its SHA-256 and its build stamp in
+    # <folder>/<version>/<build stamp>/, so the offsets of a console fatal record can be symbolized later. The
+    # unstripped ELF is never stored inside the repository.
+    [string]$ReleaseArchive = ''
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path "$PSScriptRoot/..").Path
@@ -19,6 +23,15 @@ $sourceVersion = [regex]::Match((Get-Content -LiteralPath "$repo/rpcs3/util/ps4_
 if ($sourceVersion -ne $Version) { throw "Native source version $sourceVersion differs from requested package version $Version" }
 $versionParts = $Version.Split('.')
 $sfoVersion = '{0:D2}.{1}' -f [int]$versionParts[0], $versionParts[1]
+# The archived ELF keeps its symbols and build paths, so it must never land inside the repository.
+$releaseArchiveRoot = $null
+if ($ReleaseArchive) {
+    $releaseArchiveRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReleaseArchive).Replace('/', '\').TrimEnd('\')
+    $repoRoot = $repo.Replace('/', '\').TrimEnd('\')
+    if ($releaseArchiveRoot -eq $repoRoot -or $releaseArchiveRoot.StartsWith($repoRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "-ReleaseArchive must be a folder outside the repository: $releaseArchiveRoot"
+    }
+}
 $buildPath = (Resolve-Path $Build).Path
 $withLlvm = (Get-Content -LiteralPath "$buildPath/CMakeCache.txt") -contains 'RPCS3_PS4_WITH_LLVM:BOOL=ON'
 if ([version]$Version -ge [version]'0.21' -and !$withLlvm) {
@@ -147,6 +160,182 @@ function Test-NativeExitPolicy([string]$ElfPath, [string]$FrontendObjects, [stri
     }
     Write-Output 'Native exit-policy validation passed'
 }
+function Get-CMakeCacheValue([string[]]$Cache, [string]$Name) {
+    $lines = @($Cache | Where-Object { $_.StartsWith("${Name}:") -and $_.Contains('=') })
+    if ($lines.Count -ne 1) { throw "CMakeCache.txt has no single $Name entry" }
+    $lines[0].Substring($lines[0].IndexOf('=') + 1)
+}
+# The license of a few header-only components is the comment block at the top of the header.
+function Get-SourceNotice([string]$Path) {
+    $text = [IO.File]::ReadAllText($Path).Replace("`r`n", "`n")
+    foreach ($comment in [regex]::Matches($text, '(?m)(?:^//.*\n)+|/\*[\s\S]*?\*/')) {
+        if ($comment.Value -match '(?i)copyright|licen[cs]e') { return $comment.Value.TrimEnd() }
+    }
+    throw "No license notice at the top of $Path"
+}
+function Write-SourceNotice([string]$Destination, [string]$Title, [string]$Root, [string[]]$Sources) {
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add($Title)
+    foreach ($source in $Sources) {
+        $parts.Add('')
+        $parts.Add("License notice at the top of rpcs3-ps4/${source}:")
+        $parts.Add('')
+        $parts.Add((Get-SourceNotice (Join-Path $Root $source)))
+    }
+    [IO.File]::WriteAllText($Destination, ($parts -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+}
+function Read-BigEndian([byte[]]$Bytes, [long]$At, [int]$Size) {
+    [long]$value = 0
+    for ($i = 0; $i -lt $Size; $i++) { $value = $value * 256 + $Bytes[[int]($At + $i)] }
+    $value
+}
+# The DejaVu fonts carry their copyright and license in the font files' name records (Windows platform, US English):
+# 0 copyright, 1 family, 5 version, 13 license, 14 license URL.
+function Get-FontNameRecords([string]$Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $nameTable = -1
+    $tableCount = Read-BigEndian $bytes 4 2
+    for ($i = 0; $i -lt $tableCount; $i++) {
+        $record = 12 + 16 * $i
+        if ([Text.Encoding]::ASCII.GetString($bytes, $record, 4) -ceq 'name') { $nameTable = Read-BigEndian $bytes ($record + 8) 4 }
+    }
+    if ($nameTable -lt 0) { throw "No name table in $Path" }
+    $recordCount = Read-BigEndian $bytes ($nameTable + 2) 2
+    $storage = $nameTable + (Read-BigEndian $bytes ($nameTable + 4) 2)
+    $records = @{}
+    for ($i = 0; $i -lt $recordCount; $i++) {
+        $at = $nameTable + 6 + 12 * $i
+        $id = [int](Read-BigEndian $bytes ($at + 6) 2)
+        if ((Read-BigEndian $bytes $at 2) -eq 3 -and (Read-BigEndian $bytes ($at + 4) 2) -eq 0x409 -and ($id -in @(0, 1, 5, 13, 14))) {
+            $offset = [int]($storage + (Read-BigEndian $bytes ($at + 10) 2))
+            $length = [int](Read-BigEndian $bytes ($at + 8) 2)
+            $records[$id] = [Text.Encoding]::BigEndianUnicode.GetString($bytes, $offset, $length).Replace("`r`n", "`n").Replace("`r", "`n").Trim()
+        }
+    }
+    foreach ($id in 0, 1, 5, 13) { if (!$records.ContainsKey($id)) { throw "Name record $id is missing in $Path" } }
+    $records
+}
+function Write-FontLicense([string]$Destination, [string]$FontRoot, [string[]]$Fonts) {
+    $fontRecords = [ordered]@{}
+    foreach ($font in $Fonts) { $fontRecords[$font] = Get-FontNameRecords (Join-Path $FontRoot $font) }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add('DejaVu fonts in fonts/: ' + (($Fonts | ForEach-Object { '{0} ("{1}", {2})' -f $_, $fontRecords[$_][1], $fontRecords[$_][5] }) -join ', ') + '.')
+    $parts.Add('The text below is the copyright (name ID 0), license (name ID 13) and license URL (name ID 14) records')
+    $parts.Add('stored in the font files.')
+    $shown = [System.Collections.Generic.List[string]]::new()
+    foreach ($font in $Fonts) {
+        $records = $fontRecords[$font]
+        $text = (@(0, 13, 14) | Where-Object { $records.ContainsKey($_) } | ForEach-Object { $records[$_] }) -join "`n`n"
+        if ($shown.Contains($text)) { continue }
+        $parts.Add('')
+        if ($shown.Count) { $parts.Add("${font}:"); $parts.Add('') }
+        $parts.Add($text)
+        $shown.Add($text)
+    }
+    [IO.File]::WriteAllText($Destination, ($parts -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+}
+# License texts of every component linked into the ELF or shipped in the package, taken from the files this build
+# used. Returns the package paths. THIRD_PARTY_NOTICES.md lists the same files (Test-NoticesListing).
+function Copy-LicenseTexts([string]$Destination, [string]$Repo, [string[]]$Cache, [string]$SdkRoot, [string]$LlvmLicense) {
+    $orbisCompat = Get-CMakeCacheValue $Cache 'RPCS3_PS4_ORBIS_COMPAT'
+    $portingKit = Get-CMakeCacheValue $Cache 'RPCS3_PS4_PORTING_KIT'
+    $abseil = Get-CMakeCacheValue $Cache 'RPCS3_PS4_ABSEIL'
+    $third = "$Repo/3rdparty"
+    $copies = [ordered]@{
+        'LLVM-libcxx-LICENSE.TXT' = "$orbisCompat/licenses/LLVM-libcxx-LICENSE.TXT"
+        'LLVM-libcxxabi-LICENSE.TXT' = "$orbisCompat/licenses/LLVM-libcxxabi-LICENSE.TXT"
+        'LLVM-libunwind-LICENSE.TXT' = "$orbisCompat/licenses/LLVM-libunwind-LICENSE.TXT"
+        'LLVM-compiler-rt-LICENSE.TXT' = "$orbisCompat/licenses/LLVM-compiler-rt-LICENSE.TXT"
+        'musl-MIT.txt' = "$orbisCompat/licenses/MIT-musl.txt"
+        'OpenOrbis-PS4-Toolchain-LICENSE.txt' = "$SdkRoot/LICENSE"
+        'Mesa-MIT.txt' = "$orbisCompat/licenses/MIT-mesa.txt"
+        'Khronos-Apache-2.0.txt' = "$orbisCompat/licenses/Apache-2.0-Khronos.txt"
+        'zlib-Zlib.txt' = "$orbisCompat/licenses/Zlib-zlib.txt"
+        'zlib-LICENSE.txt' = "$third/zlib/zlib/LICENSE"
+        'FFmpeg-LICENSE.md' = "$Repo/ps4-port/deps/ffmpeg/LICENSE.md"
+        'FFmpeg-COPYING.LGPLv2.1' = "$Repo/ps4-port/deps/ffmpeg/COPYING.LGPLv2.1"
+        'FFmpeg-core-copyright.txt' = "$third/ffmpeg/copyright"
+        'wolfSSL-COPYING.txt' = "$third/wolfssl/wolfssl/COPYING"
+        'wolfSSL-LICENSING.txt' = "$third/wolfssl/wolfssl/LICENSING"
+        'curl-COPYING.txt' = "$third/curl/curl/COPYING"
+        'miniupnpc-LICENSE.txt' = "$third/miniupnp/miniupnp/LICENSE"
+        'protobuf-LICENSE.txt' = "$third/protobuf/protobuf/LICENSE"
+        'Abseil-LICENSE.txt' = "$abseil/LICENSE"
+        'zstd-LICENSE.txt' = "$third/zstd/zstd/LICENSE"
+        'zstd-COPYING.txt' = "$third/zstd/zstd/COPYING"
+        'libpng-LICENSE.txt' = "$third/libpng/libpng/LICENSE"
+        'AsmJit-LICENSE.md' = "$third/asmjit/asmjit/LICENSE.md"
+        'yaml-cpp-LICENSE.txt' = "$third/yaml-cpp/yaml-cpp/LICENSE"
+        'pugixml-LICENSE.md' = "$third/pugixml/LICENSE.md"
+        'SoundTouch-COPYING.txt' = "$third/SoundTouch/soundtouch/COPYING.TXT"
+        'Fusion-LICENSE.md' = "$third/fusion/fusion/LICENSE.md"
+        'glslang-LICENSE.txt' = "$third/glslang/glslang/LICENSE.txt"
+        'VulkanMemoryAllocator-LICENSE.txt' = "$third/GPUOpen/VulkanMemoryAllocator/LICENSE.txt"
+        'stb-LICENSE.txt' = "$third/stblib/stb/LICENSE"
+        'libusb-COPYING.txt' = "$third/libusb/libusb/COPYING"
+        'RtMidi-LICENSE.txt' = "$third/rtmidi/rtmidi/LICENSE"
+        'OpenAL-Soft-COPYING.txt' = "$third/OpenAL/openal-soft/COPYING"
+        'orbis-compat-LICENSE.txt' = "$orbisCompat/LICENSE"
+        'orbis-compat-BSD-3-Clause-FreeBSD.txt' = "$orbisCompat/licenses/BSD-3-Clause-FreeBSD.txt"
+        'orbis-porting-kit-LICENSE.txt' = "$portingKit/LICENSE"
+    }
+    if ($LlvmLicense) { $copies.Insert(0, 'LLVM.txt', $LlvmLicense) }
+    # The stage folder is reused between runs: rebuild the folder so no text of an earlier run stays behind.
+    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
+    New-Item -ItemType Directory -Force $Destination | Out-Null
+    foreach ($copy in $copies.GetEnumerator()) {
+        if (!(Test-Path -LiteralPath $copy.Value -PathType Leaf)) { throw "License text not found: $($copy.Value)" }
+        # A git symbolic link checked out without symlink support is a one-line text naming its target.
+        if ((Get-Item -LiteralPath $copy.Value).Length -lt 256) { throw "License text too short to be a license: $($copy.Value)" }
+        Copy-Item -LiteralPath $copy.Value -Destination (Join-Path $Destination $copy.Key)
+        "licenses/$($copy.Key)"
+    }
+    Write-SourceNotice (Join-Path $Destination 'Khronos-GL-headers.txt') 'Khronos OpenGL headers (glext.h, khrplatform.h)' $Repo @('3rdparty/GL/glext.h', '3rdparty/GL/KHR/khrplatform.h')
+    'licenses/Khronos-GL-headers.txt'
+    Write-SourceNotice (Join-Path $Destination 'bcdec-LICENSE.txt') 'bcdec (BC texture decoding)' $Repo @('3rdparty/bcdec/bcdec.hpp')
+    'licenses/bcdec-LICENSE.txt'
+    Write-SourceNotice (Join-Path $Destination 'unordered_dense-LICENSE.txt') 'unordered_dense' $Repo @('3rdparty/unordered_dense/include/unordered_dense.h')
+    'licenses/unordered_dense-LICENSE.txt'
+    Write-SourceNotice (Join-Path $Destination 'PINE-NOTICE.txt') 'PINE IPC server header (GPL-2.0, the text in LICENSE)' $Repo @('3rdparty/pine/pine_server.h')
+    'licenses/PINE-NOTICE.txt'
+    Write-FontLicense (Join-Path $Destination 'DejaVu-Fonts-LICENSE.txt') "$Repo/bin/fonts" @('DejaVuSans.ttf', 'DejaVuSansMono.ttf')
+    'licenses/DejaVu-Fonts-LICENSE.txt'
+}
+# The notices name exactly the license texts the package carries, and keep the config_database.dat row while the
+# package carries that file.
+function Test-NoticesListing([string]$NoticesPath, [string[]]$Resources, [bool]$WithDatabase) {
+    $notices = [IO.File]::ReadAllText($NoticesPath)
+    $section = [regex]::Match($notices, '(?ms)^## License texts in the PKG[ \t]*\r?$(.*?)(?=^## |\z)')
+    if (!$section.Success) { throw "$NoticesPath has no 'License texts in the PKG' section" }
+    $listed = @([regex]::Matches($section.Groups[1].Value, '(?m)^\| `(licenses/[^`]+)` \|') | ForEach-Object { $_.Groups[1].Value })
+    $shipped = @($Resources | Where-Object { $_.StartsWith('licenses/') })
+    $notListed = @($shipped | Where-Object { $listed -cnotcontains $_ })
+    $notShipped = @($listed | Where-Object { $shipped -cnotcontains $_ })
+    if ($notListed.Count -or $notShipped.Count -or $listed.Count -ne @($listed | Select-Object -Unique).Count) {
+        throw "THIRD_PARTY_NOTICES.md and the package's licenses/ differ: not listed [$($notListed -join ', ')], not shipped [$($notShipped -join ', ')]"
+    }
+    if ($WithDatabase -and $notices -notmatch 'config_database\.dat') { throw 'THIRD_PARTY_NOTICES.md has no row for config_database.dat' }
+    Write-Output "Third-party notices list the $($listed.Count) license texts of the package"
+}
+# Keeps the packaged ELF next to its SHA-256, build stamp, manifest and PKG digest, keyed by the build stamp that the
+# console prints in startup.log and in every fatal record.
+function Save-ReleaseElf([string]$Root, [string]$Version, [string]$ElfPath, [string]$ElfSha256, [string]$Stamp,
+                         [string]$ManifestPath, [string]$PackagePath, [string]$PackageSha256, [string]$PackageTime) {
+    $versionFolder = Join-Path $Root $Version
+    $folder = Join-Path $versionFolder $Stamp
+    New-Item -ItemType Directory -Force $folder | Out-Null
+    $archived = Join-Path $folder 'rpcs3_ps4.elf'
+    Copy-Item -LiteralPath $ElfPath -Destination $archived
+    $hash = (Get-FileHash -LiteralPath $archived -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($hash -ne $ElfSha256.ToLowerInvariant()) { throw "Archived ELF $archived differs from the packaged ELF" }
+    "$hash  rpcs3_ps4.elf" | Set-Content -LiteralPath "$archived.sha256" -Encoding ascii
+    $Stamp | Set-Content -LiteralPath (Join-Path $folder 'build-stamp.txt') -Encoding ascii
+    Copy-Item -LiteralPath $ManifestPath -Destination (Join-Path $folder 'build-manifest.json')
+    $packageName = [IO.Path]::GetFileName($PackagePath)
+    "$PackageSha256  $packageName" | Set-Content -LiteralPath (Join-Path $folder 'package.sha256') -Encoding ascii
+    "$PackageTime $Stamp $hash $packageName $PackageSha256" | Add-Content -LiteralPath (Join-Path $versionFolder 'index.txt') -Encoding ascii
+    Write-Output "Release ELF archived: $folder"
+}
 Invoke-Checked 'cmake' @('--build', $buildPath, '--target', 'rpcs3_ps4_elf', '-j', '4')
 if (!(Test-Path $elf)) { throw 'The actual RPCS3 native ELF is missing' }
 $dispatchArguments = @("$PSScriptRoot/verify-native-dispatch.py", $elf, '--opengl')
@@ -177,12 +366,9 @@ foreach ($relative in 'sce_sys/about/right.sprx', 'sce_module/libc.prx', 'sce_mo
 Copy-Item -LiteralPath "$PSScriptRoot/assets/icon0.png" -Destination "$stage/sce_sys/icon0.png"
 Copy-Item -LiteralPath "$repo/bin/fonts/DejaVuSans.ttf","$repo/bin/fonts/DejaVuSansMono.ttf" -Destination "$stage/fonts"
 Copy-Item -LiteralPath "$repo/LICENSE" -Destination "$stage/LICENSE"
-$licenseResources = @()
-if ($withLlvm) {
-    New-Item -ItemType Directory -Force "$stage/licenses" | Out-Null
-    Copy-Item -LiteralPath "$llvmSource/llvm/LICENSE.TXT" -Destination "$stage/licenses/LLVM.txt"
-    $licenseResources += 'licenses/LLVM.txt'
-}
+Copy-Item -LiteralPath "$PSScriptRoot/THIRD_PARTY_NOTICES.md" -Destination "$stage/THIRD_PARTY_NOTICES.md"
+$llvmLicense = if ($withLlvm) { "$llvmSource/llvm/LICENSE.TXT" } else { '' }
+$licenseResources = @(Copy-LicenseTexts "$stage/licenses" $repo (Get-Content -LiteralPath "$buildPath/CMakeCache.txt") $Sdk $llvmLicense)
 # Public root certificates used to verify HTTPS (patch download). Shipped as /app0/certs/cacert.pem.
 if (Test-Path -LiteralPath "$PSScriptRoot/assets/certs/cacert.pem") {
     New-Item -ItemType Directory -Force "$stage/certs" | Out-Null
@@ -205,7 +391,7 @@ if ($ConfigDatabase) {
     $databaseTitles = @($database.games.PSObject.Properties).Count
     if (!$databaseTitles) { throw '-ConfigDatabase: the games object is empty' }
     $databaseTimestamp = if ($null -ne $database.timestamp) { [int64]$database.timestamp } else { $null }
-    Write-Warning 'Bundling the PC config_database.dat: ship it only with the licence question of ps4_config_db.hpp answered'
+    Write-Warning 'Bundling config_database.dat: RPCS3 project data whose publisher states no licence (row in THIRD_PARTY_NOTICES.md)'
     Copy-Item -LiteralPath $ConfigDatabase -Destination "$stage/config_database.dat"
     $databaseResources += 'config_database.dat'
     $configDatabaseInfo = if ($null -ne $databaseTimestamp) { [string]$databaseTimestamp } else { 'bundled, no timestamp' }
@@ -214,6 +400,7 @@ if ($ConfigDatabase) {
 elseif (Test-Path -LiteralPath "$stage/config_database.dat") {
     Remove-Item -LiteralPath "$stage/config_database.dat"
 }
+Test-NoticesListing "$stage/THIRD_PARTY_NOTICES.md" $licenseResources ([bool]$databaseResources.Count)
 # Include every native overlay icon with its original relative path.
 # Windows PowerShell 5.1 (.NET Framework) has no [IO.Path]::GetRelativePath.
 $binRoot = (Resolve-Path -LiteralPath "$repo/bin").Path.TrimEnd('\', '/')
@@ -250,6 +437,7 @@ $manifest = [ordered]@{
     llvm_source = $llvmPreparation
     exit_policy_verified = $exitPolicyChecked
     config_database = $configDatabaseInfo
+    license_texts = @($licenseResources | Where-Object { $_.StartsWith('licenses/') }).Count
     build_stamp = $buildStamp
     elf_sha256 = (Get-FileHash $elf -Algorithm SHA256).Hash
     eboot_sha256 = (Get-FileHash "$stage/eboot.bin" -Algorithm SHA256).Hash
@@ -274,7 +462,7 @@ try {
         Invoke-Checked "$tools/PkgTool.Core.exe" @('sfo_setentry','sce_sys/param.sfo',$entry[0],
             '--type',$entry[1],'--maxsize',$entry[2],'--value',$entry[3])
     }
-    $files = 'eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo sce_sys/icon0.png sce_module/libc.prx sce_module/libSceFios2.prx fonts/DejaVuSans.ttf fonts/DejaVuSansMono.ttf LICENSE build-manifest.json TESTAR_NO_PS4.txt TUTORIAL.txt'
+    $files = 'eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo sce_sys/icon0.png sce_module/libc.prx sce_module/libSceFios2.prx fonts/DejaVuSans.ttf fonts/DejaVuSansMono.ttf LICENSE THIRD_PARTY_NOTICES.md build-manifest.json TESTAR_NO_PS4.txt TUTORIAL.txt'
     $files += ' ' + (($uiResources + $licenseResources + $databaseResources) -join ' ')
     Invoke-Checked "$tools/create-gp4.exe" @('-out','native.gp4',"--content-id=$contentId",'--files',$files)
     # The SDK template lists only its sample directories. Add our font root
@@ -329,7 +517,7 @@ if ($LASTEXITCODE) { throw 'Cannot inspect embedded SFO' }
 foreach ($entry in ($stagedSfo | Select-Object -Skip 1)) {
     if ($embeddedSfo -notcontains $entry) { throw "Package SFO entry differs: $entry" }
 }
-foreach ($resource in (@('sce_sys/icon0.png', 'fonts/DejaVuSans.ttf', 'fonts/DejaVuSansMono.ttf', 'build-manifest.json', 'LICENSE', 'TESTAR_NO_PS4.txt', 'TUTORIAL.txt') + $uiResources + $licenseResources + $databaseResources)) {
+foreach ($resource in (@('sce_sys/icon0.png', 'fonts/DejaVuSans.ttf', 'fonts/DejaVuSansMono.ttf', 'build-manifest.json', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'TESTAR_NO_PS4.txt', 'TUTORIAL.txt') + $uiResources + $licenseResources + $databaseResources)) {
     $resourceRoot = if ($resource.StartsWith('sce_sys/')) { $verification } else { $embeddedRoot }
     if ((Get-FileHash "$resourceRoot/$resource" -Algorithm SHA256).Hash -ne
         (Get-FileHash "$stage/$resource" -Algorithm SHA256).Hash) {
@@ -343,6 +531,10 @@ Copy-Item -LiteralPath "$PSScriptRoot/TESTAR_NO_PS4.txt" -Destination "$output/T
 Copy-Item -LiteralPath "$PSScriptRoot/TUTORIAL.txt" -Destination "$output/TUTORIAL.txt"
 $digest = (Get-FileHash $final -Algorithm SHA256).Hash
 "$digest  $([IO.Path]::GetFileName($final))" | Set-Content -LiteralPath "$final.sha256" -Encoding ascii
+if ($releaseArchiveRoot) {
+    Save-ReleaseElf $releaseArchiveRoot $Version $elf $manifest.elf_sha256 $buildStamp "$stage/build-manifest.json" $final $digest $stamp
+}
+else { Write-Warning 'The packaged ELF was not archived: a release package needs -ReleaseArchive <folder outside the repository>' }
 Write-Output "Native package: $final"
 Write-Output "Verified EBOOT SHA256: $embedded"
 Write-Output "PKG SHA256: $digest"

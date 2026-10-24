@@ -577,7 +577,13 @@ void main()
 	}
 #endif
 
+#ifdef PS4_INTERP_STEP_LIMIT
+	// The PS4 GPU has no reset: program data without an end bit ends after this many steps instead of hanging it
+	uint ps4_steps = 0u;
+	while (!inst.end && ps4_steps++ < PS4_INTERP_STEP_LIMIT)
+#else
 	while (!inst.end)
+#endif
 	{
 		ip += inst_length;
 		inst_length = 1;

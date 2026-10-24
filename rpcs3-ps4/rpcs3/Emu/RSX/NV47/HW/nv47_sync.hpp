@@ -24,8 +24,8 @@ namespace rsx
 				const bool handled = RSX(ctx)->get_backend_config().supports_host_gpu_labels && RSX(ctx)->release_GCM_label(type, address, data);
 
 #ifdef RPCS3_PS4
-				// The label page may be one ZCULL keeps without access (see ps4_rsx_label_sudo)
-				if (*ps4_label_ptr<RsxSemaphore>(address) == data)
+				// The label page may be one ZCULL keeps without access (see ps4_rsx_label_sudo); off: the guest view
+				if (ps4_rsx_label_sudo() ? *vm::get_super_ptr<RsxSemaphore>(address) == data : vm::_ref<RsxSemaphore>(address) == data)
 #else
 				if (vm::_ref<RsxSemaphore>(address) == data)
 #endif
@@ -69,7 +69,14 @@ namespace rsx
 			// 0.37: the guest never sees the label before earlier draws read their vertex sources (RSX copy worker),
 			// and a label in a line SPU code holds a reservation on breaks it and wakes the sleepers, as on HW.
 			ps4_copy_worker_barrier();
-			*ps4_label_ptr<atomic_t<RsxSemaphore>>(address) = data;
+			if (ps4_rsx_label_sudo())
+			{
+				*vm::get_super_ptr<atomic_t<RsxSemaphore>>(address) = data;
+			}
+			else
+			{
+				vm::write<atomic_t<RsxSemaphore>>(address, data);
+			}
 			ps4_label_ring_touched(address, ps4_rsx_touch_reservations(address, sizeof(RsxSemaphore), true));
 #else
 			vm::write<atomic_t<RsxSemaphore>>(address, data);

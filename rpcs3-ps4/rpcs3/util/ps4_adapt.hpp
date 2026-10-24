@@ -56,6 +56,48 @@ inline constexpr char key_vram_low[] = "vram=low";             // video or direc
 inline constexpr char key_gpu_hang[] = "gpu_hang";             // the GPU stopped responding
 inline constexpr char key_heap_cap[] = "heap=cap";             // the CPU heap reached its cap (governor level 2)
 
+// 0.40: per-game safe mode (util/ps4_safe_mode.hpp). A failed session appends "fail=<kind>" and the next level
+// ("safe=<n>"); a clean session at a level appends "safe_ok", which counts as an occurrence of the level in force, so a
+// game that works only in safe mode keeps it. The player's choice in the per-game row appends "safe=0" (forget the
+// levels before it), then "fail=user" and the chosen level. This family applies for 8 boots instead of 3, so a title
+// that failed keeps its level long enough to be tested, and one false failure does not slow it down for good.
+inline constexpr unsigned safe_expiry_boots = 8;
+inline constexpr char key_safe0[] = "safe=0"; // the player turned the per-game safe mode off
+inline constexpr char key_safe1[] = "safe=1";
+inline constexpr char key_safe2[] = "safe=2";
+inline constexpr char key_safe3[] = "safe=3";
+inline constexpr char key_fail_crash[] = "fail=crash";
+inline constexpr char key_fail_threads[] = "fail=threads";
+inline constexpr char key_fail_stall[] = "fail=stall";
+inline constexpr char key_fail_gpu[] = "fail=gpu";
+inline constexpr char key_fail_user[] = "fail=user";
+inline constexpr char key_safe_ok[] = "safe_ok";
+
+constexpr bool safe_family(std::string_view key) noexcept
+{
+    return key == key_safe_ok || key.substr(0, 5) == "safe=" || key.substr(0, 5) == "fail=";
+}
+
+// 0.40: the GPU device was lost in a session of this title (the device-loss note writes it next to gpu_hang). The boot
+// policy turns it into the command-buffer split of the Vulkan renderer for the title's next boots (feature row
+// cb_split_after_loss). The loss came after minutes of play at one place of the game, so the split lives 8 boots, as
+// the safe family does, long enough to get back there, instead of the 3 boots of the other keys.
+inline constexpr char key_cb_split[] = "cb_split";
+inline constexpr unsigned cb_split_expiry_boots = 8;
+static_assert(cb_split_expiry_boots == safe_expiry_boots, "expiry_for() has one long expiry");
+
+// Keys that apply for 8 boots instead of 3.
+constexpr bool long_lived(std::string_view key) noexcept
+{
+    return safe_family(key) || key == key_cb_split;
+}
+
+// Expiry of 'key' when the caller asks for 'expiry' boots: the long-lived keys never expire sooner than 8 boots.
+constexpr unsigned expiry_for(std::string_view key, unsigned expiry = expiry_boots) noexcept
+{
+    return long_lived(key) && expiry < safe_expiry_boots ? safe_expiry_boots : expiry;
+}
+
 // Title of the running game, set by the main thread after a successful boot and cleared when the XMB opens again
 // (health::on_return_to_xmb does that), so a failure in the XMB is never charged to the last game. Other
 // threads (including a fatal path) read it through current_title(), which copies it under g_title_seq because the
@@ -337,7 +379,96 @@ inline std::vector<entry> parse(std::string_view text)
 
 constexpr bool is_active(const entry& e, unsigned expiry = expiry_boots) noexcept
 {
-    return e.boots_since < expiry;
+    return e.boots_since < expiry_for(e.key, expiry);
+}
+
+// 0.40: boots, the next one included, before 'e' stops applying (0 once expired). Use this rather than
+// expiry_boots - boots_since, which underflows for the longer-lived safe family.
+constexpr unsigned boots_left(const entry& e, unsigned expiry = expiry_boots) noexcept
+{
+    const unsigned limit = expiry_for(e.key, expiry);
+    return e.boots_since < limit ? limit - e.boots_since : 0;
+}
+
+// 0.40: the per-game safe-mode state of an adapt file's text (pure, allocation-free).
+struct safe_state
+{
+    unsigned level = 0;       // 0..3: the level the next boot of the title runs
+    unsigned boots_since = 0; // "boot" lines since the level was last written or confirmed by safe_ok
+    unsigned boots_left = 0;  // boots, the next one included, that the level still applies
+    std::string_view kind;    // "crash", "threads", "stall", "gpu", "user": the last fail= entry; empty at level 0
+    bool exhausted = false;   // level 3 failed again (the boot asks for the logs)
+};
+
+constexpr safe_state safe_status(std::string_view text, unsigned expiry = safe_expiry_boots) noexcept
+{
+    // Boot index of the last occurrence of each level (1..3); valid only when seen.
+    bool seen[4]{};
+    unsigned at[4]{};
+    unsigned boots = 0;
+    // Boot index of the last "safe=3" line; safe_ok does not move it, so a level-3 session that wrote safe_ok and then
+    // failed still counts as level 3 failing again
+    unsigned written3 = 0;
+    std::string_view kind;
+    bool exhausted = false;
+    const auto level_now = [&]() noexcept -> unsigned
+    {
+        for (unsigned n = 3; n >= 1; n--)
+            if (seen[n] && boots - at[n] < expiry) return n;
+        return 0;
+    };
+    while (!text.empty())
+    {
+        const auto nl = text.find('\n');
+        std::string_view line = text.substr(0, nl);
+        text.remove_prefix(nl == std::string_view::npos ? text.size() : nl + 1);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.remove_suffix(1);
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
+        if (line.empty() || line.front() == '#') continue;
+        if (line == boot_entry)
+        {
+            boots++;
+            continue;
+        }
+        if (line == key_safe0)
+        {
+            for (bool& s : seen) s = false;
+            kind = {};
+            exhausted = false;
+            continue;
+        }
+        if (line.size() == 6 && line.substr(0, 5) == "safe=" && line[5] >= '1' && line[5] <= '3')
+        {
+            const unsigned n = static_cast<unsigned>(line[5] - '0');
+            // Level 3 written again in a later session (not the player's choice): level 3 did not help either
+            exhausted = n == 3 && level_now() == 3 && written3 < boots && kind != "user";
+            seen[n] = true;
+            at[n] = boots;
+            if (n == 3) written3 = boots;
+            continue;
+        }
+        if (line == key_safe_ok)
+        {
+            if (const unsigned n = level_now())
+            {
+                at[n] = boots;
+                if (n == 3) exhausted = false;
+            }
+            continue;
+        }
+        if (line.size() > 5 && line.substr(0, 5) == "fail=")
+        {
+            kind = line.substr(5);
+        }
+    }
+    safe_state out;
+    out.level = level_now();
+    if (!out.level) return out;
+    out.boots_since = boots - at[out.level];
+    out.boots_left = expiry - out.boots_since;
+    out.kind = kind;
+    out.exhausted = exhausted && out.level == 3;
+    return out;
 }
 
 // Keys of 'text' that still apply.
@@ -382,6 +513,17 @@ inline std::string read_text(std::string_view title)
         text.erase(0, nl == std::string::npos ? text.size() : nl + 1);
     }
     return text;
+}
+
+// 0.40: the player's choice in the per-game safe-mode row: 0 = off, 1..3 = that level for the next 8 boots of 'title'.
+// Earlier levels are forgotten ("safe=0"). Allocation-free; false when a write failed or the level is out of range.
+inline bool set_user_level(std::string_view title, unsigned level) noexcept
+{
+    if (level > 3) return false;
+    if (!append(title, key_safe0)) return false;
+    if (!level) return true;
+    const char* const key = level == 1 ? key_safe1 : level == 2 ? key_safe2 : key_safe3;
+    return append(title, key_fail_user) && append(title, key);
 }
 
 // Active keys of 'title' (empty when it has no adapt file). Reading has no side effect.

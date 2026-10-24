@@ -40,11 +40,14 @@
 #include "util/ps4_cool_mode.hpp"
 #include "util/ps4_hr_wait.hpp"
 #include "util/ps4_rsx_programs.hpp"
+#include "util/ps4_safe_mode.hpp"
 #include "util/ps4_vram_policy.hpp"
+#include "util/ps4_i18n.hpp"
 #include "util/sysinfo.hpp"
 #include <sys/resource.h>
 
 void ps4_fatal_note(const char* prefix, const char* detail) noexcept;
+void ps4_notify(const char* message) noexcept;
 #endif
 
 #include <span>
@@ -221,8 +224,10 @@ namespace rsx
 	static atomic_t<bool> s_ps4_report_hint_noted{false}, s_ps4_report_forced_noted{false};
 	static atomic_t<bool> s_ps4_report_idle_noted{false}, s_ps4_report_idle_forced_noted{false};
 
-	// Label accesses of the RSX thread through the sudo view; false with /data/rpcs3/rsx-label-direct.flag (read at RSX start).
-	static atomic_t<bool> s_ps4_label_sudo{true};
+	// Label accesses of the RSX thread through the sudo view (feature rsx_label_sudo, read at RSX start). Off by default:
+	// the guest view, as 0.38 (a guest-view write to a ZCULL-locked page faults and runs the ZCULL/texture-cache
+	// invalidation that the unprotected view skips).
+	static atomic_t<bool> s_ps4_label_sudo{false};
 
 	// A dead FIFO requests the game stop instead of a thread fatal; true with /data/rpcs3/dead-fifo-stop.flag (read at
 	// RSX start).
@@ -435,6 +440,78 @@ namespace rsx
 		return fmt::format("get=0x%x put=0x%x (IO 0x%x %s), last cmd 0x%x; IO map: %u MiB mapped, IO 0 %s;%s system mode %s; %s",
 			get, put, get, get_ea == umax ? "not mapped" : fmt::format("-> ea 0x%x", get_ea), rsx->fifo_ctrl ? rsx->fifo_ctrl->last_cmd() : 0,
 			mapped, rsx->iomap_table.get_addr(0) == umax ? "not mapped" : "mapped", first, mode, ps4_sys_rsx_ring_text());
+	}
+
+	// PUT values the FIFO puller saw (ps4_note_put), RSX thread only. The guest writes PUT straight into its control
+	// register, so the puller's reads are the only place a change can be seen.
+	struct ps4_put_entry
+	{
+		u32 put = 0;
+		u32 get = 0;      // the GET the puller was at
+		u64 time_us = 0;  // get_system_time() of the read (0 = empty entry)
+	};
+
+	static std::array<ps4_put_entry, 16> s_ps4_put_ring{};
+	static u32 s_ps4_put_ring_next = 0;
+	static u32 s_ps4_put_last = umax;
+
+	void ps4_note_put(u32 put, u32 get) noexcept
+	{
+		if (put == s_ps4_put_last)
+		{
+			return;
+		}
+
+		s_ps4_put_last = put;
+		s_ps4_put_ring[s_ps4_put_ring_next++ % s_ps4_put_ring.size()] = { put, get, get_system_time() };
+	}
+
+	void ps4_dump_fifo_desync(const char* what, u32 get)
+	{
+		const auto rsx = get_current_renderer();
+		const u64 now = get_system_time();
+
+		std::string puts;
+		const u32 count = std::min<u32>(s_ps4_put_ring_next, ::size32(s_ps4_put_ring));
+		for (u32 i = 0; i < count; i++)
+		{
+			const auto& e = s_ps4_put_ring[(s_ps4_put_ring_next - count + i) % s_ps4_put_ring.size()];
+			fmt::append(puts, " 0x%x@0x%x/%llums", e.put, e.get, now > e.time_us ? (now - e.time_us) / 1000 : 0);
+		}
+
+		const std::string head = fmt::format("RSX: %s: last %u PUT values seen by the FIFO puller (put@get/age, oldest first):%s", what, count, puts.empty() ? " none" : puts.c_str());
+		rsx_log.error("PS4 %s", head);
+		ps4_startup_checkpoint(head.c_str());
+
+		if (!rsx)
+		{
+			return;
+		}
+
+		// 64 command words around GET (32 before it), read through the IO map with the unprotected view; '?' = not
+		// mapped or not readable. '>' marks GET.
+		const u32 start = (get & ~3u) >= 32 * 4 ? (get & ~3u) - 32 * 4 : 0;
+		for (u32 line = 0; line < 4; line++)
+		{
+			std::string words = fmt::format("RSX: %s: words at IO 0x%x:", what, start + line * 64);
+			for (u32 w = 0; w < 16; w++)
+			{
+				const u32 io = start + (line * 16 + w) * 4;
+				const u32 ea = rsx->iomap_table.get_addr(io);
+				const char* mark = io == (get & ~3u) ? " >" : " ";
+
+				if (ea == umax || !vm::check_addr(ea, vm::page_readable, 4))
+				{
+					fmt::append(words, "%s????????", mark);
+					continue;
+				}
+
+				fmt::append(words, "%s%08x", mark, static_cast<u32>(*vm::get_super_ptr<be_t<u32>>(ea)));
+			}
+
+			rsx_log.error("PS4 %s", words);
+			ps4_startup_checkpoint(words.c_str());
+		}
 	}
 
 	void ps4_zcull_publish(const reports::ps4_zcull_state& st) noexcept
@@ -897,6 +974,26 @@ namespace rsx
 		const auto st = zcull_ctrl->ps4_state();
 		ps4_zcull_publish(st);
 		return fmt::format("label page ZCULL-locked %s; %s", zcull_ctrl->ps4_page_locked(label_addr) ? "yes" : "no", st.to_string());
+	}
+
+	bool thread::ps4_scale_change_deferred(const surface_scaling_config_t& wanted)
+	{
+		if (wanted == resolution_scaling_config || !utils::ps4::rsx_programs::scale_change_deferred(g_cfg.video.antialiasing_level != msaa_level::none))
+		{
+			return false;
+		}
+
+		if (!m_ps4_scale_deferred_told)
+		{
+			m_ps4_scale_deferred_told = true;
+			const std::string line = fmt::format("PS4 RSX: Resolution Scale %u %% (threshold %u px) kept for the next boot: MSAA is on (a live change with MSAA surfaces crashed the RSX); running %u %%",
+				wanted.scale_percent, wanted.min_scalable_dimension, resolution_scaling_config.scale_percent);
+			rsx_log.warning("%s", line);
+			ps4_startup_checkpoint(line.c_str());
+			ps4_notify(utils::ps4::i18n::tr(utils::ps4::i18n::str::TOAST_ESCALA_PROXIMO_INICIO_MSAA));
+		}
+
+		return true;
 	}
 #endif
 
@@ -1874,6 +1971,15 @@ namespace rsx
 #ifdef RPCS3_PS4
 		// 0.29: wait-reason bookkeeping (STALL dump) and the elevated-RSX GPU backoff apply to this thread only.
 		t_ps4_is_rsx_thread = true;
+
+		// A new boot's loop has not run yet: the heartbeat must not show the previous game's RSX age (the stall rules
+		// would read it as activity).
+		s_ps4_rsx_heartbeat.release(0);
+		s_ps4_rsx_loops.release(0);
+
+		// The PUT values of the Dead FIFO dump belong to this boot
+		s_ps4_put_ring_next = 0;
+		s_ps4_put_last = umax;
 #endif
 
 		if (!serialized) method_registers.init();
@@ -2123,9 +2229,10 @@ namespace rsx
         s_ps4_report_idle_noted.release(false);
         s_ps4_report_idle_forced_noted.release(false);
         // NV406E/NV4097 label reads and writes of this thread: the sudo view never faults on a ZCULL-locked label page.
-        s_ps4_label_sudo.release(!fs::is_file("/data/rpcs3/rsx-label-direct.flag"));
-        ps4_startup_checkpoint(s_ps4_label_sudo.load() ? "RSX: semaphore labels are read and written through the unprotected view (default; rsx-label-direct.flag restores the guest view)"
-            : "RSX: semaphore labels are read and written through the guest view (rsx-label-direct.flag)");
+        // Opt-in (rsx-label-sudo.flag or features.txt); rsx-label-direct.flag and the safe mode force the guest view.
+        s_ps4_label_sudo.release(utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::rsx_label_sudo));
+        ps4_startup_checkpoint(s_ps4_label_sudo.load() ? "RSX: semaphore labels are read and written through the unprotected view (rsx_label_sudo on: rsx-label-sudo.flag or features.txt)"
+            : "RSX: semaphore labels are read and written through the guest view (0.38 default; rsx-label-sudo.flag: the unprotected view)");
         s_ps4_dead_fifo_stop.release(fs::is_file("/data/rpcs3/dead-fifo-stop.flag"));
         if (s_ps4_dead_fifo_stop.load())
             ps4_startup_checkpoint("RSX: a dead FIFO stops the game and returns to the XMB (dead-fifo-stop.flag)");
@@ -3943,12 +4050,15 @@ namespace rsx
 			const std::string ps4_line = "RSX: Dead FIFO: " + ps4_state;
 			rsx_log.error("PS4 %s", ps4_line);
 			ps4_startup_checkpoint(ps4_line.c_str());
+			ps4_dump_fifo_desync("Dead FIFO", fifo_ctrl ? fifo_ctrl->get_pos() : 0);
 
 			if (s_ps4_dead_fifo_stop.observe())
 			{
 				// dead-fifo-stop.flag: the frontend stops the game as for a renderer stop request. This thread stays
 				// alive (pause, stop) after the reset below, but run_FIFO fetches nothing more.
 				ps4_fatal_note("RSX: dead FIFO; stopping the game: ", ps4_state.substr(0, 120).c_str());
+				// The title's next boot opens one safe-mode level higher (adapt fail=gpu)
+				utils::ps4::safe_mode::note_failure(utils::ps4::safe_mode::fail_kind::gpu);
 				utils::ps4::vram::request_stop(utils::ps4::vram::stop_cause::rsx_dead_fifo, "Dead FIFO");
 				m_ps4_fifo_dead = true;
 			}
@@ -4594,6 +4704,19 @@ namespace rsx
                             closes[ps4_rp_close_pass_change] / frames, closes[ps4_rp_close_compute] / frames, closes[ps4_rp_close_other] / frames);
                     }
 
+                    // The untagged ('other') closes by calling site, ELF addresses for the release symbols
+                    std::string ps4_sites;
+                    const u64 ps4_sites_more = utils::ps4::rsx_programs::g_rp_close_callers.take([&](u64 site, u64 count)
+                    {
+                        fmt::append(ps4_sites, " +0x%llx %.1f", site, count / frames);
+                    });
+
+                    if (!ps4_sites.empty() || ps4_sites_more)
+                    {
+                        fmt::append(line, "; other rp closes/frame by caller:%s%s", ps4_sites,
+                            ps4_sites_more ? fmt::format(", other sites %.1f", ps4_sites_more / frames) : std::string());
+                    }
+
                     const u64 single_req = pc.vtx_cache_single_requests.exchange(0), single_miss = pc.vtx_cache_single_misses.exchange(0);
                     const u64 multi_req = pc.vtx_cache_multi_requests.exchange(0), multi_miss = pc.vtx_cache_multi_misses.exchange(0);
                     const auto hit_text = [](u64 requests, u64 misses)
@@ -4747,7 +4870,19 @@ namespace rsx
 
 			if (g_cfg.video.frame_skip_enabled)
 			{
+#ifdef RPCS3_PS4
+				// Logged at every forced flip upstream (hundreds of thousands of lines, the console's log writer slowed
+				// the game): once per boot here. Frame skip itself stays as the player set it.
+				if (!m_ps4_frame_skip_told)
+				{
+					m_ps4_frame_skip_told = true;
+					rsx_log.error("Frame skip is not compatible with this application");
+					rsx_log.notice("PS4 RSX: the frame skip error above is logged once per boot on PS4");
+					ps4_startup_checkpoint("RSX: Frame skip is on but this game flips by itself: frame skip has no effect on these flips");
+				}
+#else
 				rsx_log.error("Frame skip is not compatible with this application");
+#endif
 			}
 		}
 

@@ -12,6 +12,8 @@
 #ifdef RPCS3_PS4
 // ps4_launcher.cpp, any thread: one startup.log line.
 void ps4_startup_checkpoint(const char* stage);
+
+#include "util/ps4_safe_mode.hpp" // row music_lazy
 #endif
 #include "cellSpurs.h"
 #include "cellSysutil.h"
@@ -121,7 +123,8 @@ public:
 
 #ifdef RPCS3_PS4
 		// 0.39: built stand-by and started at the first end of media (the only thing that wakes it); a never-started
-		// object is destroyed without a join. keep-service-threads.flag starts it here as before.
+		// object is destroyed without a join. Without the row music_lazy (keep-service-threads.flag, or a safe-mode
+		// level) it starts here, at boot, as in 0.38; a refusal then leaves it to the first end of media.
 		m_thread = std::make_unique<named_thread<std::function<void()>>>(stx::try_launch, "cellMusic State", [this]()
 #else
 		m_thread = std::make_unique<named_thread<std::function<void()>>>("cellMusic State", [this]()
@@ -149,9 +152,9 @@ public:
 		});
 
 #ifdef RPCS3_PS4
-		if (!ps4_lazy_threads_enabled())
+		if (!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::music_lazy))
 		{
-			ps4_start_thread();
+			ps4_start_thread(true);
 		}
 #endif
 	}
@@ -288,7 +291,7 @@ private:
 	atomic_t<bool> m_ps4_thread_started{false};
 
 	// 0.39: starts the stand-by thread once (any thread); a refusal is tried again at the next end of media
-	void ps4_start_thread()
+	void ps4_start_thread(bool at_boot = false)
 	{
 		if (!m_thread || m_ps4_thread_started.exchange(true))
 		{
@@ -297,11 +300,20 @@ private:
 
 		if (m_thread->ps4_try_start())
 		{
-			ps4_startup_checkpoint("PS4 threads: cellMusic State started on first use");
+			// The boot start is the 0.38 behaviour and logs nothing
+			if (!at_boot)
+			{
+				ps4_startup_checkpoint("PS4 threads: cellMusic State started on first use");
+			}
 		}
 		else
 		{
 			m_ps4_thread_started = false;
+
+			if (at_boot)
+			{
+				ps4_startup_checkpoint("PS4 threads: cellMusic State not started at boot (thread refused); the first end of media starts it");
+			}
 		}
 	}
 #endif

@@ -2,6 +2,11 @@
 #include "overlay_home_menu_settings.h"
 #include "Emu/system_config.h"
 
+#ifdef RPCS3_PS4
+#include "util/ps4_i18n.hpp"
+#include "util/ps4_rsx_programs.hpp"
+#endif
+
 namespace rsx
 {
 	namespace overlays
@@ -138,9 +143,53 @@ namespace rsx
 			: home_menu_settings_page(x, y, width, height, use_separators, parent, get_localized_string(localized_string_id::HOME_MENU_SETTINGS_AUDIO))
 		{
 			add_signed_slider(&g_cfg.audio.volume, localized_string_id::HOME_MENU_SETTINGS_AUDIO_MASTER_VOLUME, " %", 1);
+#ifdef RPCS3_PS4
+			// The PS4 has one sound output (the PS4 backend is always used): the renderer choice has no meaning here,
+			// and Null only turned buffering off. Buffering keeps its own row, with what turning it off costs.
+			{
+				const auto lang = utils::ps4::i18n::current() == utils::ps4::i18n::lang::ar ? utils::ps4::i18n::lang::en : utils::ps4::i18n::current();
+				cfg::_bool* const setting = &g_cfg.audio.enable_buffering;
+				ensure(setting->get_is_dynamic());
+
+				const std::string text = get_localized_string(localized_string_id::HOME_MENU_SETTINGS_AUDIO_BUFFERING) + " " +
+					std::string(utils::ps4::i18n::tr(utils::ps4::i18n::str::OVL_SEM_BUFFER_SUFIXO, lang));
+				std::unique_ptr<overlay_element> elem = std::make_unique<home_menu_checkbox>(setting, text);
+				elem->set_size(this->w, menu_entry_height);
+
+				// The same handler as add_checkbox
+				add_item(elem, [this, setting](pad_button btn) -> page_navigation
+				{
+					bool value = setting->get();
+
+					switch (btn)
+					{
+					case pad_button::cross:
+						value = !value;
+						break;
+					case pad_button::select:
+						value = setting->def;
+						break;
+					default:
+						return page_navigation::stay;
+					}
+
+					if (value != setting->get())
+					{
+						rsx_log.notice("User toggled checkbox in '%s'. Setting '%s' to %d", title, setting->get_name(), value);
+						setting->set(value);
+						g_emu_callbacks.update_emu_settings();
+						if (m_config_changed) *m_config_changed = true;
+						refresh();
+					}
+
+					return page_navigation::stay;
+				});
+			}
+#else
 			add_dropdown(&g_cfg.audio.renderer, localized_string_id::HOME_MENU_SETTINGS_AUDIO_BACKEND);
 
 			add_checkbox(&g_cfg.audio.enable_buffering, localized_string_id::HOME_MENU_SETTINGS_AUDIO_BUFFERING);
+#endif
 			add_signed_slider(&g_cfg.audio.desired_buffer_duration, localized_string_id::HOME_MENU_SETTINGS_AUDIO_BUFFER_DURATION, " ms", 1);
 
 			add_checkbox(&g_cfg.audio.enable_time_stretching, localized_string_id::HOME_MENU_SETTINGS_AUDIO_TIME_STRETCHING);
@@ -152,10 +201,20 @@ namespace rsx
 		home_menu_settings_video::home_menu_settings_video(s16 x, s16 y, u16 width, u16 height, bool use_separators, home_menu_page* parent)
 			: home_menu_settings_page(x, y, width, height, use_separators, parent, get_localized_string(localized_string_id::HOME_MENU_SETTINGS_VIDEO))
 		{
+#ifdef RPCS3_PS4
+			// The slider stops at 150 % (650 % ran the GPU out of memory 7 ms later); a higher running value from the
+			// player's files (the console limit is 200 %) stays reachable, so the slider shows what runs.
+			add_unsigned_slider(&g_cfg.video.resolution_scale_percent, localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_PERCENT, "%", 25, {}, {},
+				25, utils::ps4::rsx_programs::scale_slider_maximum(g_cfg.video.resolution_scale_percent));
+#else
 			add_unsigned_slider(&g_cfg.video.resolution_scale_percent, localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_PERCENT, "%", 25);
+#endif
 			add_unsigned_slider(&g_cfg.video.min_scalable_dimension, localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_THRESHOLD, "px", 1);
 
+			// Not offered on the PS4: it always presents with sync (FIFO), a live VSync change only re-creates the swapchain
+#ifndef RPCS3_PS4
 			add_dropdown(&g_cfg.video.vsync, localized_string_id::HOME_MENU_SETTINGS_VIDEO_VSYNC);
+#endif
 
 			add_dropdown(&g_cfg.video.frame_limit, localized_string_id::HOME_MENU_SETTINGS_VIDEO_FRAME_LIMIT);
 			add_unsigned_slider(&g_cfg.video.anisotropic_level_override, localized_string_id::HOME_MENU_SETTINGS_VIDEO_ANISOTROPIC_OVERRIDE, "x", 2, {{0, "Auto"}}, {14});

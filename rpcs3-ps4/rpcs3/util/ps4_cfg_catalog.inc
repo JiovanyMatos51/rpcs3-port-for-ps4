@@ -30,7 +30,7 @@ CFG_ITEM("Core > Thread Scheduler Mode", cpu, CFGG_CPU_THREADS, W, CFGL_CORE_THR
 
 // ---- GPU
 // CFGG_GPU_RENDERER
-CFG_ITEM("Video > Renderer", gpu, CFGG_GPU_RENDERER, E, CFGL_VIDEO_RENDERER, CFGH_VIDEO_RENDERER, count_, CFGTIP_VIDEO_RENDERER, auto_, 0, 0, "", "Vulkan|OpenGL|~Null", CFGR_VALUE_NO_PICTURE, "", both, F_NONE)
+CFG_ITEM("Video > Renderer", gpu, CFGG_GPU_RENDERER, E, CFGL_VIDEO_RENDERER, CFGH_VIDEO_RENDERER, count_, CFGTIP_VIDEO_RENDERER, auto_, 0, 0, "", "Vulkan|~OpenGL|~Null", CFGR_VALUE_NO_PICTURE, "", both, F_NONE)
 CFG_ITEM("Video > Vulkan > Adapter", gpu, CFGG_GPU_RENDERER, U, CFGL_VIDEO_VK_ADAPTER, CFGH_VIDEO_VK_ADAPTER, CFGR_ONE_GPU, CFGTIP_VIDEO_VK_ADAPTER, readonly, 0, 0, "", "", count_, "", both, F_NONE)
 CFG_ITEM("Video > Aspect ratio", gpu, CFGG_GPU_RENDERER, E, CFGL_VIDEO_ASPECT_RATIO, CFGH_VIDEO_ASPECT_RATIO, count_, CFGTIP_VIDEO_ASPECT_RATIO, auto_, 0, 0, "", "", count_, "", both, F_NONE)
 CFG_ITEM("Video > Frame limit", gpu, CFGG_GPU_RENDERER, E, CFGL_VIDEO_FRAME_LIMIT, CFGH_VIDEO_FRAME_LIMIT, count_, CFGTIP_VIDEO_FRAME_LIMIT, auto_, 0, 0, "", "", count_, "", both, F_HOME)
@@ -48,7 +48,7 @@ CFG_ITEM("Video > Custom Anaglyph Matrices > Matrix Right", gpu, CFGG_GPU_3D, E,
 CFG_ITEM("Video > Screen size in inches", gpu, CFGG_GPU_3D, E, CFGL_VIDEO_SCREEN_SIZE, CFGH_VIDEO_SCREEN_SIZE, count_, count_, auto_, 0, 0, "", "", count_, "Video > 3D Display Enabled=true", game_only, F_NONE)
 // CFGG_GPU_RESOLUTION
 CFG_ITEM("Video > Resolution", gpu, CFGG_GPU_RESOLUTION, E, CFGL_VIDEO_RESOLUTION, CFGH_VIDEO_RESOLUTION, count_, CFGTIP_VIDEO_RESOLUTION, auto_, 0, 0, "", "1280x720|720x480|720x480i|720x576|720x576i|~1920x1080|~1920x1080i|~1600x1080|~1440x1080|~1280x1080|~960x1080", CFGR_VALUE_VRAM, "", both, F_NONE)
-CFG_ITEM("Video > Resolution Scale", gpu, CFGG_GPU_RESOLUTION, E, CFGL_VIDEO_RESOLUTION_SCALE_PERCENT, CFGH_VIDEO_RESOLUTION_SCALE_PERCENT, count_, CFGTIP_VIDEO_RESOLUTION_SCALE_PERCENT, auto_, 25, 100, "%", "25..100|~101..800", CFGR_VALUE_VRAM, "Video > Strict Rendering Mode=false", both, F_HOME)
+CFG_ITEM("Video > Resolution Scale", gpu, CFGG_GPU_RESOLUTION, E, CFGL_VIDEO_RESOLUTION_SCALE_PERCENT, CFGH_VIDEO_RESOLUTION_SCALE_PERCENT, count_, CFGTIP_VIDEO_RESOLUTION_SCALE_PERCENT, auto_, 25, 100, "%", "25..100|~101..200|#201..800", CFGR_VALUE_VRAM, "Video > Strict Rendering Mode=false", both, F_HOME)
 CFG_ITEM("Video > Minimum Scalable Dimension", gpu, CFGG_GPU_RESOLUTION, E, CFGL_VIDEO_MIN_SCALABLE_DIMENSION, CFGH_VIDEO_MIN_SCALABLE_DIMENSION, count_, CFGTIP_VIDEO_MIN_SCALABLE_DIMENSION, auto_, 1, 16, "px", "", count_, "Video > Strict Rendering Mode=false&Video > Resolution Scale!=100", both, F_HOME)
 // CFGG_GPU_OUTPUT
 CFG_ITEM("Video > Output Scaling Mode", gpu, CFGG_GPU_OUTPUT, E, CFGL_VIDEO_OUTPUT_SCALING, CFGH_VIDEO_OUTPUT_SCALING, count_, CFGTIP_VIDEO_OUTPUT_SCALING, auto_, 0, 0, "", "", count_, "", both, F_HOME)
@@ -81,7 +81,7 @@ CFG_ITEM("Audio > Audio Device", audio, CFGG_AUDIO_OUT, U, CFGL_AUDIO_AUDIO_DEVI
 // CFGG_AUDIO_FORMAT
 CFG_ITEM("Audio > Audio Format", audio, CFGG_AUDIO_FORMAT, E, CFGL_AUDIO_FORMAT, CFGH_AUDIO_FORMAT, count_, CFGTIP_AUDIO_FORMAT, auto_, 0, 0, "", "", count_, "", both, F_NONE)
 CFG_ITEM("Audio > Audio Formats", audio, CFGG_AUDIO_FORMAT, E, CFGL_AUDIO_FORMATS, CFGH_AUDIO_FORMATS, count_, CFGTIP_AUDIO_FORMATS, audio_formats, 0, 0, "", "", count_, "Audio > Audio Format=Manual", both, F_NONE)
-CFG_ITEM("Audio > Audio Channel Layout", audio, CFGG_AUDIO_FORMAT, E, CFGL_AUDIO_CHANNEL_LAYOUT, CFGH_AUDIO_CHANNEL_LAYOUT, count_, CFGTIP_AUDIO_CHANNEL_LAYOUT, auto_, 0, 0, "", "", count_, "", both, F_NONE)
+CFG_ITEM("Audio > Audio Channel Layout", audio, CFGG_AUDIO_FORMAT, E, CFGL_AUDIO_CHANNEL_LAYOUT, CFGH_AUDIO_CHANNEL_LAYOUT, count_, CFGTIP_AUDIO_CHANNEL_LAYOUT, auto_, 0, 0, "", "Automatic|-Mono|Stereo|Stereo LFE|Quadraphonic|Quadraphonic LFE|Surround 5.1|Surround 7.1", CFGR_AUDIO_MONO_PS4, "", both, F_NONE)
 // CFGG_AUDIO_SETTINGS
 CFG_ITEM("Audio > Convert to 16 bit", audio, CFGG_AUDIO_SETTINGS, E, CFGL_AUDIO_CONVERT_TO_S16, CFGH_AUDIO_CONVERT_TO_S16, count_, CFGTIP_AUDIO_CONVERT_TO_S16, auto_, 0, 0, "", "", count_, "", both, F_NONE)
 CFG_ITEM("Audio > Dump to file", audio, CFGG_AUDIO_SETTINGS, W, CFGL_AUDIO_DUMP_TO_FILE, CFGH_AUDIO_DUMP_TO_FILE, CFGR_AUDIO_DUMP, CFGTIP_AUDIO_DUMP_TO_FILE, auto_, 0, 0, "", "", count_, "", both, F_NONE)
@@ -91,7 +91,7 @@ CFG_ITEM("Audio > Music Handler", audio, CFGG_AUDIO_SETTINGS, U, CFGL_AUDIO_MUSI
 // CFGG_AUDIO_VOLUME
 CFG_ITEM("Audio > Master Volume", audio, CFGG_AUDIO_VOLUME, E, CFGL_AUDIO_VOLUME, CFGH_AUDIO_VOLUME, count_, count_, auto_, 5, 25, "%", "", count_, "", both, F_HOME)
 // CFGG_AUDIO_BUFFERING
-CFG_ITEM("Audio > Enable Buffering", audio, CFGG_AUDIO_BUFFERING, E, CFGL_AUDIO_ENABLE_BUFFERING, CFGH_AUDIO_ENABLE_BUFFERING, count_, CFGTIP_AUDIO_ENABLE_BUFFERING, auto_, 0, 0, "", "", count_, "", both, F_HOME)
+CFG_ITEM("Audio > Enable Buffering", audio, CFGG_AUDIO_BUFFERING, E, CFGL_AUDIO_ENABLE_BUFFERING, CFGH_AUDIO_ENABLE_BUFFERING, count_, CFGTIP_AUDIO_ENABLE_BUFFERING, auto_, 0, 0, "", "true|~false", CFGH_AVISO_SEM_BUFFER, "", both, F_HOME)
 CFG_ITEM("Audio > Desired Audio Buffer Duration", audio, CFGG_AUDIO_BUFFERING, E, CFGL_AUDIO_DESIRED_BUFFER_DURATION, CFGH_AUDIO_DESIRED_BUFFER_DURATION, count_, count_, auto_, 2, 10, "ms", "", count_, "Audio > Enable Buffering=true", both, F_HOME)
 CFG_ITEM("Audio > Enable Time Stretching", audio, CFGG_AUDIO_BUFFERING, E, CFGL_AUDIO_ENABLE_TIME_STRETCHING, CFGH_AUDIO_ENABLE_TIME_STRETCHING, count_, CFGTIP_AUDIO_ENABLE_TIME_STRETCHING, auto_, 0, 0, "", "", count_, "Audio > Enable Buffering=true", both, F_HOME)
 CFG_ITEM("Audio > Time Stretching Threshold", audio, CFGG_AUDIO_BUFFERING, E, CFGL_AUDIO_TIME_STRETCHING_THRESHOLD, CFGH_AUDIO_TIME_STRETCHING_THRESHOLD, count_, count_, auto_, 5, 25, "%", "", count_, "Audio > Enable Buffering=true&Audio > Enable Time Stretching=true", both, F_HOME)
@@ -143,7 +143,7 @@ CFG_ITEM("System > Time Format", system, CFGG_SYS_CONSOLE, E, CFGL_SYS_TIME_FMT,
 CFG_ITEM("System > Console time offset (s)", system, CFGG_SYS_CONSOLE, E, CFGL_SYS_CONSOLE_TIME_OFFSET, CFGH_SYS_CONSOLE_TIME_OFFSET, count_, CFGTIP_SYS_CONSOLE_TIME_OFFSET, time_offset, 0, 0, "s", "", count_, "", both, F_NONE)
 // CFGG_SYS_DISK_CACHE
 CFG_ITEM("VFS > Limit disk cache size", system, CFGG_SYS_DISK_CACHE, U, CFGL_VFS_LIMIT_CACHE_SIZE, CFGH_VFS_LIMIT_CACHE_SIZE, SET_SEMPRE_LIGADO_PS4_CACHE_NAO, CFGTIP_VFS_LIMIT_CACHE_SIZE, auto_, 0, 0, "", "", count_, "", global_only, F_NONE)
-CFG_ITEM("VFS > Disk cache maximum size (MB)", system, CFGG_SYS_DISK_CACHE, E, CFGL_VFS_CACHE_MAX_SIZE, CFGH_VFS_CACHE_MAX_SIZE, count_, count_, auto_, 256, 1024, "MB", "1024..4096", CFGR_VALUE_CACHE, "", global_only, F_NONE)
+CFG_ITEM("VFS > Disk cache maximum size (MB)", system, CFGG_SYS_DISK_CACHE, E, CFGL_VFS_CACHE_MAX_SIZE, CFGH_VFS_CACHE_MAX_SIZE, count_, count_, auto_, 256, 1024, "MB", "1024..10240", CFGR_VALUE_CACHE, "", global_only, F_NONE)
 // CFGG_SYS_HOMEBREW
 CFG_ITEM("VFS > Enable /host_root/", system, CFGG_SYS_HOMEBREW, U, CFGL_VFS_HOST_ROOT, CFGH_VFS_HOST_ROOT, SET_SEMPRE_DESLIGADO_PS4_JOGO_NAO, CFGTIP_VFS_HOST_ROOT, auto_, 0, 0, "", "", count_, "", both, F_NONE)
 CFG_ITEM("VFS > Empty /dev_hdd0/tmp/", system, CFGG_SYS_HOMEBREW, E, CFGL_VFS_EMPTY_HDD0_TMP, CFGH_VFS_EMPTY_HDD0_TMP, count_, CFGTIP_VFS_EMPTY_HDD0_TMP, auto_, 0, 0, "", "", count_, "", both, F_NONE)

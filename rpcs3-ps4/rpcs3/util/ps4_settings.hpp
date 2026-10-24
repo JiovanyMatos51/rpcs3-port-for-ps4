@@ -113,16 +113,24 @@ inline std::string toggle(std::string& event)
 // /data/rpcs3/present-hold-ms.txt (the Vulkan renderer keeps showing the last complete frame, up to that many ms, while
 // a frame lost draws to pipelines still compiling). Subtitles fit one XMB line (<= 830 px at 17 px); the rest of the
 // explanation is in the toggle messages.
-// 0.39: "Áudio contínuo" is automatic by default (cellAudio slows the sound down a little, never below 70 %, while the
-// game falls behind); 'Desligado' creates /data/rpcs3/audio-no-stretch.flag. The 0.34 audio-auto-stretch.flag is
-// ignored by cellAudio (logged).
+// 0.39: "Áudio contínuo" was automatic by default (cellAudio slows the sound down a little, never below 70 %, while the
+// game falls behind); 'Desligado' created /data/rpcs3/audio-no-stretch.flag.
+// 0.40: the row follows the audio_continuity row of util/ps4_safe_mode.hpp, off by default (the 0.38 controller).
+// 'Automático' creates its enable flag audio-continuity.flag and removes audio-no-stretch.flag (its kill flag, which a
+// 0.39 'Desligado' left behind); 'Desligado' removes the enable flag, the 0.34-0.38 alias audio-auto-stretch.flag and
+// the row's name in features.txt, and writes the kill flag only when features.txt 'all' would still turn it on.
 namespace scene_audio_rows
 {
 using i18n::str;
 
 inline constexpr char present_hold_path[] = "/data/rpcs3/present-hold-ms.txt";
 inline constexpr std::string_view present_hold_text = "750\n";
-inline constexpr char audio_no_stretch_path[] = "/data/rpcs3/audio-no-stretch.flag";
+
+// A file of the feature rows (same directory as util/ps4_safe_mode.hpp reads)
+inline std::string feature_file(const char* name)
+{
+    return std::string(RPCS3_PS4_SAFE_MODE_DIR) + "/" + name;
+}
 
 // Same reading as the renderer (VKPresent.cpp): a file below 16 bytes starting with a number; 1..3000 holds frames.
 inline bool present_hold_enabled()
@@ -135,10 +143,13 @@ inline bool present_hold_enabled()
     return end != text.c_str() && value >= 1 && value <= 3000;
 }
 
-// Automatic continuity runs unless audio-no-stretch.flag exists (cellAudio reads it once per boot)
+// What the next boot of a game without a safe-mode level runs (cellAudio reads the row once per boot): the enable
+// flag, its alias, features.txt and the kill flag; the global safe mode has its own row and is left out here.
 inline bool audio_stretch_enabled()
 {
-    return !fs::is_file(audio_no_stretch_path);
+    safe_mode::inputs files = safe_mode::read_inputs();
+    files.global_safe = false;
+    return safe_mode::enabled_in(safe_mode::compute(files), safe_mode::feature::audio_continuity);
 }
 
 inline std::string present_hold_title(bool on)
@@ -175,46 +186,124 @@ inline std::string toggle_present_hold(bool& on, std::string& event)
     return i18n::tr(enable ? str::SET_EVITAR_PISCADAS_LIGADO_PEQUENA_PAUSA : str::SET_EVITAR_PISCADAS_DESLIGADO_CENAS_NOVAS);
 }
 
-// 'Automático' removes audio-no-stretch.flag, 'Desligado' creates it (same contract as toggle_present_hold; 'on' =
-// automatic continuity).
+// 'Automático' / 'Desligado' (same contract as toggle_present_hold; 'on' = automatic continuity).
 inline std::string toggle_audio_stretch(bool& on, std::string& event)
 {
+    const safe_mode::info& row = safe_mode::row(safe_mode::feature::audio_continuity);
+    const std::string enable_path = feature_file(row.enable_flag), kill_path = feature_file(row.kill_flag);
+    const auto drop = [](const std::string& path) { return !fs::is_file(path) || fs::remove_file(path); };
     const bool enable = !audio_stretch_enabled();
-    static constexpr std::string_view note = "Created by the PS4 settings menu ('Audio continuo: Desligado'): cellAudio never "
-        "slows the sound down when the game falls behind the audio clock. Delete it or switch it back to Automatico in the menu.\n";
-    const bool written = enable ? (!fs::is_file(audio_no_stretch_path) || fs::remove_file(audio_no_stretch_path))
-                                : policy_detail::write_note(audio_no_stretch_path, note);
+    bool written = true;
+    bool killed = false;
+    if (enable)
+    {
+        static constexpr std::string_view note = "Created by the PS4 settings menu ('Audio continuo: Automatico'): cellAudio slows the sound "
+            "down a little (never below 70 %) while the game falls behind the audio clock. Delete it or switch it back to Desligado in the menu.\n";
+        written = drop(kill_path) && policy_detail::write_note(enable_path, note);
+    }
+    else
+    {
+        written = drop(enable_path);
+        for (const safe_mode::alias& a : safe_mode::aliases)
+            if (a.f == row.f) written = drop(feature_file(a.enable_flag)) && written;
+        written = safe_mode::features_file::set(row.name, false) && written;
+        // features.txt 'all' still turns every row on: only the kill flag keeps this one off
+        if (written && audio_stretch_enabled())
+        {
+            static constexpr std::string_view note = "Created by the PS4 settings menu ('Audio continuo: Desligado') while features.txt says 'all': "
+                "cellAudio never slows the sound down. Delete it or switch it back to Automatico in the menu.\n";
+            written = policy_detail::write_note(kill_path, note);
+            killed = true;
+        }
+    }
     on = audio_stretch_enabled();
-    if (!written || on != enable) return i18n::tr(str::COM_ERRO_GRAVAR) + std::string(audio_no_stretch_path);
-    event = enable ? "settings: Audio continuo switched to AUTOMATIC (audio-no-stretch.flag removed)"
-                   : "settings: Audio continuo switched OFF (audio-no-stretch.flag created)";
+    if (!written || on != enable) return i18n::tr(str::COM_ERRO_GRAVAR) + (enable ? enable_path : kill_path);
+    event = enable ? "settings: Audio continuo switched to AUTOMATIC (audio-continuity.flag created, audio-no-stretch.flag removed)"
+        : killed ? "settings: Audio continuo switched OFF (audio-continuity.flag removed; audio-no-stretch.flag created: features.txt says all)"
+                 : "settings: Audio continuo switched OFF (audio-continuity.flag removed; the 0.38 default)";
     return i18n::tr(enable ? str::SET_AUDIO_CONTINUO_AUTO_MSG : str::SET_AUDIO_CONTINUO_OFF_MSG);
 }
 } // namespace scene_audio_rows
 
 // 0.39: 'Idioma dos jogos' (the language PS3 games get, util/ps4_policy.hpp game_language): global row values
 // automatic, then CELL_SYSUTIL_LANG_* 0..19; a game's row starts with 'Igual ao global' (no marker).
+// 0.40: 'Automático' is English (US) again; the value 'Idioma do PS4 (<nome>)' (game-language.txt 'ps4') follows the PS4
+// language as 0.39's automatic value did, and a safe-mode level turns it off for that boot.
 namespace game_language_rows
 {
 using i18n::str;
 
-// Name of a value in the interface language: "Automático (Português (Brasil))", "Francês", ...
-inline std::string label(std::int32_t value, std::int32_t automatic)
+// Name of a value in the interface language: "Automático (Inglês (EUA))", "Idioma do PS4 (Português (Brasil))",
+// "Francês", ...
+inline std::string label(std::int32_t value, std::int32_t automatic, std::int32_t system)
 {
+    if (value == game_language_system) return i18n::trf(str::GL_PS4_FMT, {i18n::game_language_name(system)});
     if (value < 0) return i18n::trf(str::LANG_AUTO_FMT, {i18n::game_language_name(automatic)});
     return i18n::tr(i18n::game_language_name(value));
 }
 
-// The choices of a row in order: nullopt = the global choice (game rows only), then automatic, then 0..19
+// The choices of a row in order: nullopt = the global choice (game rows only), then automatic, the PS4 language, then
+// 0..19
 inline std::vector<std::optional<std::int32_t>> choices(bool game)
 {
     std::vector<std::optional<std::int32_t>> out;
     if (game) out.push_back(std::nullopt);
     out.push_back(game_language_auto);
+    out.push_back(game_language_system);
     for (std::int32_t v = 0; v < game_language_count; ++v) out.push_back(v);
     return out;
 }
 } // namespace game_language_rows
+
+// 0.40: the global 'Modo seguro' row (PS4 tab: /data/rpcs3/safe-mode.flag, level 1 for every game, enable flags and
+// features.txt ignored) and the per-game 'Modo seguro deste jogo' row (the title's adapt file: safe=0, or fail=user and
+// safe=N, util/ps4_adapt.hpp set_user_level). Both apply from the next boot.
+namespace safe_mode_rows
+{
+using i18n::str;
+
+inline std::string global_title(bool on)
+{
+    return i18n::tr(on ? str::SET_MODO_SEGURO_LIGADO : str::SET_MODO_SEGURO_DESLIGADO);
+}
+
+inline const char* global_help()
+{
+    return i18n::tr(str::SET_MODO_SEGURO_HELP);
+}
+
+// Flips safe-mode.flag (same contract as online_rows::toggle_online).
+inline std::string toggle_global(std::string& event)
+{
+    const bool enable = !safe_mode::global_on();
+    if (!safe_mode::set_global(enable) || safe_mode::global_on() != enable)
+        return i18n::tr(str::COM_ERRO_GRAVAR) + scene_audio_rows::feature_file(safe_mode::global_flag_name);
+    event = enable ? "settings: Modo seguro switched ON (safe-mode.flag created)" : "settings: Modo seguro switched OFF (safe-mode.flag removed)";
+    return i18n::tr(enable ? str::SET_MODO_SEGURO_LIGADO_MSG : str::SET_MODO_SEGURO_DESLIGADO_MSG);
+}
+
+// "Desligado" or "Nível 2"
+inline std::string level_name(unsigned level)
+{
+    if (!level) return i18n::tr(str::COM_DESLIGADO);
+    return i18n::trf(str::SET_MODO_SEGURO_NIVEL, {level});
+}
+
+inline std::string game_title(unsigned level)
+{
+    return i18n::trf(str::SET_MODO_SEGURO_JOGO, {i18n::raw(level_name(level))});
+}
+
+// The subtitle: what the row does at level 0, else why the title is at its level and for how many boots
+inline std::string game_help(const runtime_inputs& in)
+{
+    if (!in.safe_level) return i18n::tr(str::SET_MODO_SEGURO_JOGO_HELP);
+    if (in.safe_exhausted) return i18n::tr(str::SET_MODO_SEGURO_JOGO_EXHAUSTED_HELP);
+    if (in.safe_kind == safe_mode::fail_kind::user || in.safe_kind == safe_mode::fail_kind::none)
+        return i18n::trf(str::SET_MODO_SEGURO_JOGO_USER_HELP, {in.safe_boots_left});
+    return i18n::trf(str::SET_MODO_SEGURO_JOGO_AUTO_HELP, {fail_text(in.safe_kind), in.safe_boots_left});
+}
+} // namespace safe_mode_rows
 
 // The settings menu (Configurações > Configurações do RPCS3, and Square on a game), a stopped-game editor of a staged
 // copy of the RPCS3 config: cancelled edits never reach the live config. The top level holds Salvar, the automatic
@@ -232,12 +321,12 @@ public:
     using tab = cfg_catalog::tab;
 
 private:
-    enum class top_action { save, auto_switch, back_to_auto, adapt, game_mode, tab, apply_profile, reset, remove_game };
-    enum class ps4_row { players, online, upnp, cool, present_hold, audio_stretch, game_language };
+    enum class top_action { save, auto_switch, use_saved, back_to_auto, adapt, game_mode, safe_level, game_features, tab, apply_profile, reset, remove_game };
+    enum class ps4_row { players, online, upnp, cool, present_hold, audio_stretch, game_language, safe_mode };
     static constexpr ps4_row ps4_rows[] = {ps4_row::players, ps4_row::online, ps4_row::upnp, ps4_row::cool, ps4_row::present_hold,
-        ps4_row::audio_stretch, ps4_row::game_language};
+        ps4_row::audio_stretch, ps4_row::game_language, ps4_row::safe_mode};
     // A top-level action that changes files only after a second X on the same row
-    enum class pending_action { none, back_to_auto, convert, remove_game };
+    enum class pending_action { none, back_to_auto, convert, remove_game, use_saved };
     // A list edit waiting for its warning's confirmation: X on the same row confirms it and repeats the edit
     struct retry_edit
     {
@@ -259,13 +348,15 @@ private:
     pending_action m_pending = pending_action::none;
     std::size_t m_pending_row = 0;
     std::vector<std::string> m_convert_keys;          // a format-1 game YAML: the settings its conversion pins
+    std::vector<std::string> m_legacy_keys;           // the global layer's own values the automatic configuration replaces
+    u64 m_title_features = 0;                         // the rows custom_configs/<TITLE_ID>.features turns on
     std::optional<retry_edit> m_retry;
     std::vector<std::size_t> m_list;                  // the page row of each list row (section captions left out)
     runtime_inputs m_inputs;                          // flags and adaptation keys read by open() and the switches
     std::string m_players;                            // ps4_pads::summary() from the launcher
     int m_players_connected = -1;                     // -1 = unknown
     bool m_present_hold = false;                      // present-hold-ms.txt state, read by open() and the switch
-    bool m_audio_stretch = true;                      // automatic audio continuity (no audio-no-stretch.flag)
+    bool m_audio_stretch = false;                     // automatic audio continuity (audio-continuity.flag, 0.40: off by default)
     // 'Idioma dos jogos': the global choice and, in a game's menu, the game's own (nullopt = follows the global)
     std::int32_t m_game_language_global = game_language_auto;
     std::optional<std::int32_t> m_game_language_game;
@@ -300,9 +391,9 @@ private:
 
     std::string game_language_label(std::optional<std::int32_t> value) const
     {
-        const std::string global = game_language_rows::label(m_game_language_global, m_inputs.game_language_auto);
+        const std::string global = game_language_rows::label(m_game_language_global, m_inputs.game_language_auto, m_inputs.game_language_system);
         if (!value) return i18n::trf(str::GL_SAME_AS_GLOBAL, {i18n::raw(global)});
-        return game_language_rows::label(*value, m_inputs.game_language_auto);
+        return game_language_rows::label(*value, m_inputs.game_language_auto, m_inputs.game_language_system);
     }
 
     std::string game_language_title() const
@@ -331,21 +422,44 @@ private:
         return message;
     }
 
-    // The per-game menu shows the adaptation of its game (none for the global menu or the keep flag).
+    // The per-game menu shows the adaptation of its game (none for the global menu or the keep flag). 0.40: a lone
+    // 'safe=0' (the player turned the per-game safe mode off) adjusts nothing.
     bool show_adapt() const
     {
-        return !m_title.empty() && !m_inputs.adapt.empty() && m_mode != policy_mode::keep_user_settings;
+        if (m_title.empty() || m_mode == policy_mode::keep_user_settings) return false;
+        return std::any_of(m_inputs.adapt.begin(), m_inputs.adapt.end(), [](const std::string& key) { return key != adapt::key_safe0; });
     }
 
-    // 0.31: what the active adaptation keys do, in one line.
+    // 'Modo seguro deste jogo' (every per-game menu: the feature rows of a level apply in every mode)
+    bool show_safe_level() const
+    {
+        return !m_title.empty();
+    }
+
+    // X on 'Modo seguro deste jogo': Desligado -> Nível 1 -> 2 -> 3 -> Desligado, written at once (the player's choice,
+    // fail=user), from the next boot of the game
+    std::string step_safe_level()
+    {
+        const unsigned next = (unsigned{m_inputs.safe_level} + 1) % (unsigned{safe_mode::max_level} + 1);
+        if (!adapt::set_user_level(m_title, next)) return i18n::tr(str::COM_ERRO_GRAVAR) + adapt::path(m_title);
+        refresh_runtime();
+        m_event = "settings: " + m_title + " per-game safe mode " + (next ? "level " + std::to_string(next) + " (adapt safe=0, fail=user, safe=" +
+            std::to_string(next) + ")" : std::string("off (adapt safe=0)"));
+        return i18n::trf(str::SET_MODO_SEGURO_JOGO_CHANGED, {m_title, i18n::raw(safe_mode_rows::level_name(next))});
+    }
+
+    // 0.31: what the active adaptation keys do, in one line. 0.40: the per-game safe mode first ("Modo seguro: nível 2
+    // (a GPU travou)").
     std::string adapt_text() const
     {
         std::string text;
         const auto append = [&](str part) { text += text.empty() ? "" : ", "; text += i18n::tr(part); };
+        if (m_inputs.safe_level) text = i18n::trf(str::SET_MODO_SEGURO_NIVEL_MOTIVO, {unsigned{m_inputs.safe_level}, fail_text(m_inputs.safe_kind)});
         if (adapt_fewer_threads(m_inputs)) append(str::SET_COMPILACAO_1_THREAD);
         if (adapt_has(m_inputs, adapt::key_vram_low)) append(str::SET_VRAM_REDUZIDA);
         if (online_blocked(m_inputs)) append(str::SET_ONLINE_DESLIGADO);
         if (adapt_no_shader_interpreter(m_inputs)) append(str::SET_GPU_TRAVOU_SHADERS);
+        if (adapt_has(m_inputs, adapt::key_cb_split) && feature_on(m_inputs, safe_mode::feature::cb_split_after_loss)) append(str::SET_COMANDOS_GPU_DIVIDIDOS);
         if (text.empty()) text = i18n::tr(str::SET_REGISTRO_FALHA);
         return text + i18n::trf(str::SET_VALE_PROXIMOS_BOOT, {m_inputs.adapt_boots_left});
     }
@@ -354,6 +468,102 @@ private:
     {
         if (m_players_connected < 0) return i18n::tr(str::COM_CONTROLES_CONECTADOS);
         return i18n::trf(str::SET_CONTROLES_CONECTADOS_4, {m_players_connected});
+    }
+
+    // 0.40: 'Novidades neste jogo' (custom_configs/<TITLE_ID>.features, util/ps4_safe_mode.hpp): the 0.39 audio rules for
+    // this game only. The kill flags, the safe-mode levels and the global safe mode still win at boot.
+    static constexpr u64 audio_039_rows = safe_mode::bit(safe_mode::feature::audio_wait_policy) | safe_mode::bit(safe_mode::feature::audio_hr_waits) |
+        safe_mode::bit(safe_mode::feature::audio_reserve_64);
+
+    std::string game_features_value() const
+    {
+        if ((m_title_features & audio_039_rows) == audio_039_rows) return i18n::tr(str::SET_NOVIDADES_AUDIO_039);
+        // rows written by hand (console A/B tests): their names, which are the same in every language
+        std::string names;
+        for (const safe_mode::info& r : safe_mode::table)
+            if (m_title_features & safe_mode::bit(r.f)) names += (names.empty() ? "" : ", ") + std::string(r.name);
+        return names.empty() ? std::string(i18n::tr(str::SET_NOVIDADES_NENHUMA)) : names;
+    }
+
+    std::string game_features_title() const
+    {
+        return i18n::trf(str::CFGU_CHANGED, {str::SET_NOVIDADES_JOGO, i18n::raw(game_features_value())});
+    }
+
+    // X: nenhuma <-> the 0.39 audio rules; other names in the file stay
+    std::string step_game_features()
+    {
+        const bool on = (m_title_features & audio_039_rows) != audio_039_rows;
+        fs::create_path(rpcs3::utils::get_custom_config_dir());
+        if (!safe_mode::title_features_file::set(m_title, audio_039_rows, on))
+            return i18n::tr(str::COM_ERRO_GRAVAR) + rpcs3::utils::get_custom_config_dir() + m_title + ".features";
+        m_title_features = safe_mode::title_features_file::named(m_title);
+        refresh_runtime();
+        m_event = "settings: " + m_title + " per-game features " + (on ? "audio_wait_policy, audio_hr_waits, audio_reserve_64 on" : "audio rows off") +
+            " (custom_configs/" + m_title + ".features)";
+        return i18n::trf(str::SET_NOVIDADES_CHANGED, {m_title, i18n::raw(game_features_value())});
+    }
+
+    // 0.40: 'Usar meus valores salvos (N)' (global menu, automatic configuration on): the global layer's own values the
+    // automatic configuration replaces (util/ps4_policy.hpp legacy_choices); X twice pins them with the saved values
+    std::vector<std::string> legacy_values() const
+    {
+        const auto saved = std::make_unique<cfg_root>();
+        const auto automatic = std::make_unique<cfg_root>();
+        saved->from_string(m_global_baseline);
+        automatic->from_string(m_global_baseline);
+        std::string layer = policy_detail::read_small(global_path, settings_text_limit);
+        if (layer.empty()) layer = policy_detail::read_small(fs::get_config_dir(true) + "config.yml", settings_text_limit);
+        std::vector<std::string> keys = legacy_choices(*saved, *automatic, m_inputs, layer, read_pins({}).global);
+        // the settings the PS4 keeps at one value, or that have no meaning here, are never the player's
+        std::erase_if(keys, [](const std::string& key)
+        {
+            const cfg_catalog::item* item = cfg_catalog::find(key);
+            return !item || item->kind == cfg_catalog::klass::unavailable || item->kind == cfg_catalog::klass::hidden;
+        });
+        return keys;
+    }
+
+    bool show_use_saved() const
+    {
+        return m_title.empty() && !m_legacy_keys.empty();
+    }
+
+    // "Frame limit, Resolution Scale, Renderer (+2)": the labels of the listed settings
+    std::string legacy_list() const
+    {
+        std::string out;
+        constexpr std::size_t shown = 3;
+        for (std::size_t i = 0; i < m_legacy_keys.size() && i < shown; ++i)
+        {
+            const cfg_catalog::item* item = cfg_catalog::find(m_legacy_keys[i]);
+            out += (i ? ", " : "") + (item ? std::string(i18n::tr(item->label)) : m_legacy_keys[i]);
+        }
+        if (m_legacy_keys.size() > shown) out += " (+" + std::to_string(m_legacy_keys.size() - shown) + ")";
+        return out;
+    }
+
+    std::string use_saved_help() const
+    {
+        const std::string text = i18n::trf(str::SET_USAR_VALORES_SALVOS_HELP, {i18n::raw(legacy_list())});
+        return m_pending == pending_action::use_saved ? text + confirm_hint() : text;
+    }
+
+    void select_use_saved(std::string& message, bool again)
+    {
+        if (!again)
+        {
+            m_pending = pending_action::use_saved;
+            m_pending_row = m_selection;
+            message = use_saved_help();
+            return;
+        }
+        m_browser.pin_keys(m_legacy_keys);
+        const std::size_t n = m_legacy_keys.size();
+        m_event = "settings: global saved values kept as the player's own (" + std::to_string(n) + " pin(s): " + key_list(m_legacy_keys) + "; written by Salvar)";
+        m_legacy_keys.clear();
+        select_row(top_action::save);
+        message = i18n::trf(str::SET_USAR_VALORES_SALVOS_DONE, {n});
     }
 
     // After a switch in this menu: read the flags and the adaptation file again and redo the preview of the staged
@@ -390,9 +600,13 @@ private:
     std::vector<std::pair<top_action, int>> top_rows() const
     {
         std::vector<std::pair<top_action, int>> rows{{top_action::save, -1}, {top_action::auto_switch, -1}};
+        if (show_use_saved()) rows.push_back({top_action::use_saved, -1});
         if (show_back_to_auto()) rows.push_back({top_action::back_to_auto, -1});
         if (show_adapt()) rows.push_back({top_action::adapt, -1});
         if (show_game_mode()) rows.push_back({top_action::game_mode, -1});
+        if (show_safe_level()) rows.push_back({top_action::safe_level, -1});
+        // next to the per-game safe mode: both apply from the game's next boot, in every mode
+        if (show_safe_level()) rows.push_back({top_action::game_features, -1});
         for (int t = 0; t < int(cfg_catalog::tab_count); ++t) rows.push_back({top_action::tab, t});
         rows.push_back({top_action::apply_profile, -1});
         rows.push_back({top_action::reset, -1});
@@ -529,6 +743,8 @@ private:
         case ps4_row::present_hold: return entry(scene_audio_rows::present_hold_title(m_present_hold), scene_audio_rows::present_hold_help());
         case ps4_row::audio_stretch: return entry(scene_audio_rows::audio_stretch_title(m_audio_stretch), scene_audio_rows::audio_stretch_help());
         case ps4_row::game_language: return entry(game_language_title(), i18n::tr(str::GL_HELP_GLOBAL));
+        // The state open() and refresh_runtime() read (no stat per frame)
+        case ps4_row::safe_mode: return entry(safe_mode_rows::global_title(m_inputs.global_safe), safe_mode_rows::global_help());
         }
         return entry({}, {});
     }
@@ -562,6 +778,14 @@ private:
             message = ps4_rows[m_selection] == ps4_row::present_hold ? scene_audio_rows::toggle_present_hold(m_present_hold, event)
                                                                       : scene_audio_rows::toggle_audio_stretch(m_audio_stretch, event);
             m_event = std::move(event);
+            return false;
+        // safe-mode.flag: read again by every boot; the preview follows it (the game language row's PS4 value, the
+        // features the policy decides with)
+        case ps4_row::safe_mode:
+            message = safe_mode_rows::toggle_global(event);
+            if (event.empty()) return false;
+            m_event = std::move(event);
+            refresh_runtime();
             return false;
         }
         return false;
@@ -879,6 +1103,10 @@ public:
         else m_game_language_game.reset();
         m_convert_keys.clear();
         if (legacy_game_file() && show_game_mode()) m_convert_keys = conversion().first;
+        // 0.40: the per-game .features file, and the global layer's own values that the automatic configuration replaces
+        m_title_features = m_title.empty() ? 0 : safe_mode::title_features_file::named(m_title);
+        m_legacy_keys.clear();
+        if (m_title.empty() && m_mode == policy_mode::automatic) m_legacy_keys = legacy_values();
         m_tab = -1;
         m_selection = 0;
         m_pending = pending_action::none;
@@ -948,6 +1176,9 @@ public:
         case top_action::back_to_auto: row(i18n::tr(str::COM_VOLTAR_AUTOMATICO), back_to_auto_help()); break;
         case top_action::adapt: row(i18n::tr(str::SET_AJUSTE_AUTOMATICO_APOS_FALHA), adapt_text() + i18n::tr(str::SET_REMOVE)); break;
         case top_action::game_mode: row(mode_title(), mode_help()); break;
+        case top_action::safe_level: row(safe_mode_rows::game_title(m_inputs.safe_level), safe_mode_rows::game_help(m_inputs)); break;
+        case top_action::game_features: row(game_features_title(), i18n::tr(str::SET_NOVIDADES_HELP)); break;
+        case top_action::use_saved: row(i18n::trf(str::SET_USAR_VALORES_SALVOS, {m_legacy_keys.size()}), use_saved_help()); break;
         case top_action::tab:
             row(i18n::tr(cfg_catalog::tab_name(tab(which))), which == int(tab::ps4) ? std::string(i18n::tr(str::SET_ABRIR)) : m_browser.tab_summary(tab(which)));
             break;
@@ -1127,6 +1358,15 @@ public:
         }
         case top_action::back_to_auto: select_back_to_auto(message, again && asked == pending_action::back_to_auto); return false;
         case top_action::game_mode: select_game_mode(message, again && asked == pending_action::convert); return false;
+        case top_action::safe_level:
+            message = step_safe_level();
+            select_row(top_action::safe_level);
+            return false;
+        case top_action::game_features:
+            message = step_game_features();
+            select_row(top_action::game_features);
+            return false;
+        case top_action::use_saved: select_use_saved(message, again && asked == pending_action::use_saved); return false;
         case top_action::remove_game: select_remove_game(message, again && asked == pending_action::remove_game); return false;
         case top_action::apply_profile: message = apply_profile(); return false;
         case top_action::reset: message = restore_defaults(); return false;
@@ -1140,7 +1380,15 @@ public:
         m_pending = pending_action::none;
         if (!browser_tab(m_tab)) return false;
         const std::span<const cfg_browser::row> page = build_list();
-        if (m_selection >= m_list.size() || page[m_list[m_selection]].locked) return false;
+        if (m_selection >= m_list.size()) return false;
+        // 0.40: an unavailable row whose files hold a value it cannot use: Square removes the value (Salvar writes it)
+        if (m_browser.has_unused_saved(m_list[m_selection]))
+        {
+            cancel_retry();
+            m_browser.remove_unused_saved(m_list[m_selection]);
+            return true;
+        }
+        if (page[m_list[m_selection]].locked) return false;
         cancel_retry();
         m_browser.reset_auto(m_list[m_selection]);
         return true;

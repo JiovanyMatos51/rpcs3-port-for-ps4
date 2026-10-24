@@ -16,6 +16,8 @@
 
 #include "Emu/Cell/timers.hpp"
 #include "Emu/System.h"
+#include "util/ps4_memory_governor.hpp" // optional_thread_allowed (also includes util/ps4_safe_mode.hpp)
+#include "util/ps4_safe_mode.hpp"       // rows rsx_copy_worker, copy_worker_lazy
 
 void ps4_startup_checkpoint(const char* stage);
 
@@ -112,6 +114,8 @@ namespace rsx
 		const bool m_raise_priority;
 		// 0.39: RSX thread only (the single producer): 0 = stand-by until the first large copy, 1 = running, 2 = refused
 		u8 m_ps4_start = 0;
+		// 0.40: RSX thread only: large copies left before the stand-by worker asks the thread budget again
+		u32 m_ps4_budget_wait = 0;
 
 		explicit ps4_copy_worker(bool raise_priority) noexcept
 			: m_raise_priority(raise_priority)
@@ -396,8 +400,10 @@ namespace rsx
 
 		std::string ps4_worker_off;
 
-		if (fs::is_file("/data/rpcs3/rsx-copy-worker-off.flag"))
-			ps4_worker_off = "rsx-copy-worker-off.flag";
+		// 0.40: row rsx_copy_worker (util/ps4_safe_mode.hpp), read per renderer: off with rsx-copy-worker-off.flag or
+		// at safe-mode level 3 (the copies then run inline, as in 0.36)
+		if (!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::rsx_copy_worker))
+			ps4_worker_off = fs::is_file("/data/rpcs3/rsx-copy-worker-off.flag") ? "rsx-copy-worker-off.flag" : "safe mode level 3";
 		else if (g_cfg.video.renderer != video_renderer::vulkan)
 			ps4_worker_off = "Vulkan renderer only";
 		else if (g_cfg.video.multithreaded_rsx)
@@ -427,8 +433,8 @@ namespace rsx
 			const bool raise = !fs::is_file("/data/rpcs3/rsx-normal-priority.flag");
 			auto worker = std::make_shared<named_thread<ps4_copy_worker>>(stx::try_launch, std::string("RSX copy worker"), raise);
 
-			// 0.39: stand-by until the first copy it takes (ps4_worker_push), unless keep-service-threads.flag
-			const bool lazy = ps4_lazy_threads_enabled();
+			// 0.39: stand-by until the first copy it takes (ps4_worker_push); row copy_worker_lazy
+			const bool lazy = utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::copy_worker_lazy);
 
 			if (lazy || worker->ps4_try_start())
 			{
@@ -581,6 +587,20 @@ namespace rsx
 		{
 			if (w.m_ps4_start == 2 || Emu.IsStopped())
 			{
+				return false;
+			}
+
+			// 0.40: an optional thread never takes one of the last slots of the console's thread cap, which stay for the
+			// game: the copy runs inline, and the budget is asked again 256 large copies later
+			if (w.m_ps4_budget_wait)
+			{
+				w.m_ps4_budget_wait--;
+				return false;
+			}
+
+			if (!utils::ps4::governor::optional_thread_allowed("RSX copy worker", 1))
+			{
+				w.m_ps4_budget_wait = 256;
 				return false;
 			}
 

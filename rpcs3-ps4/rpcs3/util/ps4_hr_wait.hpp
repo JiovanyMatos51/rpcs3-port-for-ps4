@@ -7,6 +7,7 @@
 
 #ifdef __ORBIS__
 #include <orbis/libkernel.h>
+#include "util/ps4_safe_mode.hpp" // 0.40: rows hr_wait, hr_timeout_keep (relaxed loads)
 #else
 #include <chrono>
 #include <thread>
@@ -87,9 +88,12 @@ namespace utils::ps4
 		}
 	}
 
+	// The boot probe enabled the HR timer (no-hr-wait.flag keeps it off for the process), and this boot's row hr_wait is
+	// on: safe-mode level 3 sends every HR wait of that game back to the tick-bound waits used before the HR timer (one
+	// relaxed load per call).
 	inline bool hr_wait_enabled() noexcept
 	{
-		return hr_wait_detail::g_enabled.load(std::memory_order_acquire);
+		return hr_wait_detail::g_enabled.load(std::memory_order_acquire) && safe_mode::enabled(safe_mode::feature::hr_wait);
 	}
 
 	// 0.39: waits that timed out (deadline + 2 ms) with the equeue kept, for the 'hr wait:' line.
@@ -163,7 +167,9 @@ namespace utils::ps4
 			// 0.39: a timed-out wait already lasted the deadline + 2 ms and says nothing against the equeue (a late
 			// event is consumed by the next wait): counted, the equeue is kept and the thread stays on the HR timer.
 			// Only a timer that keeps timing out (each wait 2 ms late) sends the thread to the fallback, as any error.
-			if (rc == error_timed_out)
+			// 0.40: row hr_timeout_keep (no-hr-wait.flag, safe-mode level 1): off, the first timeout sends the thread
+			// to the fallback, as in 0.38.
+			if (rc == error_timed_out && safe_mode::enabled(safe_mode::feature::hr_timeout_keep))
 			{
 				g_timeouts.fetch_add(1, std::memory_order_relaxed);
 				g_last_error.store(rc, std::memory_order_relaxed);

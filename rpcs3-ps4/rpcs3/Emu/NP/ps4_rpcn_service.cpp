@@ -960,8 +960,10 @@ bool start(job type, std::string user, std::string pass, std::string email, std:
         s.started = std::chrono::steady_clock::now();
 
         const bool pressure = needs_client(type) && utils::ps4::governor::thread_pressure() >= 2;
+        // The worker is an optional thread: never one of the last slots of the console's cap (whatever the governor rules)
+        const bool budget = !pressure && !utils::ps4::governor::optional_thread_allowed("RPCN Account", 1);
         worker_thread* worker = nullptr;
-        if (!pressure && !refuse_flag_set())
+        if (!pressure && !budget && !refuse_flag_set())
         {
             worker = new (std::nothrow) worker_thread(stx::try_launch, "RPCN Account", type, std::move(req));
         }
@@ -980,7 +982,7 @@ bool start(job type, std::string user, std::string pass, std::string email, std:
             delete worker;
         }
 
-        const std::string why = pressure ? "thread pressure" : "thread refused";
+        const std::string why = pressure ? "thread pressure" : budget ? "thread budget" : "thread refused";
         checkpoint("RPCN account: job %s not started (%s); live threads: %s", job_name(type), why.c_str(),
             ps4_thread_live_summary().c_str());
 

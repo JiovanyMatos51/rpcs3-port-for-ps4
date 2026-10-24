@@ -29,7 +29,9 @@ using namespace std::literals::chrono_literals;
 
 #ifdef __ORBIS__
 #include "util/ps4_backoff.hpp"
+#include "util/ps4_lifecycle.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <string_view>
 #include <vector>
@@ -41,6 +43,42 @@ void ps4_fatal_note(const char* prefix, const char* detail) noexcept;
 
 namespace
 {
+	// 0.40: the repeated-line limiter of the live log (util/ps4_lifecycle.hpp). Constant-initialized, so a line written
+	// before main finds it ready.
+	utils::ps4::repeat_limiter s_repeat_limiter;
+
+	// 0 = log-flood-off.flag not checked yet, 1 = the limiter acts, 2 = off (every line is written)
+	std::atomic<int> s_repeat_mode{0};
+
+	bool repeat_limiter_on() noexcept
+	{
+		int mode = s_repeat_mode.load(std::memory_order_relaxed);
+
+		if (mode == 0)
+		{
+			mode = ::access("/data/rpcs3/log-flood-off.flag", F_OK) == 0 ? 2 : 1;
+			s_repeat_mode.store(mode, std::memory_order_relaxed);
+		}
+
+		return mode == 1;
+	}
+
+	// Never limited: the always and fatal levels, the PS4 channels (heartbeat, session lines, the copies of startup.log
+	// lines), which a report needs whole, and sys_fs: its per-call lines are the record of which files a game opened
+	// (a missing language file, a movie, an I/O error), one per open, and a long load opens thousands.
+	bool repeat_exempt(const logs::message& msg) noexcept
+	{
+		const logs::level level = msg;
+
+		if (level == logs::level::always || level == logs::level::fatal)
+		{
+			return true;
+		}
+
+		const char* const name = msg->name;
+		return name && ((name[0] == 'P' && name[1] == 'S' && name[2] == '4') || std::strcmp(name, "sys_fs") == 0);
+	}
+
 	// True for "<prefix><digits>.log".
 	bool is_log_part(std::string_view entry, std::string_view prefix)
 	{
@@ -519,6 +557,31 @@ void logs::message::broadcast(const char* fmt, const fmt_type_info* sup, ...) co
 	// Get timestamp
 	const u64 stamp = get_stamp();
 
+#ifdef __ORBIS__
+	// 0.40: a message that repeats without end is cut down here, before anything is formatted: after its first 64
+	// lines, 8 per 10 s pass and the rest is counted in one summary line per window.
+	if (g_init && !repeat_exempt(*this) && repeat_limiter_on())
+	{
+		const u64 key = reinterpret_cast<uptr>(fmt) * 0x9e3779b97f4a7c15ull ^ reinterpret_cast<uptr>(this);
+		const auto verdict = s_repeat_limiter.admit(key, fmt, this, stamp);
+
+		if (verdict.summary)
+		{
+			const std::string summary = utils::ps4::repeat_summary_line(verdict.summary, verdict.sample);
+
+			for (listener* lis = get_logger(); lis; lis = lis->m_next)
+			{
+				lis->log(stamp, *this, {}, summary);
+			}
+		}
+
+		if (!verdict.pass)
+		{
+			return;
+		}
+	}
+#endif
+
 	// Notify start operation
 	g_tls_log_control(fmt, 0);
 
@@ -573,6 +636,61 @@ void logs::message::broadcast(const char* fmt, const fmt_type_info* sup, ...) co
 	// Notify end operation
 	g_tls_log_control(fmt, -1);
 }
+
+#ifdef __ORBIS__
+namespace logs
+{
+	// 0.40: the frontend's main loop calls this about once per second (rpcs3/ps4_main.cpp). It writes the summary of a
+	// window that ended with lines left out and no later line of its message, and one line (also to startup.log, for
+	// the first 32) when the limiter starts acting on a message, all on the main thread.
+	void ps4_flush_repeated_lines()
+	{
+		if (!g_init)
+		{
+			return;
+		}
+
+		if (!repeat_limiter_on())
+		{
+			static bool s_off_told = false;
+
+			if (!std::exchange(s_off_told, true))
+			{
+				ps4_fatal_note("log: ", "repeated-line limiter off (log-flood-off.flag): every repeated line is written");
+			}
+
+			return;
+		}
+
+		static u32 s_limited_told = 0;
+		const u64 stamp = get_stamp();
+
+		s_repeat_limiter.flush(stamp,
+			[&](const char* text, const void* tag)
+			{
+				const message& msg = *static_cast<const message*>(tag);
+				const std::string line = utils::ps4::repeat_limited_line(text);
+
+				if (s_limited_told < 32)
+				{
+					const std::string prefix = msg->name && *msg->name ? std::string(msg->name) + ": " : std::string();
+					ps4_fatal_note(prefix.c_str(), line.c_str());
+				}
+				else if (s_limited_told == 32)
+				{
+					ps4_fatal_note("log: ", "more messages reached the repeated-line limit; their lines are in RPCS3.log only");
+				}
+
+				s_limited_told++;
+				get_logger()->broadcast(stored_message{msg, stamp, std::string(), line});
+			},
+			[&](const char* text, const void* tag, std::uint32_t count)
+			{
+				get_logger()->broadcast(stored_message{*static_cast<const message*>(tag), stamp, std::string(), utils::ps4::repeat_summary_line(count, text)});
+			});
+	}
+}
+#endif
 
 logs::file_writer::file_writer(const std::string& name, u64 max_size)
 	: m_max_size(max_size)

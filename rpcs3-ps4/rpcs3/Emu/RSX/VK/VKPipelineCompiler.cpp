@@ -8,11 +8,13 @@
 #include "util/sysinfo.hpp"
 
 #ifdef RPCS3_PS4
+#include "Emu/Cell/timers.hpp"
 #include "Emu/RSX/RSXThread.h"
 #include "ps4_launcher.h"
 #include "Utilities/File.h"
 #include "util/ps4_memory_governor.hpp"
 #include "util/ps4_rsx_programs.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 #include <atomic>
 #include <optional>
@@ -80,15 +82,51 @@ namespace vk
 	// 0.38: compile admission hook (VKPipelineCompiler.h). Without one, each job takes a compile slot of the memory
 	// governor (utils::ps4::governor::compile_slot), like the PPU/SPU LLVM workers: under heap or thread pressure the
 	// compiles run one at a time. rsx-compile-no-slot.flag (read per worker group): jobs never wait (0.37).
-	// 0.39: only from memory level 2 (a real shortage) up; below it the workers run in parallel as in 0.37, instead of
-	// sharing one slot with every PPU/SPU compile from level 1 (pipeline bursts at ~0.5 s per pipeline).
+	// With the 0.39 governor rules (governor_v039): only from memory level 2 (a real shortage) up; below it the workers
+	// run in parallel as in 0.37, instead of sharing one slot with every PPU/SPU compile from level 1 (pipeline bursts at
+	// ~0.5 s per pipeline). The 0.38 rules (default) keep the 0.38 admission.
 	static std::atomic<const ps4_pipe_compile_hook*> s_ps4_compile_hook{ nullptr };
 	static atomic_t<bool> s_ps4_compile_slot{true};
 
-	// 0.39: shader interpreter links run before queued game pipelines (interp-no-lane.flag: in the FIFO, as 0.38).
-	static atomic_t<bool> s_ps4_lane_enabled{true};
+	// Feature interp_lane (interp-lane.flag or features.txt, read per worker group): shader interpreter links run before
+	// queued game pipelines. Off by default: they wait in the FIFO, as 0.38.
+	static atomic_t<bool> s_ps4_lane_enabled{false};
 	lf_queue<pipe_compiler::pipe_compiler_job> pipe_compiler::s_ps4_lane;
 	lf_queue<std::function<void()>> pipe_compiler::s_ps4_translate;
+
+	// The worker loop that also drains the interpreter lane and the program translations (shader-translate-async.flag):
+	// set before the workers start when either is on. Otherwise the workers run the 0.38 loop (one FIFO).
+	static atomic_t<bool> s_ps4_loop_v039{false};
+
+	// Feature pipelines_first (pipelines-first.flag or features.txt): graphics jobs go to the shared queues
+	// (VKPipelineCompiler.h) instead of the round-robin per-worker queues. Read once per renderer, at the first worker
+	// group (a resize keeps it, so no job is left in a queue nobody drains); off by default.
+	static atomic_t<bool> s_ps4_pipelines_first{false};
+	static bool s_ps4_pipelines_first_read = false;
+
+	std::deque<std::unique_ptr<pipe_compiler::pipe_compiler_job>> pipe_compiler::s_ps4_shared_game;
+	std::deque<std::unique_ptr<pipe_compiler::pipe_compiler_job>> pipe_compiler::s_ps4_shared_links;
+	std::mutex pipe_compiler::s_ps4_shared_mutex;
+	u32 pipe_compiler::s_ps4_shared_links_running = 0;
+	atomic_t<u32> pipe_compiler::s_ps4_shared_seq{0};
+
+	u64 ps4_pipe_now_us() noexcept
+	{
+		return get_system_time();
+	}
+
+	// A graphics job handed its result back: game pipelines feed the wait histogram of the 10 s 'Vulkan backend' line
+	// and the pipeline burst line (interpreter links are timed by the shader interpreter itself).
+	static void ps4_note_pipeline_ready(bool is_graphics_job, rsx::flags32_t flags, u64 queued_us) noexcept
+	{
+		if (!is_graphics_job || (flags & pipe_compiler::PS4_INTERPRETER_LINK) || !queued_us)
+		{
+			return;
+		}
+
+		const u64 now = get_system_time();
+		utils::ps4::rsx_programs::g_pipeline_waits.note(now > queued_us ? now - queued_us : 0);
+	}
 
 	// Governor slot class of a job: a game pipeline or a shader interpreter link.
 	enum class ps4_job_kind : u8
@@ -131,9 +169,19 @@ namespace vk
 				return;
 			}
 
-			if (utils::ps4::rsx_programs::rsx_job_takes_slot(s_ps4_compile_slot.observe(), utils::ps4::governor::memory_level()))
+			namespace sm = utils::ps4::safe_mode;
+			const bool rules_v039 = sm::enabled(sm::feature::governor_v039);
+			if (utils::ps4::rsx_programs::rsx_job_takes_slot(s_ps4_compile_slot.observe(), utils::ps4::governor::memory_level(), rules_v039))
 			{
-				ps4_take_compile_slot(m_slot, kind, &ps4_pipe_worker_stopped);
+				if (rules_v039)
+				{
+					ps4_take_compile_slot(m_slot, kind, &ps4_pipe_worker_stopped);
+				}
+				else
+				{
+					// 0.38: one slot kind for every compile
+					m_slot.emplace(&ps4_pipe_worker_stopped);
+				}
 			}
 		}
 
@@ -213,8 +261,82 @@ namespace vk
 			: int_compile_graphics_pipe(job.graphics_data, job.graphics_modules, job.inputs, {}, job.flags);
 		t_ps4_fast_link = false;
 		job.callback_func(compiled);
+		ps4_note_pipeline_ready(true, job.flags, job.ps4_queued_us);
 		ps4_pipe_retired();
 		return true;
+	}
+
+	void pipe_compiler::ps4_push_shared(std::unique_ptr<pipe_compiler_job> job)
+	{
+		{
+			std::lock_guard lock(s_ps4_shared_mutex);
+			auto& queue = (job->flags & PS4_INTERPRETER_LINK) ? s_ps4_shared_links : s_ps4_shared_game;
+			queue.push_back(std::move(job));
+		}
+
+		s_ps4_shared_seq++;
+		s_ps4_shared_seq.notify_all();
+	}
+
+	bool pipe_compiler::ps4_run_shared_job()
+	{
+		std::unique_ptr<pipe_compiler_job> job;
+		bool link = false;
+
+		{
+			std::lock_guard lock(s_ps4_shared_mutex);
+			using utils::ps4::rsx_programs::job_pick;
+
+			switch (utils::ps4::rsx_programs::pick_next_job(!s_ps4_shared_game.empty(), !s_ps4_shared_links.empty(), s_ps4_shared_links_running))
+			{
+			case job_pick::game:
+				job = std::move(s_ps4_shared_game.front());
+				s_ps4_shared_game.pop_front();
+				break;
+			case job_pick::link:
+				job = std::move(s_ps4_shared_links.front());
+				s_ps4_shared_links.pop_front();
+				s_ps4_shared_links_running++;
+				link = true;
+				break;
+			case job_pick::none:
+				return false;
+			}
+		}
+
+		// Dropped (and retired) instead of compiled when the workers are being destroyed.
+		ps4_run_job(*job);
+
+		if (link)
+		{
+			{
+				std::lock_guard lock(s_ps4_shared_mutex);
+				s_ps4_shared_links_running--;
+			}
+
+			// The next queued link may start now
+			s_ps4_shared_seq++;
+			s_ps4_shared_seq.notify_all();
+		}
+
+		return true;
+	}
+
+	void pipe_compiler::ps4_drop_shared() noexcept
+	{
+		u32 dropped = 0;
+		{
+			std::lock_guard lock(s_ps4_shared_mutex);
+			dropped = ::size32(s_ps4_shared_game) + ::size32(s_ps4_shared_links);
+			s_ps4_shared_game.clear();
+			s_ps4_shared_links.clear();
+			s_ps4_shared_links_running = 0;
+		}
+
+		if (dropped)
+		{
+			rsx_log.notice("PS4 RSX: %u queued pipeline job(s) of the shared queue dropped with the pipeline workers", dropped);
+		}
 	}
 
 	void pipe_compiler::ps4_drain_lane()
@@ -295,6 +417,100 @@ namespace vk
 		while (thread_ctrl::state() != thread_state::aborting)
 		{
 #ifdef RPCS3_PS4
+			if (s_ps4_pipelines_first.observe())
+			{
+				// pipelines_first: program translations first (shader-translate-async.flag), then this worker's own
+				// queue (compute jobs), then one job of the shared queues, game pipelines before interpreter links.
+				// The sequence number is read before the queues are checked, so a push in between ends the wait.
+				const u32 seq = s_ps4_shared_seq.load();
+				ps4_drain_translations();
+
+				u32 dropped = 0;
+				for (auto&& job : m_work_queue.pop_all())
+				{
+					if (!ps4_run_job(job))
+					{
+						dropped++;
+					}
+				}
+
+				if (dropped)
+				{
+					rsx_log.notice("PS4 RSX: pipeline worker stopping: %u queued job(s) dropped", dropped);
+				}
+
+				if (thread_ctrl::state() == thread_state::aborting)
+				{
+					break;
+				}
+
+				if (ps4_run_shared_job())
+				{
+					continue;
+				}
+
+				thread_ctrl::wait_on_custom<3>([&](atomic_wait::list<5>& list)
+				{
+					list.template set<0>(m_work_queue);
+					list.template set<1>(s_ps4_shared_seq, seq);
+					list.template set<2>(s_ps4_translate);
+				});
+				continue;
+			}
+
+			if (!s_ps4_loop_v039.observe())
+			{
+				// The 0.38 loop: one FIFO (interpreter links included), nothing else to drain. The only addition is the
+				// stop path: a job not started yet when the workers are being destroyed is dropped instead of compiled,
+				// so the stop does not wait for every queued link.
+				u32 dropped = 0;
+				for (auto&& job : m_work_queue.pop_all())
+				{
+					// Under memory pressure the governor runs one compile at a time (PPU, SPU and these jobs).
+					const ps4_compile_admission admission((job.flags & PS4_INTERPRETER_LINK) ? ps4_job_kind::interp : ps4_job_kind::rsx);
+
+					if (ps4_pipe_worker_stopped())
+					{
+						ps4_pipe_retired();
+						dropped++;
+						continue;
+					}
+
+					if (!job.is_graphics_job)
+					{
+						auto compiled = int_compile_compute_pipe(job.compute_data, job.inputs, job.flags);
+						job.callback_func(compiled);
+						ps4_pipe_retired();
+						continue;
+					}
+
+					t_ps4_fast_link = s_ps4_fast_pipelines.observe() && ps4_pipelines_pending() >= ps4_fast_link_backlog;
+					if (job.create_info_func)
+					{
+						auto compiled = int_compile_graphics_pipe(job.create_info_func, job.inputs, {}, job.flags);
+						t_ps4_fast_link = false;
+						job.callback_func(compiled);
+						ps4_note_pipeline_ready(true, job.flags, job.ps4_queued_us);
+						ps4_pipe_retired();
+						continue;
+					}
+
+					auto compiled = int_compile_graphics_pipe(job.graphics_data, job.graphics_modules, job.inputs, {}, job.flags);
+					t_ps4_fast_link = false;
+					job.callback_func(compiled);
+					ps4_note_pipeline_ready(true, job.flags, job.ps4_queued_us);
+					ps4_pipe_retired();
+				}
+
+				if (dropped)
+				{
+					rsx_log.notice("PS4 RSX: pipeline worker stopping: %u queued job(s) dropped", dropped);
+				}
+
+				thread_ctrl::wait_on(m_work_queue);
+				continue;
+			}
+
 			// 0.39: shader interpreter links first, also between two game pipelines of one batch. Once the workers are
 			// being destroyed, the jobs not started are dropped instead of compiled (the stop no longer waits for every
 			// queued link, 'RSX.W is too sleepy').
@@ -580,6 +796,13 @@ namespace vk
 
 #ifdef RPCS3_PS4
 		ps4_pipe_queued();
+
+		if (s_ps4_pipelines_first.observe())
+		{
+			// pipelines_first: the next free worker takes it, before any interpreter link.
+			ps4_push_shared(std::make_unique<pipe_compiler_job>(create_info, modules, vs_inputs, fs_inputs, flags, callback));
+			return {};
+		}
 #endif
 		m_work_queue.push(create_info, modules, vs_inputs, fs_inputs, flags, callback);
 		return {};
@@ -599,9 +822,16 @@ namespace vk
 #ifdef RPCS3_PS4
 		ps4_pipe_queued();
 
+		if (s_ps4_pipelines_first.observe())
+		{
+			// pipelines_first: interpreter links run only while no game pipeline is queued, one at a time.
+			ps4_push_shared(std::make_unique<pipe_compiler_job>(get_create_info, vs_inputs, fs_inputs, flags, callback));
+			return {};
+		}
+
 		if ((flags & PS4_INTERPRETER_LINK) && s_ps4_lane_enabled.observe())
 		{
-			// 0.39: the next free worker runs it before its next game pipeline (0.38: behind the whole FIFO, median 5 s).
+			// interp_lane: the next free worker runs it before its next game pipeline (0.38: behind the whole FIFO, median 5 s).
 			s_ps4_lane.push(get_create_info, vs_inputs, fs_inputs, flags, callback);
 			return {};
 		}
@@ -682,6 +912,24 @@ namespace vk
 			g_pipeline_cache = pipe_cache;
 		}
 
+#ifdef RPCS3_PS4
+		// Read before the workers start: each picks its loop from these. A translation posted while the workers run the
+		// 0.38 loop (shader-translate-async.flag created after this point) is taken back by the renderer thread.
+		namespace sm = utils::ps4::safe_mode;
+		const bool ps4_lane = sm::enabled(sm::feature::interp_lane);
+		const bool ps4_translate_async = fs::is_file(utils::ps4::rsx_programs::translate_async_flag);
+		s_ps4_lane_enabled.release(ps4_lane);
+		s_ps4_loop_v039.release(ps4_lane || ps4_translate_async);
+
+		if (!s_ps4_pipelines_first_read)
+		{
+			s_ps4_pipelines_first_read = true;
+			s_ps4_pipelines_first.release(sm::enabled(sm::feature::pipelines_first));
+		}
+
+		const bool ps4_first = s_ps4_pipelines_first.load();
+#endif
+
 		// Create the thread pool
 		g_pipe_compilers = std::make_unique<named_thread_group<pipe_compiler>>("RSX.W", num_worker_threads);
 		g_num_pipe_compilers = num_worker_threads;
@@ -703,12 +951,17 @@ namespace vk
 			ps4_startup_checkpoint("RSX: pipeline compile jobs run without the memory governor's compile slots (rsx-compile-no-slot.flag)");
 		}
 
-		const bool lane = !fs::is_file(utils::ps4::rsx_programs::interp_no_lane_flag);
-		s_ps4_lane_enabled.release(lane);
-		ps4_startup_checkpoint(fmt::format("RSX: %u pipeline worker(s); %s%s", num_worker_threads,
-			compile_slot ? fmt::format("compile jobs take a memory governor compile slot from memory level %d up; ", utils::ps4::rsx_programs::compile_slot_level) : std::string(),
-			lane ? "shader interpreter links run before queued game pipelines (interp-no-lane.flag: in the queue)"
-				: "shader interpreter links wait in the pipeline queue (interp-no-lane.flag)").c_str());
+		const bool rules_v039 = sm::enabled(sm::feature::governor_v039);
+		ps4_startup_checkpoint(fmt::format("RSX: %u pipeline worker(s); %s%s; %s", num_worker_threads,
+			!compile_slot ? std::string()
+				: rules_v039 ? fmt::format("compile jobs take a memory governor compile slot from memory level %d up (0.39 governor rules); ", utils::ps4::rsx_programs::compile_slot_level)
+				: std::string("compile jobs take a memory governor compile slot, serialised with PPU/SPU compiles from memory level 1 (0.38 governor rules); "),
+			ps4_first ? "one shared queue; game pipelines first, shader interpreter links when no game pipeline is queued, at most 1 at a time (pipelines_first on: pipelines-first.flag or features.txt)"
+				: ps4_lane ? "shader interpreter links run before queued game pipelines (interp_lane on: interp-lane.flag or features.txt)"
+				: "shader interpreter links wait in the pipeline queue (0.38 default; interp-lane.flag: a priority lane)",
+			ps4_first ? (ps4_lane ? "workers take one job at a time from the shared queue (the interp_lane priority lane is not used)" : "workers take one job at a time from the shared queue")
+				: s_ps4_loop_v039.load() ? "workers also drain the interpreter lane and program translations"
+				: "workers run the 0.38 loop").c_str());
 
 		const bool fast_pipelines = fs::is_file("/data/rpcs3/vk-fast-pipelines.flag");
 		s_ps4_fast_pipelines.release(fast_pipelines);
@@ -745,7 +998,12 @@ namespace vk
 		// destroyed.
 		pipe_compiler::ps4_drop_lane();
 		pipe_compiler::ps4_drop_translations();
+		pipe_compiler::ps4_drop_shared();
 		rsx::g_ps4_rsx_counters.pipe_pending.release(0);
+
+		// The next renderer reads pipelines_first again
+		s_ps4_pipelines_first_read = false;
+		s_ps4_pipelines_first.release(false);
 #endif
 
 		if (g_pipeline_cache)

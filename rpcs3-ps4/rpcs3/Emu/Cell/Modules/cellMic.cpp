@@ -1283,6 +1283,11 @@ error_code cellMicGetFormatDsp(s32 dev_num, vm::ptr<CellMicInputFormatI> format)
 
 error_code cellMicSetNotifyEventQueue(u64 key)
 {
+#ifdef RPCS3_PS4
+	// Called in a probe loop by some games (Mortal Kombat Komplete); the first 3 per process say it all
+	static atomic_t<u32> s_ps4_n = 0;
+	if (s_ps4_n++ < 3)
+#endif
 	cellMic.todo("cellMicSetNotifyEventQueue(key=0x%llx)", key);
 
 	auto& mic_thr = g_fxo->get<mic_thread>();

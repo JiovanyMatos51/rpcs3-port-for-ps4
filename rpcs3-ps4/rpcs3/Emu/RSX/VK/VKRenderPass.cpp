@@ -9,6 +9,11 @@
 #ifdef RPCS3_PS4
 #include "Emu/RSX/RSXThread.h"
 #include "util/ps4_gpu_health.hpp"
+#include "util/ps4_rsx_programs.hpp"
+
+// Start of the executable's code (OpenOrbis link script): .text starts at ELF address 0, so 'address - __text_start'
+// is the ELF address a symbolizer reads.
+extern char __text_start[];
 #endif
 
 namespace vk
@@ -448,6 +453,14 @@ namespace vk
 		// 0.36: render-pass closes by cause for the 10 s 'RSX gameplay' line (every frame; any thread).
 		const u32 cause = utils::ps4::gpu::t_rp_close_cause;
 		rsx::g_ps4_rsx_counters.rp_close[cause < rsx::ps4_rp_close_cause_count ? cause : rsx::ps4_rp_close_other]++;
+
+		if (cause == rsx::ps4_rp_close_other || cause >= rsx::ps4_rp_close_cause_count)
+		{
+			// No caller named a cause: the calling site (ELF address) is counted, so the line names it
+			const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+			const u64 base = reinterpret_cast<u64>(__text_start);
+			utils::ps4::rsx_programs::g_rp_close_callers.note(caller > base ? caller - base : 0);
+		}
 #endif
 	}
 

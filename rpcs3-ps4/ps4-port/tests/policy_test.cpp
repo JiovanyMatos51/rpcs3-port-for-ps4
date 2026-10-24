@@ -19,21 +19,34 @@
 // Settings format 2: the 'PS4 user settings:' pins (parser, writer, keys, read_pins), their precedence at boot (profile,
 // database entry, rows, migration, Modo frio vs every-mode rows, console / runtime / hardware limits, global vs game),
 // the pins line of startup.log, the user-tuned marker with a format-2 file, and the four application console limits.
+// 0.40: the 0.38 defaults behind their feature rows (34 ms reserve, strict OpenGL pair, English (US) as the automatic
+// game language) with their enable flags, features.txt and kill flags, profile 40 and its migrations (stamp 39 back,
+// pins kept), the 'Idioma do PS4' row value, Modo online without an RPCN account (rpcn.yml rule, offline boot, toast,
+// online-without-account.flag), the per-game safe mode at boot (items per level and kind, toasts, the policy line,
+// the level in every mode), config-database-off.flag and level 2 (the entry skipped, fallback rows), the database line
+// with the entry's settings, and the boots-left count of the safe family. Also 0.40: the command-buffer split after a
+// device loss (adapt cb_split: the stored renderer decision, the adapt line, the toast, 8 boots), a thread failure that
+// keeps the database entry, custom_configs/<TITLE_ID>.features, the Resolution Scale cap, the platform step (OpenGL
+// legacy recompiler without gl-async.flag), the disk cache bound from the free space, the 'settings:' line with the
+// emulator pass merged and the once-per-build toast, and legacy_choices().
 //
 // The RPCS3 config tree and file system are replaced by tests/policy-mocks (same setting names, value spellings
 // and bounds; /data/rpcs3 flag files live in memory). The adaptation files use their real I/O in a directory
-// created next to the test, which the test removes again.
+// created next to the test, which the test removes again; so do the feature row files of util/ps4_safe_mode.hpp
+// (its own stat/fopen reads, RPCS3_PS4_SAFE_MODE_DIR).
 //
 // Build and run from any scratch directory (llvm-mingw, already used for the other host tests):
 //   clang++ -std=c++20 -static -Wall -Wextra -I ps4-port/tests/policy-mocks -I rpcs3 ps4-port/tests/policy_test.cpp -o policy_test.exe
 //   policy_test.exe
 
 #define RPCS3_PS4_ADAPT_DIR "policy-test-adapt"
+#define RPCS3_PS4_SAFE_MODE_DIR "policy-test-safe"
 #include "util/ps4_policy.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -105,10 +118,38 @@ unsigned boot_lines(std::string_view title)
     return n;
 }
 
+// 0.40: a feature row file (enable or kill flag, features.txt, safe-mode.flag) of util/ps4_safe_mode.hpp, real I/O.
+void safe_file(const char* name, bool on, std::string_view text = {})
+{
+    std::error_code ec;
+    const std::filesystem::path path = std::filesystem::path(RPCS3_PS4_SAFE_MODE_DIR) / name;
+    if (!on)
+    {
+        std::filesystem::remove(path, ec);
+        return;
+    }
+    std::filesystem::create_directories(RPCS3_PS4_SAFE_MODE_DIR, ec);
+    std::ofstream(path, std::ios::binary) << text;
+}
+
+// An rpcn.yml with an account (an NPID and a derived password), in the fs mock's config directory.
+void give_rpcn_account(bool on = true)
+{
+    if (on)
+        fs::test_files()[rpcn_config_path()] = "Version: 2\nHost: np.rpcs3.net\nNPID: Maestro_77\n"
+                                               "Password: 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\nToken: \"\"\n";
+    else fs::test_files().erase(rpcn_config_path());
+}
+
 void reset_state()
 {
     fs::test_files().clear();
     config_db::forget();
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(RPCS3_PS4_SAFE_MODE_DIR, ec);
+    }
+    safe_mode::set_boot_enables(0);
     // cool-mode.flag is read through the real file system (util/ps4_cool_mode.hpp); the tests set its cached state.
     cool_mode::detail::state().store(0, std::memory_order_relaxed);
     g_checkpoints.clear();
@@ -167,6 +208,7 @@ void test_online_flag_with_old_yaml()
     for (const int mode : {0, 1, 2}) // automatic, user-tuned, automatic configuration off
     {
         reset_state();
+        give_rpcn_account();
         CHECK(set_online_enabled(true));
         CHECK(online_enabled());
         if (mode == 1) CHECK(set_user_tuned(minecraft, true));
@@ -190,6 +232,7 @@ void test_online_flag_with_old_yaml()
 
     // UPnP: only with its switch and only while online.
     reset_state();
+    give_rpcn_account();
     CHECK(set_online_enabled(true) && set_upnp_enabled(true) && upnp_enabled());
     {
         cfg_root cfg;
@@ -210,6 +253,373 @@ void test_online_flag_with_old_yaml()
     }
     CHECK(set_upnp_enabled(false) && !upnp_enabled());
     CHECK(set_upnp_enabled(false)); // removing a missing flag is not an error
+}
+
+// 0.40: Modo online without an RPCN account boots offline (no NP sign-in can work; Minecraft waited for its world
+// server forever with the network up and NP offline). The account rule reads rpcn.yml as text, never writes it.
+void test_online_without_account()
+{
+    // The rule
+    const std::string password(64, 'A');
+    CHECK(rpcn_account_present_in("Version: 2\nNPID: Maestro_77\nPassword: " + password + "\n"));
+    CHECK(rpcn_account_present_in("NPID: \"Maestro_77\"\r\nPassword: '" + std::string(64, 'f') + "'\r\n"));
+    CHECK(!rpcn_account_present_in("Version: 2\nNPID: \"\"\nPassword: " + password + "\n"));          // no NPID
+    CHECK(!rpcn_account_present_in("Version: 2\nNPID: Maestro_77\nPassword: \"\"\n"));               // no password
+    CHECK(!rpcn_account_present_in("Version: 2\nNPID: Maestro_77\nPassword: hunter2\n"));            // a typed password
+    CHECK(!rpcn_account_present_in("Version: 2\nNPID: Maestro_77\nPassword: " + std::string(64, 'G') + "\n"));
+    CHECK(!rpcn_account_present_in("Version: 1\nNPID: Maestro_77\nPassword: " + password + "\n"));   // load() clears it
+    CHECK(!rpcn_account_present_in("") && !rpcn_account_present_in("Host: np.rpcs3.net\n"));
+    CHECK(!rpcn_account_present_in("Account:\n  NPID: Maestro_77\n  Password: " + password + "\n")); // top-level keys only
+
+    // The switch on, no rpcn.yml: offline, one line, one toast per boot from the XMB, rpcn.yml never created
+    reset_state();
+    CHECK(set_online_enabled(true));
+    {
+        cfg_root cfg;
+        std::vector<change> changes;
+        const policy_result r = boot(cfg, minecraft, &changes);
+        CHECK(!r.online && r.online_no_account && !r.online_skipped);
+        CHECK(cfg.net.net_active.get() == np_internet_status::disabled && cfg.net.psn_status.get() == np_psn_status::disabled);
+        const change* c = find_named(changes, "Internet enabled");
+        CHECK(!c || c->why.find("no RPCN account") != std::string::npos);
+        CHECK(contains(g_checkpoints, "Política PS4 para BLUS31426: online RPCN sem conta (offline neste boot), UPnP desligado"));
+        CHECK(g_toasts.size() == 1 && contains(g_toasts, "RPCS3: Modo online sem conta RPCN: BLUS31426 abre offline"));
+        CHECK(!fs::is_file(rpcn_config_path()));
+        CHECK(!read_runtime_inputs(minecraft).rpcn_account);
+    }
+    // A YAML that says Connected (a PC copy) gets the same
+    {
+        cfg_root cfg;
+        cfg.net.net_active.set(np_internet_status::enabled);
+        cfg.net.psn_status.set(np_psn_status::psn_rpcn);
+        const policy_result r = boot(cfg, minecraft);
+        CHECK(!r.online && cfg.net.net_active.get() == np_internet_status::disabled);
+    }
+    // A relaunch of the running game: no second toast
+    {
+        CHECK(adapt::set_title(minecraft));
+        g_toasts.clear();
+        cfg_root cfg;
+        boot(cfg, minecraft);
+        CHECK(g_toasts.empty());
+        adapt::clear_title();
+    }
+    // The preview: offline, no line, no toast
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = apply_boot_policy_preview(cfg, minecraft, [](const cfg::_base&, const std::string&, std::string_view) {});
+        CHECK(r.online_no_account && cfg.net.net_active.get() == np_internet_status::disabled && g_checkpoints.empty() && g_toasts.empty());
+    }
+    // online-without-account.flag: the 0.39 state (the network up, NP offline at sign-in)
+    safe_file("online-without-account.flag", true);
+    {
+        cfg_root cfg;
+        const policy_result r = boot(cfg, minecraft);
+        CHECK(r.online && !r.online_no_account && cfg.net.net_active.get() == np_internet_status::enabled);
+    }
+    safe_file("online-without-account.flag", false);
+    // With an account: online
+    give_rpcn_account();
+    {
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, minecraft);
+        CHECK(r.online && !r.online_no_account && cfg.net.psn_status.get() == np_psn_status::psn_rpcn && g_toasts.empty());
+        CHECK(read_runtime_inputs(minecraft).rpcn_account);
+    }
+    // The switch off: offline, no account question at all
+    give_rpcn_account(false);
+    CHECK(set_online_enabled(false));
+    {
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, minecraft);
+        CHECK(!r.online && !r.online_no_account && g_toasts.empty() && read_runtime_inputs(minecraft).rpcn_account);
+    }
+    // A title on the lighter thread budget stays offline for that reason, not for the account
+    CHECK(set_online_enabled(true));
+    CHECK(adapt::append(minecraft, adapt::key_threads_low));
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, minecraft);
+        CHECK(r.online_skipped && !r.online_no_account && contains(g_checkpoints, "online pulado (limite de threads)"));
+    }
+    reset_state();
+}
+
+// 0.40: the per-game safe mode at boot: the level and kind of the adapt file (util/ps4_adapt.hpp safe_status), the boot
+// items of each level (util/ps4_safe_mode.hpp items_for), the policy line, the toast that replaces the adaptation
+// toast, the level in every mode (for set_for_boot), the global safe mode, the expiry after 8 boots.
+void test_safe_mode_boot()
+{
+    using safe_mode::fail_kind;
+    i18n::apply(i18n::setting::automatic, -1);
+    reset_state();
+    give_rpcn_account();
+    CHECK(set_online_enabled(true));
+    const auto at_level = [](const char* title, const char* fail, const char* level)
+    {
+        adapt::remove(title);
+        CHECK(adapt::append(title, fail) && adapt::append(title, level));
+    };
+    // The same title without a level: online, two compile threads, the interpreter
+    cfg_root base;
+    CHECK(boot(base, terraria).online && base.core.llvm_threads.get() == 2 && base.video.shadermode.get() == shader_mode::async_with_interpreter);
+
+    // Level 1 after a crash: feature rows only (no boot item); the toast names the failure instead of the adjustments
+    at_level(terraria, adapt::key_fail_crash, adapt::key_safe1);
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, terraria);
+        CHECK(r.safe_level == 1 && r.safe_kind == fail_kind::crash);
+        CHECK(r.online && cfg.core.llvm_threads.get() == 2 && cfg.video.shader_compiler_threads_count.get() == 2);
+        CHECK(cfg.video.shadermode.get() == shader_mode::async_with_interpreter);
+        CHECK(contains(g_checkpoints, " · modo seguro nível 1 (erro fatal, este boot e mais 7)"));
+        CHECK(contains(g_checkpoints, "adapt: BLUS31537 keys fail=crash,safe=1 (this boot and 7 more):"));
+        CHECK(g_toasts.size() == 1 && g_toasts[0] == "RPCS3: BLUS31537 falhou da última vez (erro fatal): abrindo no modo seguro, nível 1 de 3");
+        // the next boot counts down
+        g_checkpoints.clear();
+        cfg_root again;
+        boot(again, terraria);
+        CHECK(contains(g_checkpoints, " · modo seguro nível 1 (erro fatal, este boot e mais 6)"));
+    }
+    // Level 1 after a thread failure: the lighter thread budget (online off, one compile thread)
+    at_level(terraria, adapt::key_fail_threads, adapt::key_safe1);
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        cfg.net.net_active.set(np_internet_status::enabled); // a YAML that was online: the change names the reason
+        std::vector<change> changes;
+        const policy_result r = boot(cfg, terraria, &changes);
+        CHECK(r.safe_level == 1 && r.safe_kind == fail_kind::threads && r.online_skipped && !r.online);
+        CHECK(cfg.net.net_active.get() == np_internet_status::disabled);
+        CHECK(cfg.core.llvm_threads.get() == 1 && cfg.video.shader_compiler_threads_count.get() == 1);
+        const change* c = nullptr;
+        for (const change& item : changes)
+            if (item.name == "Max LLVM Compile Threads") c = &item; // the last change: after the profile's
+        CHECK(c && c->kind == change_kind::adapt && c->why == "per-game safe mode level 1 (threads): one compile thread");
+        c = find_named(changes, "Internet enabled");
+        CHECK(c && c->kind == change_kind::adapt && c->why == "online skipped for this title: per-game safe mode level 1 (threads)");
+        CHECK(contains(g_checkpoints, "Política PS4 para BLUS31537: online pulado (modo seguro nível 1), UPnP desligado"));
+        CHECK(contains(g_checkpoints, " · modo seguro nível 1 (falta de threads, este boot e mais 7)"));
+        CHECK(contains(g_checkpoints, "(this boot and 7 more): llvm_threads=1 shader_threads=1 online=skipped"));
+        CHECK(g_toasts.size() == 1 && g_toasts[0] == "RPCS3: BLUS31537 falhou da última vez (falta de threads): abrindo no modo seguro, nível 1 de 3");
+    }
+    // Level 1 after a GPU failure: the Async Recompiler
+    at_level(terraria, adapt::key_fail_gpu, adapt::key_safe1);
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        std::vector<change> changes;
+        const policy_result r = boot(cfg, terraria, &changes);
+        CHECK(r.online && cfg.core.llvm_threads.get() == 2 && cfg.video.shadermode.get() == shader_mode::async_recompiler);
+        const change* c = find_named(changes, "Shader Mode");
+        CHECK(c && c->kind == change_kind::adapt && c->why.find("(per-game safe mode level 1 (gpu)): async recompiler after a GPU hang") != std::string::npos);
+        CHECK(contains(g_checkpoints, " · shader=Async Recompiler (multi-threaded) (async recompiler after a GPU hang: per-game safe mode level 1 (gpu))"));
+    }
+    // Level 2 after a stall: online off and one compile thread whatever the failure, the shader mode stays
+    at_level(terraria, adapt::key_fail_stall, adapt::key_safe2);
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, terraria);
+        CHECK(r.safe_level == 2 && r.safe_kind == fail_kind::stall && r.online_skipped);
+        CHECK(cfg.core.llvm_threads.get() == 1 && cfg.video.shadermode.get() == shader_mode::async_with_interpreter);
+        CHECK(contains(g_checkpoints, "online pulado (modo seguro nível 2)") && contains(g_checkpoints, " · modo seguro nível 2 (travou sem progresso, "));
+        CHECK(g_toasts.size() == 1 && g_toasts[0] == "RPCS3: BLUS31537 falhou da última vez (travou sem progresso): abrindo no modo seguro, nível 2 de 3");
+    }
+    // Level 3: also the Async Recompiler without the shader interpreter, whatever the failure
+    at_level(terraria, adapt::key_fail_crash, adapt::key_safe3);
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        std::vector<change> changes;
+        boot(cfg, terraria, &changes);
+        CHECK(cfg.video.shadermode.get() == shader_mode::async_recompiler && cfg.core.llvm_threads.get() == 1);
+        const change* c = find_named(changes, "Shader Mode");
+        CHECK(c && c->why == "per-game safe mode level 3 (crash): async recompiler without the shader interpreter");
+        CHECK(contains(g_checkpoints, "(async recompiler without the shader interpreter: per-game safe mode level 3 (crash))"));
+    }
+    // Level 3 failed again in a later session: the toast asks for the logs
+    adapt::remove(terraria);
+    CHECK(adapt::append(terraria, adapt::key_fail_crash) && adapt::append(terraria, adapt::key_safe3) && adapt::note_boot(terraria) &&
+        adapt::append(terraria, adapt::key_fail_crash) && adapt::append(terraria, adapt::key_safe3));
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(contains(g_checkpoints, ": o nível 3 falhou de novo"));
+        CHECK(g_toasts.size() == 1 && g_toasts[0] == "RPCS3: BLUS31537 falhou também no modo seguro nível 3: envie startup.log e RPCS3.log");
+    }
+    // The player's level (the per-game row): its own toast; 'Desligado' (safe=0) forgets every earlier level
+    adapt::remove(terraria);
+    CHECK(adapt::set_user_level(terraria, 2));
+    {
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, terraria);
+        CHECK(r.safe_level == 2 && r.safe_kind == fail_kind::user && !r.online);
+        CHECK(g_toasts.size() == 1 && g_toasts[0] == "RPCS3: BLUS31537 abre no modo seguro, nível 2 de 3 (escolhido por você)");
+    }
+    CHECK(adapt::set_user_level(terraria, 0));
+    {
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, terraria);
+        CHECK(r.safe_level == 0 && r.online && cfg.core.llvm_threads.get() == 2 && g_toasts.empty());
+    }
+    // English interface: the toast and the failure name follow it; the policy line stays in Portuguese
+    i18n::apply(i18n::setting::en, -1);
+    at_level(terraria, adapt::key_fail_gpu, adapt::key_safe2);
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(g_toasts.size() == 1 && g_toasts[0] == "RPCS3: BLUS31537 failed last time (the GPU hung): starting in safe mode, level 2 of 3");
+        CHECK(contains(g_checkpoints, " · modo seguro nível 2 (a GPU travou, este boot e mais 7)"));
+    }
+    i18n::apply(i18n::setting::automatic, -1);
+    // The preview: the level, no line, no toast, no boot counted
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        const unsigned boots = boot_lines(terraria);
+        cfg_root cfg;
+        const policy_result r = apply_boot_policy_preview(cfg, terraria, [](const cfg::_base&, const std::string&, std::string_view) {});
+        CHECK(r.safe_level == 2 && r.safe_kind == fail_kind::gpu && cfg.core.llvm_threads.get() == 1);
+        CHECK(g_checkpoints.empty() && g_toasts.empty() && boot_lines(terraria) == boots);
+    }
+    // keep-user-settings.flag: no setting changes, the level still goes to set_for_boot (the feature rows are code paths)
+    // and its boot counts toward the expiry
+    fs::test_files()[keep_user_settings_flag] = "";
+    {
+        const unsigned boots = boot_lines(terraria);
+        cfg_root cfg;
+        const policy_result r = boot(cfg, terraria);
+        CHECK(r.mode == policy_mode::keep_user_settings && r.safe_level == 2 && r.safe_kind == fail_kind::gpu && cfg.core.llvm_threads.get() == 0);
+        CHECK(boot_lines(terraria) == boots + 1);
+    }
+    fs::test_files().erase(keep_user_settings_flag);
+    // Expiry: 8 boots from the XMB at the level, then none (and the file goes)
+    at_level(terraria, adapt::key_fail_crash, adapt::key_safe1);
+    for (int i = 0; i < 8; i++)
+    {
+        cfg_root cfg;
+        CHECK(boot(cfg, terraria).safe_level == 1);
+    }
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, terraria);
+        CHECK(r.safe_level == 0 && g_toasts.empty() && contains(g_checkpoints, "adapt: BLUS31537: no active adjustment left, file removed"));
+        CHECK(adapt::read_text(terraria).empty());
+    }
+    // The global safe mode: level 1 for every game, no boot item, the policy line says so
+    safe_file("safe-mode.flag", true);
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, terraria);
+        CHECK(r.safe_level == 0 && r.online && cfg.core.llvm_threads.get() == 2 && g_toasts.empty());
+        CHECK(contains(g_checkpoints, " · modo seguro global (safe-mode.flag)"));
+        CHECK(read_runtime_inputs(terraria).global_safe && !feature_on(read_runtime_inputs(terraria), safe_mode::feature::live_cheats));
+    }
+    at_level(terraria, adapt::key_fail_threads, adapt::key_safe1);
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, terraria);
+        CHECK(r.safe_level == 1 && r.online_skipped && contains(g_checkpoints, " · modo seguro nível 1 (falta de threads, este boot e mais 7) · modo seguro global"));
+    }
+    reset_state();
+}
+
+void write_database(std::initializer_list<std::pair<std::string_view, std::string_view>> games);
+
+// 0.40: config-database-off.flag, or the per-game safe mode from level 2, skips the title's PC config database entry:
+// the title runs as without a database, its fallback rows included; every boot decides again.
+void test_config_db_skip()
+{
+    constexpr char sonic[] = "BLES00750";
+    reset_state();
+    write_database({{sonic, "Video:\n  MSAA: Disabled\n  Write Color Buffers: true\n  Strict Rendering Mode: true"}});
+    const auto strict = [&](database_use use, bool expect_strict)
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        std::vector<change> changes;
+        const policy_result r = boot(cfg, sonic, &changes);
+        CHECK(r.database.use == use && r.database.entry);
+        CHECK(cfg.video.strict_rendering_mode.get() == expect_strict);
+        // the fallback row holds MSAA and Write Color Buffers without the entry
+        CHECK(cfg.video.antialiasing_level.get() == msaa_level::none && cfg.video.write_color_buffers.get());
+        const change* c = find_named(changes, "MSAA");
+        CHECK(c && (use == database_use::applied ? is_database_reason(c->why) : c->why.find("no usable database entry") != std::string::npos));
+        return r;
+    };
+    strict(database_use::applied, true);
+    CHECK(contains(g_checkpoints, "config database: applied BLES00750: MSAA=Disabled, Write Color Buffers=true, Strict Rendering Mode=true · 3 keys, 3 value(s) changed"));
+    safe_file("config-database-off.flag", true);
+    strict(database_use::skipped, false);
+    CHECK(contains(g_checkpoints, "config database: BLES00750 entry skipped (config-database-off.flag): the title runs as without a database (its fallback rows included)"));
+    CHECK(!config_db::has_entry(sonic));
+    safe_file("config-database-off.flag", false);
+    strict(database_use::applied, true);
+    CHECK(config_db::has_entry(sonic));
+    // Level 1 keeps the entry, level 2 skips it; the global safe mode is level 1
+    CHECK(adapt::append(sonic, adapt::key_fail_crash) && adapt::append(sonic, adapt::key_safe1));
+    strict(database_use::applied, true);
+    CHECK(adapt::append(sonic, adapt::key_fail_stall) && adapt::append(sonic, adapt::key_safe2));
+    strict(database_use::skipped, false);
+    CHECK(contains(g_checkpoints, "config database: BLES00750 entry skipped (per-game safe mode level 2 (stall)): the title runs as without a database"));
+    adapt::remove(sonic);
+    safe_file("safe-mode.flag", true);
+    strict(database_use::applied, true);
+    safe_file("safe-mode.flag", false);
+    // A user-tuned game never gets the entry; the line says why it is not used
+    safe_file("config-database-off.flag", true);
+    CHECK(set_user_tuned(sonic, true));
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        const policy_result r = boot(cfg, sonic);
+        CHECK(r.database.use == database_use::skipped && contains(g_checkpoints, "config database: BLES00750 entry skipped (config-database-off.flag)"));
+    }
+    CHECK(set_user_tuned(sonic, false));
+    // Automatic configuration off, a game without its own YAML: skipped too
+    CHECK(set_auto_config_enabled(false));
+    {
+        cfg_root cfg;
+        const policy_result r = boot(cfg, sonic);
+        CHECK(r.database.use == database_use::skipped && !cfg.video.strict_rendering_mode.get());
+    }
+    CHECK(set_auto_config_enabled(true));
+    safe_file("config-database-off.flag", false);
+
+    // The settings an entry lists: sections by indentation, quotes, comments, a set's items
+    const std::vector<policy_detail::entry_item> items = policy_detail::entry_items(
+        "Core:\n  PPU Decoder: Interpreter (static) # slow\n  Libraries Control:\n    - libvdec.sprx:lle\n    - \"libfs.sprx:hle\"\nVideo:\n"
+        "  Vulkan:\n    Force FIFO present mode: true\n  Resolution: '1280x720'\n# end\n");
+    CHECK(items.size() == 4);
+    if (items.size() == 4)
+    {
+        CHECK(items[0].key == "Core > PPU Decoder" && items[0].value == "Interpreter (static)");
+        CHECK(items[1].key == "Core > Libraries Control" && items[1].value == "libvdec.sprx:lle, libfs.sprx:hle");
+        CHECK(items[2].key == "Video > Vulkan > Force FIFO present mode" && items[2].value == "true");
+        CHECK(items[3].key == "Video > Resolution" && items[3].value == "1280x720");
+    }
+    reset_state();
 }
 
 void test_keep_user_settings()
@@ -401,6 +811,7 @@ void test_adapt_expiry_and_relaunch()
 void test_threads_low_skips_online()
 {
     reset_state();
+    give_rpcn_account(); // 0.40: without an account every title would stay offline for that reason
     CHECK(set_online_enabled(true));
     CHECK(adapt::append(demons_souls_eu, adapt::key_threads_low));
     {
@@ -1005,7 +1416,9 @@ void test_config_db_automatic()
         CHECK(c && is_database_reason(c->why) && count_named(changes, "Accurate ZCULL stats") == 1);
         CHECK(r.title_changes == 3);
         CHECK(contains(g_checkpoints, "config database: /data/rpcs3/config_database.dat (timestamp 1784200630, 2 titles); no bundled copy"));
-        CHECK(contains(g_checkpoints, "config database: applied BCUS98232 (5 keys), 3 value(s) changed"));
+        // 0.40: the entry's settings with what runs
+        CHECK(contains(g_checkpoints, "config database: applied BCUS98232: Accurate RSX reservation access=true, Sleep Timers Accuracy=As Host, "
+            "Write Color Buffers=true, Accurate ZCULL stats=false, Relaxed ZCULL Sync=false · 5 keys, 3 value(s) changed"));
     }
     // God of War III: Asynchronous Texture Streaming of its entry stays off (no transfer queue), the rest runs.
     {
@@ -1056,7 +1469,9 @@ void test_config_db_automatic()
         CHECK(!cfg.video.multithreaded_rsx.get()); // console limit after the entry
         // Write Color Buffers, Strict Rendering Mode, Multithreaded RSX, PPU Decoder, XFloat, Libraries Control.
         CHECK(r.database.changes == 6 && r.database.keys == 8);
-        CHECK(contains(g_checkpoints, "config database: applied BLUS31426 (8 keys), 6 value(s) changed (capped on PS4: Resolution 1920x1080, Resolution Scale 150)"));
+        CHECK(contains(g_checkpoints, "config database: applied BLUS31426: Resolution=1920x1080 (capped), Resolution Scale=150 (capped), "
+            "Write Color Buffers=true, Strict Rendering Mode=true, Multithreaded RSX=true (capped), PPU Decoder=Interpreter (static), "
+            "SPU XFloat Accuracy=Accurate, Libraries Control=libvdec.sprx:lle · 8 keys, 6 value(s) changed (capped on PS4: Resolution 1920x1080, Resolution Scale 150)"));
         // The entry's Multithreaded RSX is an unavailable option: one startup.log line.
         CHECK(contains(g_checkpoints, "console limit: 'Multithreaded RSX' = 'false' (was 'true'): unsafe on PS4"));
         const change* lib = find_named(changes, "Libraries Control");
@@ -1093,9 +1508,21 @@ void test_config_db_automatic()
         CHECK(cfg.video.shader_compiler_threads_count.get() <= 2);
     }
     {
+        // 0.40: the entry's mode stays as asked, but without gl-async.flag the OpenGL renderer runs the legacy recompiler:
+        // the boot's platform step says so (it ran at renderer start before)
         cfg_root cfg;
-        boot(cfg, terraria);
-        CHECK(cfg.video.renderer.get() == video_renderer::opengl && cfg.video.shadermode.get() == shader_mode::async_with_interpreter);
+        std::vector<change> changes;
+        boot(cfg, terraria, &changes);
+        CHECK(cfg.video.renderer.get() == video_renderer::opengl && cfg.video.shadermode.get() == shader_mode::recompiler);
+        const change* c = nullptr;
+        for (const change& item : changes)
+            if (item.name == "Shader Mode") c = &item;
+        CHECK(c && c->kind == change_kind::console && c->old == "Async Recompiler with Shader Interpreter" && c->why.starts_with(platform_reason_prefix));
+        fs::test_files()[gl_async_flag] = "";
+        cfg_root with_flag;
+        boot(with_flag, terraria);
+        CHECK(with_flag.video.renderer.get() == video_renderer::opengl && with_flag.video.shadermode.get() == shader_mode::async_with_interpreter);
+        fs::test_files().erase(gl_async_flag);
     }
 
     // An entry with a key or value this build does not know: none of it runs (PC drops it), the title is rejected
@@ -1790,13 +2217,19 @@ void test_profile_defaults_037()
         const policy_result r = boot(cfg, minecraft);
         CHECK(cfg.video.relaxed_zcull_sync.get() && !cfg.video.precise_zpass_count.get() && r.database.changes == 2);
     }
-    // An OpenGL entry that names the PC default Shader Mode keeps it (it named one).
+    // An OpenGL entry that names the PC default Shader Mode keeps it (it named one); 0.40: it runs as named with
+    // gl-async.flag, else the platform step gives the legacy recompiler the renderer would switch to
     reset_state();
     write_database({{minecraft, "Video:\n  Renderer: OpenGL\n  Shader Mode: Async Recompiler with Shader Interpreter"}});
     {
         cfg_root cfg;
         boot(cfg, minecraft);
-        CHECK(cfg.video.renderer.get() == video_renderer::opengl && cfg.video.shadermode.get() == shader_mode::async_with_interpreter);
+        CHECK(cfg.video.renderer.get() == video_renderer::opengl && cfg.video.shadermode.get() == shader_mode::recompiler);
+        fs::test_files()[gl_async_flag] = "";
+        cfg_root with_flag;
+        boot(with_flag, minecraft);
+        CHECK(with_flag.video.renderer.get() == video_renderer::opengl && with_flag.video.shadermode.get() == shader_mode::async_with_interpreter);
+        fs::test_files().erase(gl_async_flag);
     }
 }
 
@@ -1811,8 +2244,8 @@ void test_profile_migration()
     CHECK(saved_profile_version("PS4 automatic profile: \"38\"\r\nVideo:\r\n") == 38);
     CHECK(saved_profile_version("PS4 automatic profile2: 37\nPS4 automatic profile: x\n") == 0);
     CHECK(saved_profile_version("PS4 automatic profile 37\n") == 0);
-    CHECK(with_profile_stamp("Core:\n  PPU Threads: 2") == "Core:\n  PPU Threads: 2\nPS4 automatic profile: 39\n");
-    CHECK(with_profile_stamp("Video:\n") == "Video:\nPS4 automatic profile: 39\n");
+    CHECK(with_profile_stamp("Core:\n  PPU Threads: 2") == "Core:\n  PPU Threads: 2\nPS4 automatic profile: 40\n");
+    CHECK(with_profile_stamp("Video:\n") == "Video:\nPS4 automatic profile: 40\n");
     CHECK(saved_profile_version(with_profile_stamp("Video:\n  Renderer: Vulkan")) == automatic_profile_version);
     {
         cfg_root cfg; // a config load skips the stamp like any unknown key
@@ -1845,10 +2278,10 @@ void test_profile_migration()
         CHECK(cfg.video.shadermode.get() == shader_mode::async_with_interpreter);
         CHECK(!cfg.video.relaxed_zcull_sync.get() && cfg.video.precise_zpass_count.get());
         CHECK(cfg.video.write_color_buffers.get()); // the player's choice stays
-        CHECK(contains(g_checkpoints, "profile: 'Shader Mode' saved by automatic profile <=36 ('Async Recompiler (multi-threaded)') -> 39 "
+        CHECK(contains(g_checkpoints, "profile: 'Shader Mode' saved by automatic profile <=36 ('Async Recompiler (multi-threaded)') -> 40 "
             "('Async Recompiler with Shader Interpreter')"));
-        CHECK(contains(g_checkpoints, "profile: 'Relaxed ZCULL Sync' saved by automatic profile <=36 ('true') -> 39 ('false')"));
-        CHECK(contains(g_checkpoints, "profile: 'Accurate ZCULL stats' saved by automatic profile <=36 ('false') -> 39 ('true')"));
+        CHECK(contains(g_checkpoints, "profile: 'Relaxed ZCULL Sync' saved by automatic profile <=36 ('true') -> 40 ('false')"));
+        CHECK(contains(g_checkpoints, "profile: 'Accurate ZCULL stats' saved by automatic profile <=36 ('false') -> 40 ('true')"));
         const change* c = find_named(changes, "Shader Mode");
         CHECK(c && c->kind == change_kind::migration && c->why.find("automatic profile <=36") != std::string::npos);
     }
@@ -1874,8 +2307,24 @@ void test_profile_migration()
         const policy_result r = boot(cfg, mk);
         CHECK(r.migrated_changes == 0 && cfg.video.shadermode.get() == shader_mode::recompiler);
     }
-    // OpenGL: the old profile never forced the asynchronous mode there, so it stays; 0.39: the relaxed ZCULL pair is the
-    // OpenGL profile's value, so nothing migrates (zcull-strict-gl.flag: the pair migrates to strict as on Vulkan).
+    // OpenGL: the old profile never forced the asynchronous mode there, so it does not migrate (0.40: without
+    // gl-async.flag the platform step runs the legacy recompiler, as the renderer would at start); 0.40: the strict
+    // pair is the OpenGL value again (0.38), so the old relaxed pair migrates as on Vulkan, also with
+    // zcull-strict-gl.flag; with gl-relaxed-zcull.flag (the 0.39 behaviour) the relaxed pair is the OpenGL value and
+    // nothing migrates.
+    for (const char* file : {static_cast<const char*>(nullptr), "zcull-strict-gl.flag"})
+    {
+        if (file) safe_file(file, true);
+        cfg_root cfg;
+        CHECK(cfg.from_string(mk_yaml));
+        cfg.video.renderer.set(video_renderer::opengl);
+        const policy_result r = boot(cfg, mk);
+        CHECK(r.migrated_changes == 2 && cfg.video.shadermode.get() == shader_mode::recompiler);
+        CHECK(!cfg.video.relaxed_zcull_sync.get() && cfg.video.precise_zpass_count.get());
+        if (file) safe_file(file, false);
+    }
+    safe_file("gl-relaxed-zcull.flag", true);
+    fs::test_files()[gl_async_flag] = "";
     {
         cfg_root cfg;
         CHECK(cfg.from_string(mk_yaml));
@@ -1884,15 +2333,8 @@ void test_profile_migration()
         CHECK(r.migrated_changes == 0 && cfg.video.shadermode.get() == shader_mode::async_recompiler);
         CHECK(cfg.video.relaxed_zcull_sync.get() && !cfg.video.precise_zpass_count.get());
     }
-    fs::test_files()[zcull_strict_gl_flag] = "";
-    {
-        cfg_root cfg;
-        CHECK(cfg.from_string(mk_yaml));
-        cfg.video.renderer.set(video_renderer::opengl);
-        const policy_result r = boot(cfg, mk);
-        CHECK(r.migrated_changes == 2 && !cfg.video.relaxed_zcull_sync.get() && cfg.video.precise_zpass_count.get());
-    }
-    fs::test_files().erase(zcull_strict_gl_flag);
+    fs::test_files().erase(gl_async_flag);
+    safe_file("gl-relaxed-zcull.flag", false);
     // The escape files: their value is the current profile value, so nothing migrates for them.
     fs::test_files()[zcull_relaxed_flag] = "";
     {
@@ -1993,7 +2435,7 @@ void test_profile_migration()
         const policy_result r = boot(cfg, terraria);
         CHECK(r.mode == policy_mode::auto_config_off && r.migrated_changes == 3);
         CHECK(cfg.video.shadermode.get() == shader_mode::async_with_interpreter && !cfg.video.relaxed_zcull_sync.get());
-        CHECK(contains(g_checkpoints, "profile: 'Relaxed ZCULL Sync' saved by automatic profile <=36 ('true') -> 39 ('false')"));
+        CHECK(contains(g_checkpoints, "profile: 'Relaxed ZCULL Sync' saved by automatic profile <=36 ('true') -> 40 ('false')"));
     }
     {
         g_checkpoints.clear();
@@ -2104,7 +2546,7 @@ void test_bundled_database()
         const change* c = find_named(changes, "Write Color Buffers");
         CHECK(c && is_database_reason(c->why)); // the entry, not the fallback row
         CHECK(contains(g_checkpoints, "config database: bundled /app0/config_database.dat (timestamp 1784200630, 2 titles); /data copy absent"));
-        CHECK(contains(g_checkpoints, "config database: applied BCUS98232 (5 keys), 3 value(s) changed"));
+        CHECK(contains(g_checkpoints, "Relaxed ZCULL Sync=false · 5 keys, 3 value(s) changed"));
         CHECK(!contains(g_checkpoints, "not present"));
     }
     {
@@ -2234,56 +2676,142 @@ void ps4_startup_checkpoint(const char* stage)
     g_checkpoints.emplace_back(stage ? stage : "");
 }
 
-// 0.39: the 64 ms audio reserve and its migration, the OpenGL ZCULL pair and gl-async.flag, the interpreter warning
-// and the game language row.
-void test_audio_reserve_039()
+// 0.39: the OpenGL ZCULL pair and gl-async.flag, the interpreter warning and the game language row.
+// 0.40: the audio reserve is 34 ms again unless audio_reserve_64 (audio-reserve-64.flag, features.txt); a title at a
+// safe-mode level and the global safe mode run 34 ms whatever the opt-in says. Profile 40 migrates the 64 ms that
+// profile 39 saved back to 34 ms, never a pinned value; with the opt-in, the 0.39 migration of 34 ms saves runs.
+void test_audio_reserve_040()
 {
     reset_state();
+    const auto reserve = [](const char* title)
     {
-        cfg_root cfg; // the profile: 64 ms
+        cfg_root cfg;
+        boot(cfg, title);
+        return cfg.audio.desired_buffer_duration.get();
+    };
+    {
+        cfg_root cfg; // the profile: 34 ms, the upstream value of 0.29-0.38
         std::vector<change> changes;
         boot(cfg, minecraft, &changes);
-        CHECK(cfg.audio.desired_buffer_duration.get() == 64);
+        CHECK(cfg.audio.desired_buffer_duration.get() == 34);
         const change* c = find_named(changes, "Desired Audio Buffer Duration");
-        CHECK(c && c->kind == change_kind::profile && c->old == "100" && c->now == "64");
+        CHECK(c && c->kind == change_kind::profile && c->old == "100" && c->now == "34");
     }
-    // A save from 0.29-0.38 (unstamped or stamped 37) with the 34 ms those profiles forced: 64 ms; a later save keeps it.
-    for (const bool stamped : {false, true})
+    safe_file("audio-reserve-64.flag", true);
+    CHECK(reserve(minecraft) == 64);
+    // A safe-mode level of the title, or the global safe mode, turns the opt-in off
+    CHECK(adapt::append(minecraft, adapt::key_fail_crash) && adapt::append(minecraft, adapt::key_safe1));
+    CHECK(reserve(minecraft) == 34 && reserve(terraria) == 64);
+    adapt::remove(minecraft);
+    safe_file("safe-mode.flag", true);
+    CHECK(reserve(minecraft) == 34);
+    safe_file("safe-mode.flag", false);
+    safe_file("audio-reserve-64.flag", false);
+    for (const char* text : {"audio_reserve_64\n", "# test\r\nAudio-Reserve-64\r\n", "all\n", "audio-reserve-64.flag"})
+    {
+        safe_file("features.txt", true, text);
+        CHECK(reserve(minecraft) == 64);
+    }
+    safe_file("features.txt", true, "audio_continuity\n");
+    CHECK(reserve(minecraft) == 34);
+    safe_file("features.txt", false);
+
+    // A save from 0.29-0.38 (unstamped or stamped 37) with the 34 ms those profiles forced: runs as saved (0.38); with
+    // the opt-in, 64 ms as in 0.39, and a later save keeps the player's 34 ms.
+    for (const bool opt_in : {false, true})
+        for (const bool stamped : {false, true})
+        {
+            reset_state();
+            if (opt_in) safe_file("audio-reserve-64.flag", true);
+            cfg_root saved;
+            boot(saved, terraria);
+            saved.audio.desired_buffer_duration.set(34);
+            saved.video.write_color_buffers.set(true); // the player's choice keeps the marker meaningful
+            std::string yaml = saved.to_string();
+            if (stamped) yaml += "PS4 automatic profile: 37\n";
+            CHECK(set_user_tuned(terraria, true));
+            fs::test_files()[rpcs3::utils::get_custom_config_path(terraria)] = yaml;
+            cfg_root cfg;
+            CHECK(cfg.from_string(yaml));
+            const policy_result r = boot(cfg, terraria);
+            CHECK(r.mode == policy_mode::user_tuned && r.migrated_changes == (opt_in ? 1u : 0u));
+            CHECK(cfg.audio.desired_buffer_duration.get() == (opt_in ? 64 : 34));
+            CHECK(contains(g_checkpoints, "profile: 'Desired Audio Buffer Duration' saved by automatic profile <=37 ('34') -> 40 ('64')") == opt_in);
+            fs::test_files()[rpcs3::utils::get_custom_config_path(terraria)] = with_profile_stamp(saved.to_string());
+            cfg_root again;
+            CHECK(again.from_string(saved.to_string()));
+            CHECK(boot(again, terraria).migrated_changes == 0 && again.audio.desired_buffer_duration.get() == 34);
+        }
+
+    // Profile 40: a YAML stamped 39 holding the 64 ms that profile forced goes back to 34 ms; stamped 40 (a 0.40 save) it
+    // is the player's value; with the opt-in it stays.
+    for (const unsigned stamp : {39u, 40u})
+        for (const bool opt_in : {false, true})
+        {
+            reset_state();
+            if (opt_in) safe_file("audio-reserve-64.flag", true);
+            cfg_root saved;
+            boot(saved, terraria);
+            saved.audio.desired_buffer_duration.set(64);
+            saved.video.write_color_buffers.set(true);
+            const std::string yaml = saved.to_string() + "PS4 automatic profile: " + std::to_string(stamp) + "\n";
+            CHECK(set_user_tuned(terraria, true));
+            fs::test_files()[rpcs3::utils::get_custom_config_path(terraria)] = yaml;
+            cfg_root cfg;
+            CHECK(cfg.from_string(yaml));
+            const policy_result r = boot(cfg, terraria);
+            const bool back = stamp == 39 && !opt_in;
+            CHECK(r.mode == policy_mode::user_tuned && r.migrated_changes == (back ? 1u : 0u));
+            CHECK(cfg.audio.desired_buffer_duration.get() == (back ? 34 : 64));
+            CHECK(contains(g_checkpoints, "profile: 'Desired Audio Buffer Duration' saved by automatic profile 39 ('64') -> 40 ('34')") == back);
+        }
+
+    // Never a pinned value: the global ps4-settings.yml of format 2 stamped 39 that pins the reserve keeps its 64 ms
+    // (automatic configuration off, a game without its own YAML); the same file without the pin migrates.
+    for (const bool pinned : {true, false})
     {
         reset_state();
         cfg_root saved;
-        boot(saved, terraria);
-        saved.audio.desired_buffer_duration.set(34);
-        saved.video.write_color_buffers.set(true); // the player's choice keeps the marker meaningful
-        std::string yaml = saved.to_string();
-        if (stamped) yaml += "PS4 automatic profile: 37\n";
-        CHECK(set_user_tuned(terraria, true));
-        fs::test_files()[rpcs3::utils::get_custom_config_path(terraria)] = yaml;
+        boot(saved, "");
+        saved.audio.desired_buffer_duration.set(64);
+        std::string yaml = policy_detail::strip_ps4_keys(saved.to_string());
+        yaml += "PS4 automatic profile: 39\nPS4 settings format: 2\n";
+        yaml += pinned ? "PS4 user settings:\n  - \"Audio > Desired Audio Buffer Duration\"\n" : "PS4 user settings: []\n";
+        CHECK(set_auto_config_enabled(false));
+        fs::test_files()[global_settings_path] = yaml;
         cfg_root cfg;
         CHECK(cfg.from_string(yaml));
         const policy_result r = boot(cfg, terraria);
-        CHECK(r.mode == policy_mode::user_tuned && r.migrated_changes == 1 && cfg.audio.desired_buffer_duration.get() == 64);
-        CHECK(contains(g_checkpoints, "profile: 'Desired Audio Buffer Duration' saved by automatic profile <=37 ('34') -> 39 ('64')"));
-        fs::test_files()[rpcs3::utils::get_custom_config_path(terraria)] = with_profile_stamp(saved.to_string());
-        cfg_root again;
-        CHECK(again.from_string(saved.to_string()));
-        CHECK(boot(again, terraria).migrated_changes == 0 && again.audio.desired_buffer_duration.get() == 34);
+        CHECK(r.mode == policy_mode::auto_config_off && r.migrated_changes == (pinned ? 0u : 1u));
+        CHECK(cfg.audio.desired_buffer_duration.get() == (pinned ? 64 : 34));
     }
     reset_state();
 }
 
-void test_opengl_profile_039()
+// 0.40: OpenGL runs the strict ZCULL pair of 0.38 unless gl_relaxed_zcull (gl-relaxed-zcull.flag; zcull-strict-gl.flag
+// is its kill flag); profile 40 puts the relaxed pair profile 39 saved into OpenGL YAMLs back to strict.
+void test_opengl_profile_040()
 {
     reset_state();
     {
-        cfg_root cfg; // Ben 10's OpenGL row: the relaxed pair, the legacy recompiler of its row
+        cfg_root cfg; // Ben 10's OpenGL row: the strict pair (0.38), the legacy recompiler of its row
         std::vector<change> changes;
         boot(cfg, ben10, &changes);
         CHECK(cfg.video.renderer.get() == video_renderer::opengl && cfg.video.shadermode.get() == shader_mode::recompiler);
+        CHECK(!cfg.video.relaxed_zcull_sync.get() && cfg.video.precise_zpass_count.get());
+        CHECK(!find_named(changes, "Relaxed ZCULL Sync"));
+        CHECK(contains(g_checkpoints, " · OpenGL ZCULL strict · ") && !contains(g_checkpoints, "(gl_relaxed_zcull)"));
+    }
+    safe_file("gl-relaxed-zcull.flag", true);
+    {
+        g_checkpoints.clear();
+        cfg_root cfg; // the 0.39 behaviour: the relaxed pair
+        std::vector<change> changes;
+        boot(cfg, ben10, &changes);
         CHECK(cfg.video.relaxed_zcull_sync.get() && !cfg.video.precise_zpass_count.get());
         const change* c = find_named(changes, "Relaxed ZCULL Sync");
         CHECK(c && c->kind == change_kind::profile);
-        CHECK(contains(g_checkpoints, " · OpenGL ZCULL relaxed"));
+        CHECK(contains(g_checkpoints, " · OpenGL ZCULL relaxed (gl_relaxed_zcull)"));
     }
     {
         g_checkpoints.clear();
@@ -2292,31 +2820,38 @@ void test_opengl_profile_039()
         CHECK(!cfg.video.relaxed_zcull_sync.get() && cfg.video.precise_zpass_count.get());
         CHECK(!contains(g_checkpoints, "OpenGL ZCULL"));
     }
-    fs::test_files()[zcull_strict_gl_flag] = "";
+    safe_file("zcull-strict-gl.flag", true);
     {
-        cfg_root cfg;
+        g_checkpoints.clear();
+        cfg_root cfg; // the kill flag wins over the opt-in
         boot(cfg, ben10);
         CHECK(!cfg.video.relaxed_zcull_sync.get() && cfg.video.precise_zpass_count.get());
         CHECK(contains(g_checkpoints, " · OpenGL ZCULL strict (zcull-strict-gl.flag)"));
     }
     reset_state();
-    // A database entry that selects OpenGL: the OpenGL pair for each ZCULL setting the entry does not write
-    write_database({{minecraft, "Video:\n  Renderer: OpenGL"}, {terraria, "Video:\n  Renderer: OpenGL\n  Relaxed ZCULL Sync: false"}});
+    // A database entry that selects OpenGL: with the opt-in, the relaxed OpenGL pair for each ZCULL setting the entry
+    // does not write; without it, the strict pair
+    for (const bool opt_in : {false, true})
     {
-        cfg_root cfg;
-        std::vector<change> changes;
-        boot(cfg, minecraft, &changes);
-        CHECK(cfg.video.renderer.get() == video_renderer::opengl && cfg.video.shadermode.get() == shader_mode::recompiler);
-        CHECK(cfg.video.relaxed_zcull_sync.get() && !cfg.video.precise_zpass_count.get());
-        const change* c = nullptr;
-        for (const auto& item : changes)
-            if (item.name == "Relaxed ZCULL Sync") c = &item;
-        CHECK(c && is_database_reason(c->why) && c->kind == change_kind::title);
-    }
-    {
-        cfg_root cfg;
-        boot(cfg, terraria);
-        CHECK(!cfg.video.relaxed_zcull_sync.get() && !cfg.video.precise_zpass_count.get());
+        reset_state();
+        if (opt_in) safe_file("gl-relaxed-zcull.flag", true);
+        write_database({{minecraft, "Video:\n  Renderer: OpenGL"}, {terraria, "Video:\n  Renderer: OpenGL\n  Relaxed ZCULL Sync: false"}});
+        {
+            cfg_root cfg;
+            std::vector<change> changes;
+            boot(cfg, minecraft, &changes);
+            CHECK(cfg.video.renderer.get() == video_renderer::opengl && cfg.video.shadermode.get() == shader_mode::recompiler);
+            CHECK(cfg.video.relaxed_zcull_sync.get() == opt_in && cfg.video.precise_zpass_count.get() == !opt_in);
+            const change* c = nullptr;
+            for (const auto& item : changes)
+                if (item.name == "Relaxed ZCULL Sync") c = &item;
+            CHECK(opt_in ? (c && is_database_reason(c->why) && c->kind == change_kind::title) : !c);
+        }
+        {
+            cfg_root cfg;
+            boot(cfg, terraria);
+            CHECK(!cfg.video.relaxed_zcull_sync.get() && cfg.video.precise_zpass_count.get() == !opt_in);
+        }
     }
     // gl-async.flag: such an entry gets the asynchronous recompiler
     fs::test_files()[gl_async_flag] = "";
@@ -2331,32 +2866,62 @@ void test_opengl_profile_039()
     }
     fs::test_files().erase(gl_async_flag);
     CHECK(profile_opengl_shader_mode() == shader_mode::recompiler);
-    CHECK(profile_zcull_relaxed(video_renderer::opengl) && !profile_zcull_relaxed(video_renderer::vulkan));
-    // An OpenGL save that profile 37 stamped with the strict pair it forced: the OpenGL pair; a Vulkan one keeps it.
-    for (const bool gl : {true, false})
-    {
-        reset_state();
-        cfg_root saved;
-        boot(saved, terraria);
-        saved.video.renderer.set(gl ? video_renderer::opengl : video_renderer::vulkan);
-        saved.video.relaxed_zcull_sync.set(false);
-        saved.video.precise_zpass_count.set(true);
-        const std::string yaml = saved.to_string() + "PS4 automatic profile: 37\n";
-        CHECK(set_user_tuned(terraria, true));
-        fs::test_files()[rpcs3::utils::get_custom_config_path(terraria)] = yaml;
-        cfg_root cfg;
-        CHECK(cfg.from_string(yaml));
-        const policy_result r = boot(cfg, terraria);
-        CHECK(r.migrated_changes == (gl ? 2u : 0u));
-        CHECK(cfg.video.relaxed_zcull_sync.get() == gl && cfg.video.precise_zpass_count.get() == !gl);
-        if (gl) CHECK(contains(g_checkpoints, "profile: 'Relaxed ZCULL Sync' saved by automatic profile <=37 ('false') -> 39 OpenGL ('true')"));
-        // zcull-strict-gl.flag keeps the saved strict pair
-        fs::test_files()[zcull_strict_gl_flag] = "";
-        cfg_root strict;
-        CHECK(strict.from_string(yaml));
-        CHECK(boot(strict, terraria).migrated_changes == 0 && !strict.video.relaxed_zcull_sync.get());
-        fs::test_files().erase(zcull_strict_gl_flag);
-    }
+    CHECK(profile_zcull_relaxed(video_renderer::opengl) && !profile_zcull_relaxed(video_renderer::vulkan)); // the opt-in is on
+    safe_file("gl-relaxed-zcull.flag", false);
+    CHECK(!profile_zcull_relaxed(video_renderer::opengl) && !profile_zcull_relaxed(video_renderer::vulkan));
+    CHECK(profile_zcull_relaxed(video_renderer::opengl, safe_mode::bit(safe_mode::feature::gl_relaxed_zcull)));
+    // An OpenGL save that profile 37 stamped with the strict pair it forced: runs as saved (0.38); with the opt-in, the
+    // relaxed OpenGL pair (0.39); a Vulkan one keeps it; the kill flag keeps it too.
+    for (const bool opt_in : {false, true})
+        for (const bool gl : {true, false})
+        {
+            reset_state();
+            if (opt_in) safe_file("gl-relaxed-zcull.flag", true);
+            cfg_root saved;
+            boot(saved, terraria);
+            saved.video.renderer.set(gl ? video_renderer::opengl : video_renderer::vulkan);
+            saved.video.relaxed_zcull_sync.set(false);
+            saved.video.precise_zpass_count.set(true);
+            const std::string yaml = saved.to_string() + "PS4 automatic profile: 37\n";
+            CHECK(set_user_tuned(terraria, true));
+            fs::test_files()[rpcs3::utils::get_custom_config_path(terraria)] = yaml;
+            cfg_root cfg;
+            CHECK(cfg.from_string(yaml));
+            const policy_result r = boot(cfg, terraria);
+            const bool relax = gl && opt_in;
+            CHECK(r.migrated_changes == (relax ? 2u : 0u));
+            CHECK(cfg.video.relaxed_zcull_sync.get() == relax && cfg.video.precise_zpass_count.get() == !relax);
+            CHECK(contains(g_checkpoints, "profile: 'Relaxed ZCULL Sync' saved by automatic profile <=37 ('false') -> 40 OpenGL ('true')") == relax);
+            safe_file("zcull-strict-gl.flag", true);
+            cfg_root strict;
+            CHECK(strict.from_string(yaml));
+            CHECK(boot(strict, terraria).migrated_changes == 0 && !strict.video.relaxed_zcull_sync.get());
+            safe_file("zcull-strict-gl.flag", false);
+        }
+    // Profile 40: the relaxed pair profile 39 forced into an OpenGL save goes back to strict; a Vulkan save stamped 39
+    // with that pair is the player's choice, and the opt-in keeps the OpenGL one.
+    for (const bool opt_in : {false, true})
+        for (const bool gl : {true, false})
+        {
+            reset_state();
+            if (opt_in) safe_file("gl-relaxed-zcull.flag", true);
+            cfg_root saved;
+            boot(saved, terraria);
+            saved.video.renderer.set(gl ? video_renderer::opengl : video_renderer::vulkan);
+            saved.video.relaxed_zcull_sync.set(true);
+            saved.video.precise_zpass_count.set(false);
+            const std::string yaml = saved.to_string() + "PS4 automatic profile: 39\n";
+            CHECK(set_user_tuned(terraria, true));
+            fs::test_files()[rpcs3::utils::get_custom_config_path(terraria)] = yaml;
+            cfg_root cfg;
+            CHECK(cfg.from_string(yaml));
+            const policy_result r = boot(cfg, terraria);
+            const bool back = gl && !opt_in;
+            CHECK(r.migrated_changes == (back ? 2u : 0u));
+            CHECK(cfg.video.relaxed_zcull_sync.get() == !back && cfg.video.precise_zpass_count.get() == back);
+            CHECK(contains(g_checkpoints, "profile: 'Relaxed ZCULL Sync' saved by automatic profile 39 ('true') -> 40 ('false')") == back);
+            CHECK(contains(g_checkpoints, "profile: 'Accurate ZCULL stats' saved by automatic profile 39 ('false') -> 40 ('true')") == back);
+        }
     reset_state();
 }
 
@@ -2444,6 +3009,13 @@ void test_game_language_039()
     CHECK(set_game_language("", game_language_auto) && !fs::is_file(game_language_path));
     CHECK(set_game_language(terraria, 17) && read_game_language(terraria).value == 17);
 
+    // 0.40: 'ps4' (Idioma do PS4)
+    CHECK(parse_game_language("ps4\n") == game_language_system && !parse_game_language("PS4"));
+    CHECK(set_game_language("", game_language_system) && fs::test_files()[game_language_path] == "ps4\n");
+    CHECK(read_game_language(minecraft).value == game_language_system && read_game_language(minecraft).source == game_language_source::global);
+    CHECK(set_game_language(minecraft, game_language_system) && fs::test_files()[game_language_marker(minecraft)] == "ps4\n");
+    CHECK(set_game_language("", game_language_auto) && !fs::is_file(game_language_path));
+
     // Automatic before the interface language is known: English (US), the upstream default (nothing changes)
     reset_state();
     {
@@ -2451,10 +3023,20 @@ void test_game_language_039()
         std::vector<change> changes;
         boot(cfg, minecraft, &changes);
         CHECK(cfg.sys.language.get() == CellSysutilLang{1} && !find_named(changes, "Language"));
-        CHECK(contains(g_checkpoints, " · idioma do jogo English (US) (auto, PS4 -1)"));
+        CHECK(contains(g_checkpoints, " · idioma do jogo English (US) (auto)"));
     }
-    // A Portuguese (Brazil) PS4 with the interface automatic: Portuguese (Brazil), as a runtime change
+    // 0.40: a Portuguese (Brazil) PS4 with the interface automatic: 'Automático' is still English (US), as in 0.25-0.38
     i18n::apply(i18n::setting::automatic, 17);
+    {
+        cfg_root cfg;
+        std::vector<change> changes;
+        boot(cfg, minecraft, &changes);
+        CHECK(cfg.sys.language.get() == CellSysutilLang{1} && !find_named(changes, "Language"));
+        CHECK(contains(g_checkpoints, " · idioma do jogo English (US) (auto)"));
+        CHECK(read_runtime_inputs(minecraft).game_language_auto == 1 && read_runtime_inputs(minecraft).game_language_system == 17);
+    }
+    // features.txt game_language_ps4: the 0.39 automatic value (the PS4 language), as a runtime change
+    safe_file("features.txt", true, "game_language_ps4\n");
     {
         cfg_root cfg;
         std::vector<change> changes;
@@ -2463,7 +3045,7 @@ void test_game_language_039()
         const change* c = find_named(changes, "Language");
         CHECK(c && c->kind == change_kind::runtime && c->old == "English (US)" && c->now == "Portuguese (Brazil)");
         CHECK(r.runtime_changes >= 1);
-        CHECK(contains(g_checkpoints, " · idioma do jogo Portuguese (Brazil) (auto, PS4 17)"));
+        CHECK(contains(g_checkpoints, " · idioma do jogo Portuguese (Brazil) (auto, PS4 17: game_language_ps4)"));
     }
     {
         cfg_root cfg; // a language written into the YAML by hand stays with the automatic value
@@ -2472,6 +3054,46 @@ void test_game_language_039()
         CHECK(cfg.sys.language.get() == CellSysutilLang{2});
         CHECK(contains(g_checkpoints, " · idioma do jogo French (YAML)"));
     }
+    safe_file("features.txt", false);
+    // The row value 'Idioma do PS4' (global or this game's): the PS4 language; it turns game_language_ps4 on for the
+    // boot (the features line of set_for_boot names it); a safe-mode level, or the global safe mode, turns it off
+    for (const bool global : {true, false})
+    {
+        CHECK(set_game_language(global ? std::string_view{} : std::string_view{minecraft}, game_language_system));
+        cfg_root cfg;
+        std::vector<change> changes;
+        boot(cfg, minecraft, &changes);
+        CHECK(cfg.sys.language.get() == CellSysutilLang{17});
+        const change* c = find_named(changes, "Language");
+        CHECK(c && c->why.find("Idioma do PS4") != std::string::npos);
+        CHECK(contains(g_checkpoints, " · idioma do jogo Portuguese (Brazil) (Idioma do PS4, PS4 17)"));
+        CHECK(safe_mode::detail::g_boot_enables.load() == safe_mode::bit(safe_mode::feature::game_language_ps4));
+        // the preview leaves the boot's enables alone
+        safe_mode::set_boot_enables(0);
+        cfg_root preview;
+        apply_boot_policy_preview(preview, minecraft, [](const cfg::_base&, const std::string&, std::string_view) {});
+        CHECK(preview.sys.language.get() == CellSysutilLang{17} && safe_mode::detail::g_boot_enables.load() == 0);
+        CHECK(set_game_language(global ? std::string_view{} : std::string_view{minecraft}, global ? std::optional<std::int32_t>(game_language_auto) : std::nullopt));
+    }
+    CHECK(set_game_language(minecraft, game_language_system));
+    CHECK(adapt::append(minecraft, adapt::key_fail_gpu) && adapt::append(minecraft, adapt::key_safe1));
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        boot(cfg, minecraft);
+        CHECK(cfg.sys.language.get() == CellSysutilLang{1});
+        CHECK(contains(g_checkpoints, " · idioma do jogo English (US) (auto: Idioma do PS4 desligado pelo modo seguro)"));
+        CHECK(!read_runtime_inputs(minecraft).game_language_system_on);
+    }
+    adapt::remove(minecraft);
+    safe_file("safe-mode.flag", true);
+    {
+        cfg_root cfg;
+        boot(cfg, minecraft);
+        CHECK(cfg.sys.language.get() == CellSysutilLang{1});
+    }
+    safe_file("safe-mode.flag", false);
+    CHECK(set_game_language(minecraft, std::nullopt));
     // The global choice wins over the YAML, the game's marker over the global choice
     CHECK(set_game_language("", 4));
     {
@@ -2490,17 +3112,23 @@ void test_game_language_039()
     }
     CHECK(set_game_language(minecraft, game_language_auto));
     {
-        cfg_root cfg; // the game's 'auto' over a global choice: the PS4 language
+        cfg_root cfg; // the game's 'auto' over a global choice: English (US) (0.40)
         boot(cfg, minecraft);
-        CHECK(cfg.sys.language.get() == CellSysutilLang{17});
+        CHECK(cfg.sys.language.get() == CellSysutilLang{1});
     }
-    // An interface language chosen explicitly decides the automatic value (Spanish -> Spanish)
-    CHECK(set_game_language(minecraft, std::nullopt) && set_game_language("", game_language_auto));
+    // An interface language chosen explicitly decides the 0.39 automatic value (Spanish -> Spanish): 'Idioma do PS4'
+    CHECK(set_game_language(minecraft, std::nullopt) && set_game_language("", game_language_system));
     i18n::apply(i18n::setting::es, 17);
     {
         cfg_root cfg;
         boot(cfg, minecraft);
         CHECK(cfg.sys.language.get() == CellSysutilLang{3});
+    }
+    CHECK(set_game_language("", game_language_auto));
+    {
+        cfg_root cfg;
+        boot(cfg, minecraft);
+        CHECK(cfg.sys.language.get() == CellSysutilLang{1});
     }
     // keep-user-settings.flag: nothing
     fs::test_files()[keep_user_settings_flag] = "";
@@ -2627,15 +3255,15 @@ void test_pin_format()
     // Writer: the stamp keys last, the list deduplicated; a second save replaces them; an empty document is dropped.
     const std::string stamped = with_settings_stamp("Video:\n  Write Color Buffers: true\n",
         {"Video > Write Color Buffers", "Video > Write Color Buffers", "Core > SPU Block Size", ""});
-    CHECK(stamped == "Video:\n  Write Color Buffers: true\nPS4 automatic profile: 39\nPS4 settings format: 2\nPS4 user settings:\n"
+    CHECK(stamped == "Video:\n  Write Color Buffers: true\nPS4 automatic profile: 40\nPS4 settings format: 2\nPS4 user settings:\n"
                      "  - \"Video > Write Color Buffers\"\n  - \"Core > SPU Block Size\"\n");
     CHECK(saved_profile_version(stamped) == automatic_profile_version && saved_settings_format(stamped) == 2);
     CHECK(pins_of(stamped) == keys({"Video > Write Color Buffers", "Core > SPU Block Size"}));
     CHECK(with_settings_stamp(stamped, {"Audio > Enable Buffering"}) ==
-        "Video:\n  Write Color Buffers: true\nPS4 automatic profile: 39\nPS4 settings format: 2\nPS4 user settings:\n  - \"Audio > Enable Buffering\"\n");
-    CHECK(with_settings_stamp(with_profile_stamp("Video:\n"), {}) == "Video:\nPS4 automatic profile: 39\nPS4 settings format: 2\nPS4 user settings: []\n");
-    CHECK(with_settings_stamp("{}\n", {}) == "PS4 automatic profile: 39\nPS4 settings format: 2\nPS4 user settings: []\n");
-    CHECK(with_settings_stamp("", {"Video > Renderer"}) == "PS4 automatic profile: 39\nPS4 settings format: 2\nPS4 user settings:\n  - \"Video > Renderer\"\n");
+        "Video:\n  Write Color Buffers: true\nPS4 automatic profile: 40\nPS4 settings format: 2\nPS4 user settings:\n  - \"Audio > Enable Buffering\"\n");
+    CHECK(with_settings_stamp(with_profile_stamp("Video:\n"), {}) == "Video:\nPS4 automatic profile: 40\nPS4 settings format: 2\nPS4 user settings: []\n");
+    CHECK(with_settings_stamp("{}\n", {}) == "PS4 automatic profile: 40\nPS4 settings format: 2\nPS4 user settings: []\n");
+    CHECK(with_settings_stamp("", {"Video > Renderer"}) == "PS4 automatic profile: 40\nPS4 settings format: 2\nPS4 user settings:\n  - \"Video > Renderer\"\n");
     CHECK(pins_of(with_settings_stamp("", {"A \"b\" \\c"})) == keys{"A \"b\" \\c"});
     {
         cfg_root cfg; // a config load skips the three keys like any unknown key
@@ -2664,7 +3292,7 @@ void test_pin_format()
         old_file.game_profile = 39;
         const pinned_settings revoked = resolve_pins(cfg, old_file, revokes);
         CHECK(revoked.game.empty() && revoked.revoked == keys{"Core > SPU Block Size=Mega"});
-        CHECK(policy_detail::pins_line("BLUS31426", revoked).find("de volta ao automático (perfil 39): Core > SPU Block Size=Mega") != std::string::npos);
+        CHECK(policy_detail::pins_line("BLUS31426", revoked).find("de volta ao automático (perfil 40): Core > SPU Block Size=Mega") != std::string::npos);
         old_file.game_profile = 40;
         CHECK(resolve_pins(cfg, old_file, revokes).game.size() == 1);
         old_file.game_profile = 39;
@@ -2844,8 +3472,14 @@ void test_pins_boot()
             boot(cfg, minecraft);
             CHECK(cfg.video.renderer.get() == video_renderer::opengl);
             CHECK(cfg.video.shadermode.get() == (gl_async ? shader_mode::async_recompiler : shader_mode::recompiler));
-            CHECK(cfg.video.relaxed_zcull_sync.get() && !cfg.video.precise_zpass_count.get());
+            CHECK(!cfg.video.relaxed_zcull_sync.get() && cfg.video.precise_zpass_count.get()); // 0.40: the strict pair
         }
+        safe_file("gl-relaxed-zcull.flag", true);
+        cfg_root cfg;
+        CHECK(cfg.from_string(text));
+        boot(cfg, minecraft);
+        CHECK(cfg.video.relaxed_zcull_sync.get() && !cfg.video.precise_zpass_count.get());
+        safe_file("gl-relaxed-zcull.flag", false);
     }
     // ... and a pinned Shader Mode next to it stays.
     {
@@ -3027,6 +3661,428 @@ void test_app_console_limits()
     }
 }
 
+// 0.40: the renderer's reader of the command-buffer split: false until a boot stores its decision, and the row
+// cb_split_after_loss (kill cb-split-off.flag) turns it off.
+void test_cb_split_reader()
+{
+    reset_state();
+    const u64 saved = safe_mode::g_on.load();
+    policy::g_cb_split_boot.store(false);
+    CHECK(!policy::cb_split_for_title());
+    policy::g_cb_split_boot.store(true);
+    safe_mode::g_on.store(safe_mode::default_mask);
+    CHECK(policy::cb_split_for_title());
+    safe_mode::g_on.store(safe_mode::default_mask & ~safe_mode::bit(safe_mode::feature::cb_split_after_loss));
+    CHECK(!policy::cb_split_for_title());
+    safe_file("cb-split-off.flag", true);
+    CHECK(!safe_mode::enabled_in(safe_mode::compute(safe_mode::read_inputs()), safe_mode::feature::cb_split_after_loss));
+    safe_file("cb-split-off.flag", false);
+    CHECK(safe_mode::enabled_in(safe_mode::compute(safe_mode::read_inputs()), safe_mode::feature::cb_split_after_loss));
+    policy::g_cb_split_boot.store(false);
+    safe_mode::g_on.store(saved);
+    CHECK(!policy::cb_split_for_title());
+}
+
+// 0.40: after a device loss (adapt cb_split, 8 boots) the boot stores the renderer's decision for that title only; the
+// adapt line names it, the toast says so on Vulkan, cb-split-off.flag keeps the key but no split.
+void test_cb_split_boot()
+{
+    reset_state();
+    CHECK(adapt::append(terraria, adapt::key_cb_split));
+    {
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(policy::g_cb_split_boot.load());
+        CHECK(contains(g_checkpoints, "adapt: BLUS31537 keys cb_split (this boot and 7 more): cb_split=384_draws"));
+        CHECK(g_toasts.size() == 1 && g_toasts[0] == "RPCS3: ajuste automatico para BLUS31537 apos falha anterior: comandos da GPU divididos (a GPU travou)");
+    }
+    // the emulator's own pass and another title: no split
+    {
+        cfg_root cfg;
+        boot(cfg, "");
+        CHECK(!policy::g_cb_split_boot.load());
+        cfg_root other;
+        boot(other, minecraft);
+        CHECK(!policy::g_cb_split_boot.load());
+    }
+    // the kill flag: the key stays, the split does not run, no toast item
+    safe_file("cb-split-off.flag", true);
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(policy::g_cb_split_boot.load()); // the stored decision; cb_split_for_title() also reads the row
+        CHECK(contains(g_checkpoints, "cb_split=off(cb-split-off.flag)") && g_toasts.empty());
+    }
+    safe_file("cb-split-off.flag", false);
+    // OpenGL: the split is a Vulkan renderer path
+    {
+        g_checkpoints.clear();
+        g_toasts.clear();
+        cfg_root cfg;
+        CHECK(set_user_tuned(terraria, true));
+        cfg.video.renderer.set(video_renderer::opengl);
+        boot(cfg, terraria);
+        CHECK(contains(g_checkpoints, "cb_split=vulkan_only") && g_toasts.empty());
+        CHECK(set_user_tuned(terraria, false));
+    }
+    // 8 boots from the XMB in all (3 above), then the key expires and the file goes
+    for (int i = 0; i < 5; i++)
+    {
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(policy::g_cb_split_boot.load());
+    }
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(!policy::g_cb_split_boot.load() && contains(g_checkpoints, "adapt: BLUS31537: no active adjustment left, file removed"));
+    }
+    // keep-user-settings.flag: nothing is forced, but the renderer path still follows the key
+    CHECK(adapt::append(terraria, adapt::key_cb_split));
+    fs::test_files()[keep_user_settings_flag] = "";
+    {
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(policy::g_cb_split_boot.load());
+    }
+    fs::test_files().erase(keep_user_settings_flag);
+    policy::g_cb_split_boot.store(false);
+    reset_state();
+}
+
+// 0.40: a title level after a thread failure keeps the title's PC config database entry (and the lazy cellMusic row);
+// any other failure skips it from level 2 as before.
+void test_kind_kept_boot()
+{
+    constexpr char sonic[] = "BLES00750";
+    reset_state();
+    write_database({{sonic, "Video:\n  MSAA: Disabled\n  Write Color Buffers: true\n  Strict Rendering Mode: true"}});
+    for (const char* fail : {adapt::key_fail_threads, adapt::key_fail_crash})
+        for (const char* level : {adapt::key_safe2, adapt::key_safe3})
+        {
+            adapt::remove(sonic);
+            CHECK(adapt::append(sonic, fail) && adapt::append(sonic, level));
+            g_checkpoints.clear();
+            cfg_root cfg;
+            const policy_result r = boot(cfg, sonic);
+            const bool threads = std::string_view(fail) == adapt::key_fail_threads;
+            CHECK(r.database.use == (threads ? database_use::applied : database_use::skipped));
+            CHECK(cfg.video.strict_rendering_mode.get() == threads);
+            const runtime_inputs in = read_runtime_inputs(sonic);
+            CHECK(feature_on(in, safe_mode::feature::config_db_entry) == threads && feature_on(in, safe_mode::feature::music_lazy) == threads);
+            CHECK(!safe_item(in, safe_mode::item::config_db_skip) == threads);
+            // the other level items still apply: online off, one compile thread
+            CHECK(cfg.core.llvm_threads.get() == 1);
+        }
+    adapt::remove(sonic);
+    reset_state();
+}
+
+// 0.40: custom_configs/<TITLE_ID>.features turns rows on for one title's boots (the 0.39 audio rules per game)
+void test_title_features_boot()
+{
+    reset_state();
+    const std::filesystem::path file = std::filesystem::path(RPCS3_PS4_SAFE_MODE_DIR) / "custom_configs" / (std::string(terraria) + ".features");
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    std::ofstream(file, std::ios::binary) << "audio_reserve_64\n";
+    {
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(cfg.audio.desired_buffer_duration.get() == 64);
+        CHECK(feature_on(read_runtime_inputs(terraria), safe_mode::feature::audio_reserve_64));
+        CHECK(safe_mode::enabled_in(policy_features(terraria), safe_mode::feature::audio_reserve_64));
+        cfg_root other;
+        boot(other, minecraft);
+        CHECK(other.audio.desired_buffer_duration.get() == 34);
+        CHECK(!safe_mode::enabled_in(policy_features(minecraft), safe_mode::feature::audio_reserve_64));
+    }
+    // a level and the global safe mode still win
+    CHECK(adapt::append(terraria, adapt::key_fail_crash) && adapt::append(terraria, adapt::key_safe1));
+    {
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(cfg.audio.desired_buffer_duration.get() == 34);
+    }
+    adapt::remove(terraria);
+    safe_file("safe-mode.flag", true);
+    {
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(cfg.audio.desired_buffer_duration.get() == 34);
+    }
+    safe_file("safe-mode.flag", false);
+    std::filesystem::remove(file, ec);
+    {
+        cfg_root cfg;
+        boot(cfg, terraria);
+        CHECK(cfg.audio.desired_buffer_duration.get() == 34);
+    }
+    reset_state();
+}
+
+// 0.40: Resolution Scale above 200 % runs at 200 % in every mode (a pin, a saved file); 150 stays; the PC database cap
+// of 100 % stays.
+void test_resolution_scale_cap()
+{
+    for (const int mode : {0, 1, 2}) // automatic with a global pin, user-tuned, automatic configuration off
+    {
+        reset_state();
+        if (mode == 1) CHECK(set_user_tuned(minecraft, true));
+        if (mode == 2) CHECK(set_auto_config_enabled(false));
+        for (const u64 asked : {u64{775}, u64{201}, u64{200}, u64{150}})
+        {
+            g_checkpoints.clear();
+            cfg_root cfg;
+            cfg.video.resolution_scale_percent.set(asked);
+            pin_set pins;
+            pins.global = {"Video > Resolution Scale"};
+            std::vector<change> changes;
+            apply_boot_policy(cfg, minecraft, [&](const cfg::_base& setting, const std::string& old, std::string_view why, change_kind kind)
+            {
+                changes.push_back({setting.get_name(), old, setting.to_string(), std::string(why), kind});
+            }, mode == 0 ? &pins : nullptr);
+            const u64 expected = std::min<u64>(asked, resolution_scale_cap_percent);
+            CHECK(cfg.video.resolution_scale_percent.get() == expected);
+            const change* c = find_named(changes, "Resolution Scale");
+            if (asked > 200)
+            {
+                CHECK(c && c->kind == change_kind::console && c->now == "200" && c->why.find("768 MB") != std::string::npos);
+                CHECK(contains(g_checkpoints, "console limit: 'Resolution Scale' = '200' (was '" + std::to_string(asked) + "'): above 200 %"));
+                CHECK(contains(g_checkpoints, "Resolution Scale " + std::to_string(asked) + "->200 (limite do PS4)"));
+            }
+            else CHECK(!c);
+        }
+    }
+    // the database cap stays 100 %
+    reset_state();
+    write_database({{minecraft, "Video:\n  Resolution Scale: 300"}});
+    {
+        cfg_root cfg;
+        boot(cfg, minecraft);
+        CHECK(cfg.video.resolution_scale_percent.get() == 100);
+    }
+    reset_state();
+}
+
+// 0.40: the platform step: OpenGL runs the legacy recompiler without gl-async.flag (Desligada and pins included); the
+// pure rules the renderers share
+void test_platform_limits()
+{
+    CHECK(platform_gl_shader_mode(shader_mode::async_with_interpreter, false) == shader_mode::recompiler);
+    CHECK(platform_gl_shader_mode(shader_mode::interpreter_only, false) == shader_mode::recompiler);
+    CHECK(platform_gl_shader_mode(shader_mode::recompiler, false) == shader_mode::recompiler);
+    CHECK(platform_gl_shader_mode(shader_mode::async_recompiler, true) == shader_mode::async_recompiler);
+    CHECK(platform_vsync_ignored(video_renderer::vulkan) && !platform_vsync_ignored(video_renderer::opengl));
+    CHECK(platform_buffering_warned(false) && !platform_buffering_warned(true));
+    reset_state();
+    CHECK(set_auto_config_enabled(false));
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        cfg.video.renderer.set(video_renderer::opengl);
+        cfg.video.shadermode.set(shader_mode::interpreter_only);
+        std::vector<change> changes;
+        const policy_result r = boot(cfg, minecraft, &changes);
+        CHECK(cfg.video.shadermode.get() == shader_mode::recompiler && r.console_changes >= 1);
+        const change* c = find_named(changes, "Shader Mode");
+        CHECK(c && c->kind == change_kind::console && c->why.starts_with(platform_reason_prefix));
+        CHECK(contains(g_checkpoints, "platform: 'Shader Mode' = 'Legacy Recompiler (single-threaded)' (was 'Shader Interpreter only'): OpenGL compiles"));
+        CHECK(contains(g_checkpoints, "Shader Mode Shader Interpreter only->Legacy Recompiler (single-threaded) (plataforma)"));
+    }
+    fs::test_files()[gl_async_flag] = "";
+    {
+        cfg_root cfg;
+        cfg.video.renderer.set(video_renderer::opengl);
+        cfg.video.shadermode.set(shader_mode::interpreter_only);
+        boot(cfg, minecraft);
+        CHECK(cfg.video.shadermode.get() == shader_mode::interpreter_only);
+    }
+    fs::test_files().erase(gl_async_flag);
+    {
+        cfg_root cfg;
+        cfg.video.shadermode.set(shader_mode::interpreter_only); // Vulkan: not a platform decision
+        boot(cfg, minecraft);
+        CHECK(cfg.video.shadermode.get() == shader_mode::interpreter_only);
+    }
+    reset_state();
+}
+
+// 0.40: the disk cache cap follows the free space of /data (10 %, 4096..16384 MB; the setting holds at most 10240);
+// disk-cache-upstream.flag keeps 4096 MB; unknown free space keeps 4096 MB.
+void test_disk_cache_cap()
+{
+    CHECK(disk_cache_cap_mb(0) == 4096 && disk_cache_cap_mb(40960) == 4096 && disk_cache_cap_mb(41000) == 4100);
+    CHECK(disk_cache_cap_mb(100000) == 10000 && disk_cache_cap_mb(163840) == 16384 && disk_cache_cap_mb(900000) == 16384);
+    CHECK(data_free_mb() == 0); // host builds: unknown
+    reset_state();
+    const auto run = [](s64 configured, u64 free_mb, std::vector<change>* changes = nullptr)
+    {
+        cfg_root cfg;
+        cfg.vfs.cache_max_size.set(configured);
+        runtime_inputs in = read_runtime_inputs(minecraft);
+        in.data_free_mb = free_mb;
+        apply_runtime_limits(cfg, in, [&](const cfg::_base& setting, const std::string& old, std::string_view why, change_kind kind)
+        {
+            if (changes) changes->push_back({setting.get_name(), old, setting.to_string(), std::string(why), kind});
+        });
+        return cfg.vfs.cache_max_size.get();
+    };
+    CHECK(run(5120, 0) == 4096);         // unknown free space: the 0.31-0.39 cap
+    CHECK(run(5120, 100000) == 5120);    // the player's (default) value inside the cap runs as it is
+    CHECK(run(10240, 100000) == 10000);  // 10 % of 100000 MB free
+    CHECK(run(10240, 200000) == 10240);  // the setting's own maximum
+    CHECK(run(10240, 30000) == 4096);    // little room: at least 4096
+    CHECK(run(0, 100000) == 1024);       // the floor
+    {
+        std::vector<change> changes;
+        run(10240, 100000, &changes);
+        const change* c = find_named(changes, "Disk cache maximum size (MB)");
+        CHECK(c && c->why == "disk cache limit kept between 1024 and 10000 MB (10 % of the free space of /data)");
+    }
+    safe_file("disk-cache-upstream.flag", true);
+    {
+        std::vector<change> changes;
+        CHECK(run(10240, 100000, &changes) == 4096);
+        const change* c = find_named(changes, "Disk cache maximum size (MB)");
+        CHECK(c && c->why == "disk cache limit kept between 1024 and 4096 MB (disk-cache-upstream.flag)");
+    }
+    safe_file("disk-cache-upstream.flag", false);
+    runtime_inputs in;
+    in.data_free_mb = 60000;
+    CHECK(disk_cache_limit_max_mb(in) == 6000);
+    reset_state();
+}
+
+// 0.40: the 'settings:' line: what the boot runs differently from the player's files and who replaced it, the emulator
+// pass's replacements of the global files merged into the game's line, upstream defaults left out; the toast about a
+// game's own format-1 values once per build version.
+void test_settings_diff()
+{
+    using policy_detail::settings_diff_line;
+    CHECK(settings_diff_line(minecraft, {}).empty());
+    {
+        std::vector<settings_diff> d(14);
+        for (std::size_t i = 0; i < d.size(); i++) d[i] = {"Video > X", "X" + std::to_string(i), "1", "2", "automático", change_kind::profile};
+        const std::string line = settings_diff_line(minecraft, d);
+        CHECK(line.starts_with("settings: BLUS31426: 14 valor(es) rodando diferente dos seus arquivos: X0 1->2 (automático), X1 1->2 (automático)"));
+        CHECK(line.find("X11 1->2 (automático) (+2)") != std::string::npos && line.find("X12") == std::string::npos);
+        CHECK(policy_detail::diff_value(std::string(60, 'a')) == std::string(37, 'a') + "..." && policy_detail::diff_value("") == "\"\"");
+    }
+    reset_state();
+    // One boot as Emulator::Init and Emulator::Load run it on one tree: the global files, the emulator pass, the game's
+    // YAML over it, the game pass
+    const auto two_passes = [](cfg_root& cfg, std::string_view global, std::string_view game)
+    {
+        CHECK(cfg.from_string(global));
+        boot(cfg, "");
+        if (!game.empty()) CHECK(cfg.from_string(game));
+        return boot(cfg, minecraft);
+    };
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        const policy_result r = two_passes(cfg, "Video:\n  Renderer: OpenGL\n  Frame limit: 30\nCore:\n  Max LLVM Compile Threads: 0\n", "Video:\n  Resolution Scale: 150\n");
+        // Renderer and Frame limit from the global file (replaced by the emulator pass), Resolution Scale from the game's
+        // YAML (the game pass); Max LLVM Compile Threads 0 is the upstream default: not the player's
+        CHECK(r.settings_diffs.size() == 3);
+        CHECK(contains(g_checkpoints, "settings: BLUS31426: 3 valor(es) rodando diferente dos seus arquivos: "));
+        CHECK(contains(g_checkpoints, "Resolution Scale 150->100 (automático)"));
+        CHECK(contains(g_checkpoints, "Renderer OpenGL->Vulkan (automático)"));
+        CHECK(contains(g_checkpoints, "Frame limit 30->Auto (automático)"));
+        CHECK(!contains(g_checkpoints, "Max LLVM Compile Threads"));
+        CHECK(r.legacy_game_values == 0); // no own YAML on disk
+    }
+    // The game's YAML sets its own value over the replaced global one: the game's value is the file value
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        two_passes(cfg, "Video:\n  Frame limit: 30\n", "Video:\n  Frame limit: 60\n");
+        CHECK(contains(g_checkpoints, "Frame limit 60->Auto (automático)") && !contains(g_checkpoints, "Frame limit 30->"));
+    }
+    // A value no step replaced is not listed; a console limit and a runtime switch name themselves
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        CHECK(set_auto_config_enabled(false));
+        two_passes(cfg, "Video:\n  Frame limit: 30\n  Multithreaded RSX: true\nNet:\n  Internet enabled: Connected\n", {});
+        CHECK(contains(g_checkpoints, "Multithreaded RSX true->false (limite do PS4)"));
+        CHECK(contains(g_checkpoints, "Internet enabled Connected->Disconnected (interruptor)"));
+        CHECK(!contains(g_checkpoints, "Frame limit"));
+        CHECK(set_auto_config_enabled(true));
+    }
+    // Nothing differs: no line; the menu's preview never prints one
+    {
+        g_checkpoints.clear();
+        cfg_root cfg;
+        two_passes(cfg, {}, {});
+        CHECK(!contains(g_checkpoints, "settings: "));
+        cfg_root preview;
+        CHECK(preview.from_string("Video:\n  Frame limit: 30\n"));
+        g_checkpoints.clear();
+        const policy_result r = apply_boot_policy_preview(preview, minecraft, [](const cfg::_base&, const std::string&, std::string_view) {});
+        CHECK(r.settings_diffs.empty() && g_checkpoints.empty());
+    }
+    // A game's own format-1 YAML whose values the automatic profile replaced: one toast per title and build version
+    const std::string game_yaml = "Video:\n  Frame limit: 30\n  Renderer: Vulkan\n";
+    fs::test_files()[rpcs3::utils::get_custom_config_path(minecraft)] = game_yaml;
+    for (int n = 0; n < 2; n++)
+    {
+        g_toasts.clear();
+        cfg_root cfg;
+        const policy_result r = two_passes(cfg, {}, game_yaml);
+        CHECK(r.legacy_game_values == 1);
+        CHECK(n == 0 ? g_toasts.size() == 1 && g_toasts[0] == "1 ajuste(s) do arquivo do jogo sem efeito · Quadrado no jogo > Converter" : g_toasts.empty());
+        adapt::clear_title();
+    }
+    CHECK(fs::test_files()[policy_detail::legacy_notice_marker(minecraft)] == std::string(ps4_build_version) + "\n");
+    // another build version shows it again; a format-2 file holds only pins and never counts
+    fs::test_files()[policy_detail::legacy_notice_marker(minecraft)] = "0.39\n";
+    {
+        g_toasts.clear();
+        cfg_root cfg;
+        two_passes(cfg, {}, game_yaml);
+        CHECK(g_toasts.size() == 1);
+    }
+    CHECK(policy_detail::legacy_game_values({{"Video > Frame limit", "Frame limit", "30", "Auto", "automático", change_kind::profile}},
+        "Video:\n  Frame limit: 30\nPS4 settings format: 2\n") == 0);
+    CHECK(policy_detail::legacy_game_values({{"Video > Frame limit", "Frame limit", "30", "Auto", "limite do PS4", change_kind::console}}, game_yaml) == 0);
+    reset_state();
+}
+
+// 0.40: the global layer's own values (format 1) that the automatic configuration replaces, for 'Usar meus valores
+// salvos': upstream defaults, pins, old profile values and console limits left out; a format-2 file has none.
+void test_legacy_choices()
+{
+    reset_state();
+    const runtime_inputs in = read_runtime_inputs({});
+    const auto choices = [&](std::string_view yaml, const std::vector<std::string>& pins = {})
+    {
+        cfg_root saved, automatic;
+        CHECK(saved.from_string(yaml) && automatic.from_string(yaml));
+        return legacy_choices(saved, automatic, in, yaml, pins);
+    };
+    const std::string yaml = "Video:\n  Renderer: OpenGL\n  Frame limit: 30\n  Multithreaded RSX: true\nCore:\n  Max LLVM Compile Threads: 0\n";
+    {
+        const std::vector<std::string> keys = choices(yaml);
+        CHECK(keys.size() == 2);
+        CHECK(std::find(keys.begin(), keys.end(), "Video > Renderer") != keys.end());
+        CHECK(std::find(keys.begin(), keys.end(), "Video > Frame limit") != keys.end());
+    }
+    CHECK(choices(yaml, {"Video > Frame limit"}) == std::vector<std::string>{"Video > Renderer"});
+    // a value an older profile froze migrates (Async Recompiler on Vulkan, stamp <= 36): not a choice
+    CHECK(choices("Video:\n  Shader Mode: Async Recompiler (multi-threaded)\n").empty());
+    CHECK(choices("Video:\n  Shader Mode: Async Recompiler (multi-threaded)\nPS4 automatic profile: 39\n") ==
+        std::vector<std::string>{"Video > Shader Mode"});
+    // a format-2 global file: its other values are what the menu showed
+    CHECK(choices(yaml + "PS4 settings format: 2\nPS4 user settings: []\n").empty());
+    CHECK(choices({}).empty());
+    reset_state();
+}
+
 int main()
 {
     std::error_code ec;
@@ -3059,8 +4115,8 @@ int main()
     test_getllar_spin_limit();
     test_bundled_database();
     test_entry_keys();
-    test_audio_reserve_039();
-    test_opengl_profile_039();
+    test_audio_reserve_040();
+    test_opengl_profile_040();
     test_interpreter_warning_039();
     test_game_language_039();
     test_automatic_config_toast();
@@ -3068,9 +4124,22 @@ int main()
     test_pins_boot();
     test_pins_modes();
     test_app_console_limits();
+    test_online_without_account();
+    test_safe_mode_boot();
+    test_config_db_skip();
+    test_cb_split_reader();
+    test_cb_split_boot();
+    test_kind_kept_boot();
+    test_title_features_boot();
+    test_resolution_scale_cap();
+    test_platform_limits();
+    test_disk_cache_cap();
+    test_settings_diff();
+    test_legacy_choices();
 
     reset_state();
     std::filesystem::remove_all(adapt::adapt_dir, ec);
+    std::filesystem::remove_all(RPCS3_PS4_SAFE_MODE_DIR, ec);
     if (g_failures)
     {
         std::fprintf(stderr, "policy test FAILED: %d check(s)\n", g_failures);

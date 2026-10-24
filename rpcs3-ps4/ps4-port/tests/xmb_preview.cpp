@@ -6,10 +6,13 @@
 #include "util/ps4_xmb.hpp"
 #include "util/ps4_xmb_dialog.hpp"
 #include "util/ps4_padlock_icon.hpp"
+#include "util/ps4_folder_icon.hpp"
+#include "util/ps4_xmb_media.hpp"
 #include "util/ps4_cfg_catalog.hpp"
 #include "util/ps4_cheats.hpp"
 #include "3rdparty/zlib/zlib/zlib.h"
 #include <cassert>
+#include <cctype>
 #include <climits>
 #include <cstdlib>
 #include <filesystem>
@@ -634,6 +637,121 @@ inline std::size_t row_named(const cheats::game_cheats& g, std::string_view name
 }
 } // namespace cheat_screens
 
+// 0.40: synthetic stand-ins for a game's own PIC1 and PIC0, made here from gradients and shapes (no game art is used or
+// stored anywhere). The launcher decodes the selected game's files and scales them to these sizes: PIC1 to 1280x720,
+// PIC0 by 720/1080 (1000x560 becomes 667x373, right-aligned and vertically centred).
+namespace media_samples
+{
+inline std::uint32_t pack(float r, float g, float b)
+{
+    const auto c = [](float v) { return std::uint32_t(std::clamp(v, 0.f, 255.f) + .5f); };
+    return 0xff000000u | (c(r) << 16) | (c(g) << 8) | c(b);
+}
+
+// 1280x720, opaque. 0: an evening sky over two ridges with a bright sun behind the selected row's title (the hard case
+// for legibility); 1: a night sky with a moon, stars and mountains.
+inline image background(int variant)
+{
+    image out{1280, 720, std::vector<std::uint32_t>(std::size_t(1280) * 720)};
+    const bool warm = variant == 0;
+    for (int y = 0; y < 720; ++y)
+        for (int x = 0; x < 1280; ++x)
+        {
+            const float u = float(x) / 1280, v = float(y) / 720;
+            float r = warm ? 70 + 180 * v : 10 + 40 * v, g = warm ? 60 + 120 * v : 20 + 70 * v, b = warm ? 140 - 40 * v : 50 + 90 * v;
+            const float sx = warm ? 760.f : 990.f, sy = warm ? 330.f : 150.f, sr = warm ? 80.f : 40.f, glow = warm ? 300.f : 140.f;
+            const float d = std::hypot(float(x) - sx, float(y) - sy);
+            const float halo = std::clamp(1 - (d - sr) / glow, 0.f, 1.f) * .6f, body = std::clamp(sr + .5f - d, 0.f, 1.f);
+            const float light = body + (1 - body) * halo * halo;
+            r += ((warm ? 255.f : 230.f) - r) * light;
+            g += ((warm ? 236.f : 236.f) - g) * light;
+            b += ((warm ? 190.f : 250.f) - b) * light;
+            if (!warm && ((x * 7919 + y * 104729) % 977) == 0 && y < 420) r = g = b = 235; // stars
+            const float ridge1 = warm ? 520 + 40 * std::sin(u * 7.1f) + 25 * std::sin(u * 17.3f) : 430 + 160 * std::abs(std::fmod(u * 5.f, 2.f) - 1.f);
+            const float ridge2 = warm ? 600 + 30 * std::sin(u * 4.3f + 1.7f) + 12 * std::sin(u * 23.f) : 560 + 70 * std::abs(std::fmod(u * 9.f + .3f, 2.f) - 1.f);
+            if (float(y) > ridge1) { r = warm ? 96 : 22; g = warm ? 52 : 36; b = warm ? 84 : 62; }
+            if (float(y) > ridge2) { r = warm ? 46 : 10; g = warm ? 26 : 18; b = warm ? 52 : 34; }
+            out.pixels[std::size_t(y) * 1280 + std::size_t(x)] = pack(r, g, b);
+        }
+    return out;
+}
+
+// 667x373, straight alpha: a translucent rounded panel with a light frame and an emblem made of a disc and bars,
+// transparent around it
+inline image overlay()
+{
+    constexpr int w = 667, h = 373;
+    image out{w, h, std::vector<std::uint32_t>(std::size_t(w) * h, 0x00d8d8e4u)};
+    const auto round_rect = [](float x, float y, float l, float t, float r, float b, float radius)
+    {
+        const float cx = std::clamp(x, l + radius, r - radius), cy = std::clamp(y, t + radius, b - radius);
+        return std::clamp(radius + .5f - std::hypot(x - cx, y - cy), 0.f, 1.f) * float(x >= l - 1 && x <= r + 1 && y >= t - 1 && y <= b + 1);
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const float px = float(x) + .5f, py = float(y) + .5f;
+            const float panel = round_rect(px, py, 24, 64, 643, 309, 18), inner = round_rect(px, py, 27, 67, 640, 306, 15);
+            float a = panel * .62f, r = 16, g = 22, b = 48;
+            const float frame = std::clamp(panel - inner, 0.f, 1.f);
+            if (frame > 0) { r += (240 - r) * frame; g += (236 - g) * frame; b += (250 - b) * frame; a += (.86f - a) * frame; }
+            const float emblem = std::clamp(62.5f - std::hypot(px - 140, py - 186), 0.f, 1.f), hole = std::clamp(40.5f - std::hypot(px - 140, py - 186), 0.f, 1.f);
+            const float ring = std::clamp(emblem - hole, 0.f, 1.f);
+            if (ring > 0) { r += (250 - r) * ring; g += (206 - g) * ring; b += (92 - b) * ring; a += (.95f - a) * ring; }
+            for (const auto& [top, length] : {std::pair{140.f, 380.f}, std::pair{182.f, 300.f}, std::pair{224.f, 340.f}})
+                if (const float bar = round_rect(px, py, 236, top, 236 + length, top + 22, 6); bar > 0)
+                {
+                    r += (246 - r) * bar; g += (244 - g) * bar; b += (252 - b) * bar; a += (.92f - a) * bar;
+                }
+            if (a <= 0) continue;
+            const auto c = [](float v) { return std::uint32_t(std::clamp(v, 0.f, 255.f) + .5f); };
+            out.pixels[std::size_t(y) * w + std::size_t(x)] = (c(a * 255) << 24) | (c(r) << 16) | (c(g) << 8) | c(b);
+        }
+    return out;
+}
+} // namespace media_samples
+
+// SHA-256 as lowercase hex (the firmware folder texture check compares the decoded ARGB with a known hash)
+inline std::string sha256_hex(std::span<const std::uint8_t> data)
+{
+    static constexpr std::array<std::uint32_t, 64> k{0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    std::array<std::uint32_t, 8> h{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    std::vector<std::uint8_t> m(data.begin(), data.end());
+    const std::uint64_t bits = std::uint64_t(data.size()) * 8;
+    m.push_back(0x80);
+    while (m.size() % 64 != 56) m.push_back(0);
+    for (int i = 7; i >= 0; --i) m.push_back(std::uint8_t(bits >> (i * 8)));
+    const auto rotr = [](std::uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+    for (std::size_t chunk = 0; chunk < m.size(); chunk += 64)
+    {
+        std::array<std::uint32_t, 64> w{};
+        for (std::size_t i = 0; i < 16; ++i)
+            w[i] = (std::uint32_t(m[chunk + i * 4]) << 24) | (std::uint32_t(m[chunk + i * 4 + 1]) << 16) | (std::uint32_t(m[chunk + i * 4 + 2]) << 8) | m[chunk + i * 4 + 3];
+        for (std::size_t i = 16; i < 64; ++i)
+        {
+            const std::uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3), s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        std::array<std::uint32_t, 8> v = h;
+        for (std::size_t i = 0; i < 64; ++i)
+        {
+            const std::uint32_t t1 = v[7] + (rotr(v[4], 6) ^ rotr(v[4], 11) ^ rotr(v[4], 25)) + ((v[4] & v[5]) ^ (~v[4] & v[6])) + k[i] + w[i];
+            const std::uint32_t t2 = (rotr(v[0], 2) ^ rotr(v[0], 13) ^ rotr(v[0], 22)) + ((v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]));
+            v = {t1 + t2, v[0], v[1], v[2], v[3] + t1, v[4], v[5], v[6]};
+        }
+        for (std::size_t i = 0; i < 8; ++i) h[i] += v[i];
+    }
+    std::string hex;
+    for (const std::uint32_t word : h)
+        for (int shift = 28; shift >= 0; shift -= 4) hex += "0123456789abcdef"[(word >> shift) & 15];
+    return hex;
+}
+
 // 0.39: the interface languages. For pt-BR, English, Spanish and Arabic: 9 screens (game column with a locked game, a long
 // message line and the footer; the Configurações column with the language row; the settings top rows with 'Idioma dos
 // jogos'; disc install question; copy progress; firmware question; out-of-memory notice; boot-next countdown; emulator
@@ -922,19 +1040,160 @@ inline int render(const std::filesystem::path& out, const std::map<std::string, 
             run_scene(m, 1, 1, rows, i18n::trf(str::LANG_CHANGED, {i18n::raw(i18n::endonym(i18n::current()))}), false);
             if (!save("xmb_settings_column")) return -1;
         }
-        // 3 settings top rows: audio continuity and the game language
+        // 3 settings top rows: audio continuity and the game language (0.40: 'Automático' is English (US))
         {
             scene m;
             m.resources = firmware_images;
-            const std::string auto_label = i18n::trf(str::LANG_AUTO_FMT, {i18n::game_language_name(i18n::game_language_auto())});
+            const std::string auto_label = i18n::trf(str::LANG_AUTO_FMT, {i18n::game_language_name(1)});
             std::vector<entry> rows{{"@setting", i18n::tr(str::SET_SALVAR_CONFIGURACOES), std::string(i18n::tr(str::SET_TODOS_JOGOS)) + " · " +
                     i18n::tr(str::COM_CONFIGURACAO_AUTOMATICA) + i18n::tr(str::COM_APLICADAS_PROXIMO_JOGO), "tex_sysconf", {}},
                 {"@setting", i18n::tr(str::SET_MODO_FRIO_MENOS_CALOR_2), i18n::tr(str::SET_MENOS_CPU_GIRANDO_TOA_MENOS), "tex_sysconf", {}},
-                {"@setting", i18n::tr(str::SET_AUDIO_CONTINUO_AUTOMATICO), i18n::tr(str::SET_AUDIO_CONTINUO_HELP), "tex_sysconf", {}},
+                {"@setting", i18n::tr(str::SET_AUDIO_CONTINUO_DESLIGADO), i18n::tr(str::SET_AUDIO_CONTINUO_HELP), "tex_sysconf", {}},
                 {"@setting", i18n::trf(str::GL_TITLE_GLOBAL, {i18n::raw(auto_label)}), i18n::tr(str::GL_HELP_GLOBAL), "tex_sysconf", {}},
                 {"@setting", i18n::tr(str::SET_AUDIO), i18n::tr(str::SET_ABRIR), "tex_sysconf", {}}};
             run_scene(m, 1, 3, rows, i18n::trf(str::GL_CHANGED, {i18n::raw(auto_label)}), true);
             if (!save("settings_top")) return -1;
+        }
+        // 3b 0.40: the PS4 tab's new rows: 'Áudio contínuo' off by default, the 'Idioma do PS4' value, the global
+        // 'Modo seguro' row selected after X (its message)
+        {
+            scene m;
+            m.resources = firmware_images;
+            const std::string ps4_label = i18n::trf(str::GL_PS4_FMT, {i18n::game_language_name(i18n::game_language_auto())});
+            std::vector<entry> rows{{"@setting", i18n::tr(str::SET_MODO_FRIO_MENOS_CALOR_2), i18n::tr(str::SET_MENOS_CPU_GIRANDO_TOA_MENOS), "tex_sysconf", {}},
+                {"@setting", i18n::tr(str::SET_AUDIO_CONTINUO_AUTOMATICO), i18n::tr(str::SET_AUDIO_CONTINUO_HELP), "tex_sysconf", {}},
+                {"@setting", i18n::trf(str::GL_TITLE_GLOBAL, {i18n::raw(ps4_label)}), i18n::tr(str::GL_HELP_GLOBAL), "tex_sysconf", {}},
+                {"@setting", i18n::tr(str::SET_MODO_SEGURO_LIGADO), i18n::tr(str::SET_MODO_SEGURO_HELP), "tex_sysconf", {}}};
+            run_scene(m, 1, 3, rows, i18n::tr(str::SET_MODO_SEGURO_LIGADO_MSG), true);
+            if (!save("settings_ps4_safe_mode")) return -1;
+            run_scene(m, 1, 1, rows, i18n::tr(str::SET_AUDIO_CONTINUO_AUTO_MSG), true);
+            if (!save("settings_ps4_audio_continuity")) return -1;
+            run_scene(m, 1, 2, rows, i18n::trf(str::GL_CHANGED, {i18n::raw(ps4_label)}), true);
+            if (!save("settings_ps4_game_language")) return -1;
+        }
+        // 3c 0.40: a game's top rows at safe-mode level 2 after a GPU failure: the adjustment row names the level, the
+        // per-game 'Modo seguro deste jogo' row (selected), and the boot toast on the message line; then the player's
+        // own level 3 and level 3 that failed again
+        {
+            scene m;
+            m.resources = firmware_images;
+            const std::string level2 = i18n::trf(str::SET_MODO_SEGURO_NIVEL, {2u});
+            const std::string adapt_help = i18n::trf(str::SET_MODO_SEGURO_NIVEL_MOTIVO, {2u, str::POL_FAIL_GPU}) + ", " + i18n::tr(str::SET_COMPILACAO_1_THREAD) +
+                ", " + i18n::tr(str::SET_GPU_TRAVOU_SHADERS) + i18n::trf(str::SET_VALE_PROXIMOS_BOOT, {8u}) + i18n::tr(str::SET_REMOVE);
+            std::vector<entry> rows{{"@setting", i18n::tr(str::SET_SALVAR_CONFIGURACOES), "BCUS98232 · " + std::string(i18n::tr(str::COM_CONFIGURACAO_AUTOMATICA)) +
+                    i18n::tr(str::COM_APLICADAS_PROXIMO_JOGO), "tex_sysconf", {}},
+                {"@setting", i18n::tr(str::SET_AJUSTE_AUTOMATICO_APOS_FALHA), adapt_help, "tex_sysconf", {}},
+                {"@setting", i18n::trf(str::SET_MODO_SEGURO_JOGO, {i18n::raw(level2)}), i18n::trf(str::SET_MODO_SEGURO_JOGO_AUTO_HELP, {str::POL_FAIL_GPU, 8u}),
+                    "tex_sysconf", {}},
+                {"@setting", i18n::tr(cat::tab_name(cat::tab::gpu)), i18n::tr(str::SET_ABRIR), "tex_sysconf", {}}};
+            run_scene(m, 1, 2, rows, i18n::trf(str::POL_SAFE_MODE_TOAST, {"BCUS98232", str::POL_FAIL_GPU, 2u}), true);
+            if (!save("settings_game_safe_level")) return -1;
+            run_scene(m, 1, 1, rows, i18n::trf(str::POL_SAFE_MODE_TOAST, {"BCUS98232", str::POL_FAIL_GPU, 2u}), true);
+            if (!save("settings_game_safe_adapt")) return -1;
+            const std::string level3 = i18n::trf(str::SET_MODO_SEGURO_NIVEL, {3u});
+            rows[2] = {"@setting", i18n::trf(str::SET_MODO_SEGURO_JOGO, {i18n::raw(level3)}), i18n::trf(str::SET_MODO_SEGURO_JOGO_USER_HELP, {8u}), "tex_sysconf", {}};
+            run_scene(m, 1, 2, rows, i18n::trf(str::SET_MODO_SEGURO_JOGO_CHANGED, {"BCUS98232", i18n::raw(level3)}), true);
+            if (!save("settings_game_safe_user")) return -1;
+            rows[2] = {"@setting", i18n::trf(str::SET_MODO_SEGURO_JOGO, {i18n::raw(level3)}), i18n::tr(str::SET_MODO_SEGURO_JOGO_EXHAUSTED_HELP), "tex_sysconf", {}};
+            run_scene(m, 1, 2, rows, i18n::trf(str::POL_SAFE_MODE_EXHAUSTED, {"BCUS98232"}), true);
+            if (!save("settings_game_safe_exhausted")) return -1;
+            const std::string off = i18n::tr(str::COM_DESLIGADO);
+            rows[2] = {"@setting", i18n::trf(str::SET_MODO_SEGURO_JOGO, {i18n::raw(off)}), i18n::tr(str::SET_MODO_SEGURO_JOGO_HELP), "tex_sysconf", {}};
+            rows.erase(rows.begin() + 1);
+            run_scene(m, 1, 1, rows, i18n::trf(str::POL_ONLINE_SEM_CONTA, {"BLUS31426"}), true);
+            if (!save("settings_game_safe_off")) return -1;
+        }
+        // 3d 0.40: the new rows of the settings menu, built as util/ps4_settings.hpp builds them: a game's 'Novidades neste
+        // jogo' row (none, the 0.39 audio rules after X, names written by hand in the file), the global 'Usar meus valores
+        // salvos (N)' action (its question after the first X, the result after the second), the adjustment row after a
+        // device loss (GPU commands split) and a title at level 2 after a thread failure. The boot notices are system
+        // toasts: their texts are measured on the message line. A title or message wider than its room, or a help line on
+        // more than two, is listed as 'cut' and counted (the screen edge cuts a Latin line): the menu's texts and their
+        // composition are fixed in the string tables and the menu, not here.
+        unsigned rows_cut = 0;
+        {
+            constexpr float room = 1240 - (375 + 75);
+            const auto run_rows = [&](int category, const std::vector<entry>& list, std::size_t selected, const std::string& message, const char* screen)
+            {
+                scene m;
+                m.resources = firmware_images;
+                run_scene(m, category, selected, list, message, category == 1);
+                for (const entry& e : list)
+                {
+                    if (const float w = typeface.measure(e.title, 27); w > room)
+                    { ++rows_cut; std::cout << "cut " << code << ' ' << screen << ": title " << int(w) << " px > " << int(room) << " px '" << e.title << "'\n"; }
+                    if (typeface.wrap(e.subtitle, 17, room, 3, ar).size() > 2) { ++rows_cut; std::cout << "cut " << code << ' ' << screen << ": help over two lines '" << e.subtitle << "'\n"; }
+                }
+                if (const float w = typeface.measure(message, 20); w > 1160)
+                { ++rows_cut; std::cout << "cut " << code << ' ' << screen << ": message " << int(w) << " px > 1160 px '" << message << "'\n"; }
+                return save(screen);
+            };
+            const std::string game = "BLUS30443", sep = " \xC2\xB7 ";
+            const auto row = [](std::string title, std::string help) { return entry{"@setting", std::move(title), std::move(help), "tex_sysconf", {}}; };
+            const auto tab_row = [&](cat::tab t, std::array<unsigned, 4> n)
+            { return row(i18n::tr(cat::tab_name(t)), i18n::trf(str::CFGU_TAB_SUMMARY, {n[0], n[1], n[2], n[3]})); };
+            const entry auto_on = row(i18n::tr(str::SET_CONFIGURACAO_AUTOMATICA_LIGADA), i18n::tr(str::SET_CADA_JOGO_INICIA_AJUSTES_RECOMENDADOS));
+            const entry game_save = row(i18n::tr(str::SET_SALVAR_CONFIGURACOES), game + sep + i18n::tr(str::COM_CONFIGURACAO_AUTOMATICA) + i18n::tr(str::COM_APLICADAS_PROXIMO_JOGO));
+            const entry game_mode = row(i18n::trf(str::CFGU_MODE_GAME_AUTO, {0u}), i18n::trf(str::CFGU_CHANGED, {"X", i18n::raw(i18n::tr(str::CFGU_MODE_GAME_MANUAL))}));
+            const entry safe_off = row(i18n::trf(str::SET_MODO_SEGURO_JOGO, {i18n::raw(i18n::tr(str::COM_DESLIGADO))}), i18n::tr(str::SET_MODO_SEGURO_JOGO_HELP));
+            const auto features = [&](const std::string& value) { return row(i18n::trf(str::CFGU_CHANGED, {str::SET_NOVIDADES_JOGO, i18n::raw(value)}), i18n::tr(str::SET_NOVIDADES_HELP)); };
+            // a game: Salvar, the switch, the mode, the per-game safe mode, 'Novidades neste jogo' (selected), the first tabs
+            std::vector<entry> game_rows{game_save, auto_on, game_mode, safe_off, features(i18n::tr(str::SET_NOVIDADES_NENHUMA)),
+                tab_row(cat::tab::cpu, {7, 2, 0, 0}), tab_row(cat::tab::gpu, {36, 9, 4, 1})};
+            if (!run_rows(1, game_rows, 4, {}, "settings_game_features")) return -1;
+            const std::string audio_039 = i18n::tr(str::SET_NOVIDADES_AUDIO_039);
+            game_rows[4] = features(audio_039);
+            if (!run_rows(1, game_rows, 4, i18n::trf(str::SET_NOVIDADES_CHANGED, {game, i18n::raw(audio_039)}), "settings_game_features_039")) return -1;
+            // rows named by hand in custom_configs/<TITLE_ID>.features: their names, the same in every language
+            game_rows[4] = features("audio_hr_waits, pipelines_first");
+            if (!run_rows(1, game_rows, 4, {}, "settings_game_features_named")) return -1;
+            // the global menu in the automatic configuration: five values of the player's file the automatic one replaces
+            const std::string scope_all = i18n::tr(str::SET_TODOS_JOGOS);
+            std::string legacy;
+            for (const char* key : {"Video > Frame limit", "Video > Shader Mode", "Video > Write Color Buffers"}) legacy += (legacy.empty() ? "" : ", ") + row_label(key);
+            legacy += " (+2)";
+            const std::string use_help = i18n::trf(str::SET_USAR_VALORES_SALVOS_HELP, {i18n::raw(legacy)});
+            const auto global_rows = [&](bool use_saved, const std::string& help, bool pending)
+            {
+                std::vector<entry> rows{row(i18n::tr(str::SET_SALVAR_CONFIGURACOES), scope_all + sep + i18n::tr(str::COM_CONFIGURACAO_AUTOMATICA) +
+                    i18n::tr(pending ? str::SET_ALTERACOES_PENDENTES : str::COM_APLICADAS_PROXIMO_JOGO)), auto_on};
+                if (use_saved) rows.push_back(row(i18n::trf(str::SET_USAR_VALORES_SALVOS, {5u}), help));
+                rows.push_back(tab_row(cat::tab::cpu, {7, 2, 0, 0}));
+                rows.push_back(tab_row(cat::tab::gpu, {36, 9, 4, 1}));
+                rows.push_back(row(i18n::tr(str::SET_APLICAR_PERFIL_AUTOMATICO), i18n::tr(str::SET_LLVM_VULKAN_720P_SHADERS_ASSINCRONOS)));
+                return rows;
+            };
+            if (!run_rows(1, global_rows(true, use_help, false), 2, {}, "settings_use_saved")) return -1;
+            const std::string asked = use_help + sep + i18n::tr(str::CFGU_CONFIRM_AGAIN);
+            if (!run_rows(1, global_rows(true, asked, false), 2, asked, "settings_use_saved_confirm")) return -1;
+            if (!run_rows(1, global_rows(false, {}, true), 0, i18n::trf(str::SET_USAR_VALORES_SALVOS_DONE, {5u}), "settings_use_saved_done")) return -1;
+            // after a device loss of this game: shaders without the interpreter and the GPU commands split, with the boot's
+            // adjustment notice
+            {
+                const entry adapt = row(i18n::tr(str::SET_AJUSTE_AUTOMATICO_APOS_FALHA), std::string(i18n::tr(str::SET_GPU_TRAVOU_SHADERS)) + ", " +
+                    i18n::tr(str::SET_COMANDOS_GPU_DIVIDIDOS) + i18n::trf(str::SET_VALE_PROXIMOS_BOOT, {8u}) + i18n::tr(str::SET_REMOVE));
+                const std::vector<entry> rows{game_save, auto_on, adapt, game_mode, safe_off, features(i18n::tr(str::SET_NOVIDADES_NENHUMA)),
+                    tab_row(cat::tab::gpu, {36, 9, 4, 1})};
+                const std::string items = std::string(i18n::tr(str::POL_SHADERS_SEM_INTERPRETADOR)) + i18n::tr(str::POL_LIST_SEPARATOR) +
+                    i18n::tr(str::POL_COMANDOS_GPU_DIVIDIDOS);
+                if (!run_rows(1, rows, 2, i18n::trf(str::POL_ADAPT_TOAST, {game, i18n::raw(items)}), "settings_game_adapt_cb_split")) return -1;
+            }
+            // level 2 after a thread failure (the music and PC database guards stay on: only the startup line shows it)
+            {
+                const std::string level2 = i18n::trf(str::SET_MODO_SEGURO_NIVEL, {2u});
+                const entry adapt = row(i18n::tr(str::SET_AJUSTE_AUTOMATICO_APOS_FALHA), i18n::trf(str::SET_MODO_SEGURO_NIVEL_MOTIVO, {2u, str::POL_FAIL_THREADS}) +
+                    i18n::trf(str::SET_VALE_PROXIMOS_BOOT, {8u}) + i18n::tr(str::SET_REMOVE));
+                const entry safe = row(i18n::trf(str::SET_MODO_SEGURO_JOGO, {i18n::raw(level2)}), i18n::trf(str::SET_MODO_SEGURO_JOGO_AUTO_HELP, {str::POL_FAIL_THREADS, 8u}));
+                const std::vector<entry> rows{game_save, auto_on, adapt, game_mode, safe, features(i18n::tr(str::SET_NOVIDADES_NENHUMA)), tab_row(cat::tab::gpu, {36, 9, 4, 1})};
+                if (!run_rows(1, rows, 4, i18n::trf(str::POL_SAFE_MODE_TOAST, {game, str::POL_FAIL_THREADS, 2u}), "settings_game_safe_threads")) return -1;
+            }
+            // the boot notice of a game whose format-1 file holds values the automatic configuration replaced
+            {
+                const std::vector<entry> games{{"@savedata", i18n::tr(str::LAU_UTILITARIO_DADOS_GUARDADOS), "", "item_tex_ps3util", {}},
+                    {"demons.iso", "Demon's Souls", game, "item_tex_ps3game_folder", {}, game}, {"terraria", "Terraria", "BLUS31537", "item_tex_ps3game_folder", {}, "BLUS31537"}};
+                if (!run_rows(6, games, 1, i18n::trf(str::POL_AJUSTES_ARQUIVO_SEM_EFEITO, {4u}), "xmb_notice_saved_values")) return -1;
+            }
+            std::cout << "Settings rows " << code << ": 9 screens, " << rows_cut << " text(s) cut\n";
         }
         // Dialogs
         const auto run_dialog = [&](const dialog& d, const char* screen)
@@ -1250,6 +1509,164 @@ inline int render(const std::filesystem::path& out, const std::map<std::string, 
                 if (cross < 0 || circle < 0 || (ar ? cross <= circle : cross >= circle)) { std::cerr << "FAIL: page footer order (" << code << ")\n"; return -1; }
             }
             std::cout << "Settings pages " << code << ": 14 screens, " << cut << " text(s) fitted\n";
+
+            // 0.40: the console limits and platform rules as the settings browser shows them (util/ps4_cfg_browser.hpp
+            // help_of, judge, note_of; the page view adds a note after the help): VSync locked on Vulkan, Resolution Scale
+            // above 200 %, OpenGL's shader mode, the renderer values (OpenGL warned, and its question), the Frame Skip and
+            // per-executable notes, Audio Renderer Null replaced by Cubeb (the saved value without effect, then Square),
+            // Enable Buffering off asks first, Mono greyed, an unavailable row with a saved value, and the Triangle option
+            // 'Usar meu valor salvo (X)' with its result. What the page would cut of the selected line, the help, the
+            // message or the list is listed as 'cut' and counted, as for the rows above; a key missing from its tab fails.
+            unsigned limit_cut = 0;
+            bool limit_key_missing = false;
+            const auto strict = [&](const settings_page& p, const char* screen)
+            {
+                const page_line& l = p.lines[p.selected];
+                if (l.caption) { limit_key_missing = true; std::cerr << "FAIL: " << screen << ": the selected line is a caption (the key is not in the tab)\n"; return; }
+                // the page's rule (as in 'widths' above)
+                const float bw = l.badge.empty() ? 0 : typeface.measure(l.badge, 17) + 16 + (l.padlock ? 18 : 0);
+                const float room = 1110 - 170 - 20 - (bw > 0 ? bw + 14 : 0);
+                const float value_room = std::max(360.f, room - std::min(typeface.measure(l.label, 21), 560.f));
+                const float label_room = std::max(60.f, std::min(560.f, room - std::min(typeface.measure(l.value, 21), value_room)));
+                if (typeface.measure(l.value, 21) > value_room) { ++limit_cut; std::cout << "cut " << code << ' ' << screen << ": value '" << l.value << "'\n"; }
+                if (typeface.measure(l.label, 21) > label_room) { ++limit_cut; std::cout << "cut " << code << ' ' << screen << ": label '" << l.label << "'\n"; }
+                for (const auto& [text, size, width] : {std::tuple{p.help, 17.f, 940.f}, std::tuple{p.message, 20.f, 1160.f}})
+                    if (typeface.wrap(text, size, width, 3, ar).size() > 2) { ++limit_cut; std::cout << "cut " << code << ' ' << screen << ": more than two lines: '" << text << "'\n"; }
+                if (p.popup)
+                {
+                    const float choice_room = 540 - 20 - (p.popup->radio || p.popup->checks ? 56 : 30);
+                    for (const page_choice& c : p.popup->choices)
+                        if (typeface.measure(c.label, 21) > choice_room) { ++limit_cut; std::cout << "cut " << code << ' ' << screen << ": option '" << c.label << "'\n"; }
+                    if (typeface.measure(p.popup->title, 18) > 540 - 60) { ++limit_cut; std::cout << "cut " << code << ' ' << screen << ": heading '" << p.popup->title << "'\n"; }
+                }
+            };
+            const auto run_limit = [&](const settings_page& p, const char* screen)
+            {
+                strict(p, screen);
+                return run_page(p, screen);
+            };
+            const auto first = [](std::vector<sample_row> mine, const std::vector<sample_row>& rest)
+            {
+                mine.insert(mine.end(), rest.begin(), rest.end());
+                return mine;
+            };
+            const auto sentence = [](std::string text)
+            {
+                if (!text.empty() && text.front() >= 'a' && text.front() <= 'z') text.front() = static_cast<char>(text.front() - 'a' + 'A');
+                return text;
+            };
+            // the launcher's question for a warned value: the setting's name, its reason as a sentence
+            const auto warn_dialog = [&](std::string_view key, str reason)
+            {
+                return dialog{i18n::tr(str::CFGU_WARN_TITLE), {row_label(key)}, {sentence(i18n::tr(reason))}, -1, {}, {}, false, nullptr,
+                    {cross_button(i18n::tr(str::CFGU_FOOTER_CHANGE)), circle_button(i18n::tr(str::COM_CANCELAR))}};
+            };
+            const std::string unavailable = i18n::tr(str::COM_INDISPONIVEL_PS4), dot = " \xC2\xB7 ";
+            // 1 VSync on Vulkan: locked with the reason (X on it shows the reason too)
+            {
+                const std::vector<page_line> lines = tab_lines(cat::tab::gpu, first({{"Video > VSync Mode", value_label("Video > VSync Mode", "Disabled"), mark::ps4, true}}, gpu_global));
+                const std::string reason = unavailable + i18n::tr(str::CFGR_VSYNC_FIFO_PS4);
+                if (!run_limit(page_of(cat::tab::gpu, scope_all, lines, "Video > VSync Mode", reason, reason), "cfg_vsync_locked")) return -1;
+            }
+            // 2 Resolution Scale above 200 % in the file: the boot runs 200 %
+            {
+                const std::vector<page_line> lines = tab_lines(cat::tab::gpu, first({{"Video > Resolution Scale", "200 %", mark::ps4}}, gpu_global));
+                if (!run_limit(page_of(cat::tab::gpu, scope_all, lines, "Video > Resolution Scale", i18n::trf(str::CFGR_LIMIT_RESOLUTION_SCALE, {200u}), {}),
+                        "cfg_resscale_limit"))
+                    return -1;
+            }
+            // 3 OpenGL without gl-async.flag: every shader mode runs as the legacy recompiler
+            {
+                const std::vector<page_line> lines = tab_lines(cat::tab::gpu, first({{"Video > Renderer", "OpenGL", mark::mine},
+                    {"Video > Shader Mode", value_label("Video > Shader Mode", "Legacy Recompiler (single-threaded)"), mark::ps4}}, gpu_global));
+                if (!run_limit(page_of(cat::tab::gpu, scope_all, lines, "Video > Shader Mode", i18n::tr(str::CFGR_VALUE_GL_ASYNC), {}), "cfg_opengl_shader_mode")) return -1;
+            }
+            // 4 the renderer values (the setting's order): OpenGL under the cursor, warned for its own reason; X asks first
+            {
+                page_popup popup;
+                popup.title = row_label("Video > Renderer");
+                for (const char* spelling : {"Null", "OpenGL", "Vulkan"})
+                    popup.choices.push_back({value_label("Video > Renderer", spelling), false, std::string_view(spelling) == "Vulkan"});
+                popup.selected = 1;
+                settings_page p = page_of(cat::tab::gpu, scope_all, gpu_lines, "Video > Renderer", i18n::tr(str::CFGH_AVISO_OPENGL_ZINK), {});
+                p.buttons = popup_buttons;
+                p.footer_help.clear();
+                p.popup = &popup;
+                if (!run_limit(p, "cfg_picker_renderer_opengl")) return -1;
+                if (!run_dialog(warn_dialog("Video > Renderer", str::CFGH_AVISO_OPENGL_ZINK), "cfg_renderer_opengl_warn")) return -1;
+            }
+            // 5 Enable Frame Skip: the help with its note
+            {
+                const cat::item* item = cat::find("Video > Enable Frame Skip");
+                const std::string help = std::string(item ? i18n::tr(item->help) : "") + dot + i18n::tr(str::CFGH_NOTA_FRAME_SKIP);
+                if (!run_limit(page_of(cat::tab::gpu, scope_all, gpu_lines, "Video > Enable Frame Skip", help, {}), "cfg_frame_skip_note")) return -1;
+            }
+            const std::vector<page_line> audio_lines = tab_lines(cat::tab::audio, {{"Audio > Renderer", "Cubeb"}, {"Audio > Enable Buffering", i18n::tr(str::COM_LIGADO)},
+                {"Audio > Audio Channel Layout", value_label("Audio > Audio Channel Layout", "Automatic")}, {"Audio > Audio Provider", value_label("Audio > Audio Provider", "CellAudio")}});
+            // 6 Audio Renderer Null in the file runs as Cubeb: why, and that Square removes the saved value; after Square
+            // the row's own reason again
+            {
+                const cat::item* renderer = cat::find("Audio > Renderer");
+                const std::string help = unavailable + i18n::tr(str::CFGR_AUDIO_NULL_PS4) + dot + i18n::tr(str::CFGU_VALOR_SALVO_SEM_EFEITO);
+                if (!run_limit(page_of(cat::tab::audio, scope_all, audio_lines, "Audio > Renderer", help, {}), "cfg_audio_renderer_null")) return -1;
+                const std::string after = unavailable + (renderer ? i18n::tr(renderer->reason) : "");
+                if (!run_limit(page_of(cat::tab::audio, scope_all, audio_lines, "Audio > Renderer", after,
+                        i18n::trf(str::CFGU_RESET_AUTO_DONE, {i18n::raw(row_label("Audio > Renderer")), i18n::raw("Cubeb")})), "cfg_audio_renderer_removed"))
+                    return -1;
+            }
+            // 7 Enable Buffering off asks first
+            if (!run_dialog(warn_dialog("Audio > Enable Buffering", str::CFGH_AVISO_SEM_BUFFER), "cfg_buffering_warn")) return -1;
+            // 8 the channel layouts: Mono greyed, its reason under the cursor, X refused
+            {
+                page_popup popup;
+                popup.title = row_label("Audio > Audio Channel Layout");
+                for (const char* spelling : {"Automatic", "Mono", "Stereo", "Stereo LFE", "Quadraphonic", "Quadraphonic LFE", "Surround 5.1", "Surround 7.1"})
+                    popup.choices.push_back({value_label("Audio > Audio Channel Layout", spelling), std::string_view(spelling) == "Mono", std::string_view(spelling) == "Automatic"});
+                popup.selected = 1;
+                const std::string reason = i18n::tr(str::CFGR_AUDIO_MONO_PS4);
+                settings_page p = page_of(cat::tab::audio, scope_all, audio_lines, "Audio > Audio Channel Layout", reason,
+                    i18n::trf(str::CFGU_VALUE_REFUSED, {i18n::raw(popup.choices[1].label), i18n::raw(reason)}));
+                p.buttons = popup_buttons;
+                p.footer_help.clear();
+                p.popup = &popup;
+                if (!run_limit(p, "cfg_picker_mono")) return -1;
+            }
+            // 9 Audio Provider: the help with its note
+            {
+                const cat::item* item = cat::find("Audio > Audio Provider");
+                const std::string help = std::string(item ? i18n::tr(item->help) : "") + dot + i18n::tr(str::CFGH_NOTA_POR_EXECUTAVEL);
+                if (!run_limit(page_of(cat::tab::audio, scope_all, audio_lines, "Audio > Audio Provider", help, {}), "cfg_audio_provider_note")) return -1;
+            }
+            // 10 an unavailable row whose file holds a value it cannot use
+            {
+                const cat::item* mtrsx = cat::find("Video > Multithreaded RSX");
+                const std::string help = unavailable + (mtrsx ? i18n::tr(mtrsx->reason) : "") + dot + i18n::tr(str::CFGU_VALOR_SALVO_SEM_EFEITO);
+                if (!run_limit(page_of(cat::tab::gpu, scope_all, gpu_lines, "Video > Multithreaded RSX", help, {}), "cfg_unavailable_saved")) return -1;
+            }
+            // 11 Triangle on a row whose file holds another value than the one the boot runs: 'Usar meu valor salvo (30)'
+            // after 'Fixar este valor'; X keeps the saved value as the player's own
+            {
+                const std::string automatic = value_label("Video > Frame limit", "Auto"), saved = value_label("Video > Frame limit", "30");
+                const std::vector<page_line> lines = tab_lines(cat::tab::gpu, first({{"Video > Frame limit", automatic, mark::automatic}}, gpu_global));
+                page_popup popup;
+                popup.title = row_label("Video > Frame limit");
+                popup.radio = false;
+                for (const std::string& label : {std::string(i18n::tr(str::CFGU_OPT_BACK_AUTO)), std::string(i18n::tr(str::CFGU_OPT_UPSTREAM)), std::string(i18n::tr(str::CFGU_OPT_PIN)),
+                         i18n::trf(str::SET_USAR_VALOR_SALVO, {i18n::raw(saved)}), std::string(i18n::tr(str::CFGU_OPT_FULL_HELP)), std::string(i18n::tr(str::CFGU_OPT_YAML_KEY))})
+                    popup.choices.push_back({label, false, false});
+                popup.selected = 3;
+                settings_page p = page_of(cat::tab::gpu, scope_all, lines, "Video > Frame limit", i18n::trf(str::CFGU_NOTE_AUTO, {i18n::raw(automatic), i18n::raw(saved)}), {});
+                p.buttons = popup_buttons;
+                p.footer_help.clear();
+                p.popup = &popup;
+                if (!run_limit(p, "cfg_options_use_saved")) return -1;
+                const std::vector<page_line> mine = tab_lines(cat::tab::gpu, first({{"Video > Frame limit", saved, mark::mine}}, gpu_global));
+                if (!run_limit(page_of(cat::tab::gpu, scope_all, mine, "Video > Frame limit", i18n::tr(str::CFGU_NOTE_MINE),
+                        i18n::trf(str::CFGU_PINNED, {i18n::raw(row_label("Video > Frame limit"))}) + dot + saved), "cfg_use_saved_done"))
+                    return -1;
+            }
+            std::cout << "Settings limits " << code << ": 14 screens, " << limit_cut << " text(s) cut\n";
+            if (limit_key_missing) return -1;
         }
         // Cheats: the game row's hint (R2), the first row of the patch list, the list (its header with the codes for
         // another version and the RPCN warning), an invalid cheat, the options of the console's own cheat and of a PC
@@ -1325,6 +1742,588 @@ inline int render(const std::filesystem::path& out, const std::map<std::string, 
             std::cout << "Cheats " << code << ": 10 screens, " << cut << " text(s) cut\n";
             if (cut) { std::cerr << "FAIL: cheat texts do not fit (" << code << ")\n"; return -1; }
         }
+        // 0.40: folders of the 'Jogo' column, as the folders glue builds them, with the folder drawn by
+        // util/ps4_folder_icon.hpp (this default run never uses the firmware's folder): the top level, inside a folder,
+        // halfway open, the options of a folder and of a game, 'Mover para uma pasta', the checklist, 'Mudar posição', the
+        // delete question, an empty folder, a console without firmware. Checked by pixels: the open folder's icon at the
+        // column's place; every option list changes nothing left of x 700 (never mirrored in the XMB) and its texts start
+        // at x 730, or end at x 1210 right to left.
+        unsigned folder_cut = 0;
+        const image folder = folder_icon();
+        const std::array<const char*, 3> folder_names = i18n::current() == i18n::lang::en ? std::array<const char*, 3>{"Racing", "Fighting", "Favourites"}
+            : i18n::current() == i18n::lang::es ? std::array<const char*, 3>{"Carreras", "Lucha", "Favoritos"}
+            : i18n::current() == i18n::lang::ar ? std::array<const char*, 3>{"\xD8\xB3\xD8\xA8\xD8\xA7\xD9\x82", "\xD9\x82\xD8\xAA\xD8\xA7\xD9\x84",
+                "\xD8\xA7\xD9\x84\xD9\x85\xD9\x81\xD8\xB6\xD9\x84\xD8\xA9"}
+            : std::array<const char*, 3>{"Corrida", "Luta", "Favoritos"};
+        // The player's names go into the texts as typed: isolated left to right unless they are Arabic
+        const auto name_arg = [](const char* name) { return utils::ps4::arabic::has_arabic(name) ? i18n::raw(name) : i18n::arg(name); };
+        const entry savedata{"@savedata", i18n::tr(str::LAU_UTILITARIO_DADOS_GUARDADOS), "", "item_tex_ps3util", {}};
+        const entry licenses{"@licenses", i18n::tr(str::LAU_IMPORTAR_LICENCAS_RAP), i18n::tr(str::LAU_IMPORTAR_LICENCAS_RAP_HELP), "item_tex_disc_install", {}};
+        const std::vector<entry> library{{"/data/rpcs3/games/Gran Turismo 5.iso", "Gran Turismo 5", "BCUS98114", "item_tex_ps3game_folder", {}, "BCUS98114"},
+            {"/data/rpcs3/games/MotorStorm Pacific Rift.iso", "MotorStorm: Pacific Rift", "BCUS98137", "item_tex_ps3game_folder", {}, "BCUS98137"},
+            {"/mnt/usb0/PS3ISO/Burnout Paradise.iso", "Burnout Paradise", "BLUS30066", "item_tex_ps3game_folder", {}, "BLUS30066"},
+            {"/data/rpcs3/games/Tekken 6.iso", "Tekken 6", "BLUS30307", "item_tex_ps3game_folder", {}, "BLUS30307"},
+            {"/data/rpcs3/games/Mortal Kombat.iso", "Mortal Kombat", "BLUS30522", "item_tex_ps3game_folder", {}, "BLUS30522"},
+            {"demons.iso", "Demon's Souls", "BLUS30443", "item_tex_ps3game_folder", {}, "BLUS30443"},
+            {"terraria", "Terraria", "BLUS31537", "item_tex_ps3game_folder", {}, "BLUS31537"},
+            {"minecraft.iso", "Minecraft: PlayStation\xC2\xAE" "3 Edition", "BLUS31426", "item_tex_ps3game_folder", {}, "BLUS31426"}};
+        const auto folder_row = [&](int id, const char* name, std::size_t games, std::size_t missing)
+        {
+            std::string count = games == 0 ? std::string(i18n::tr(str::FLD_PASTA_SUB_0)) : games == 1 ? std::string(i18n::tr(str::FLD_PASTA_SUB_1))
+                : i18n::trf(str::FLD_PASTA_SUB_N, {games});
+            if (missing) count += i18n::trf(str::FLD_AUSENTES_SUFIXO, {missing});
+            return entry{"@folder:" + std::to_string(id), name, std::move(count), "item_tex_plain_folder", {}};
+        };
+        // Top level: the utility rows, the folders in the player's order (Corrida 3 games, Luta 2 and 1 not in the library
+        // now, Favoritos empty), then the games in no folder
+        const std::vector<entry> top{savedata, licenses, folder_row(1, folder_names[0], 3, 0), folder_row(2, folder_names[1], 2, 1),
+            folder_row(3, folder_names[2], 0, 0), library[5], library[6], library[7]};
+        const std::vector<entry> racing{library[0], library[1], library[2]};
+        auto folder_images = firmware_images;
+        folder_images.insert_or_assign("item_tex_plain_folder", folder);
+        const folder_header racing_header{&folder_images.at("item_tex_plain_folder"), folder_names[0]};
+        const std::string options_hint = i18n::tr(str::FLD_OPCOES);
+        // The room of a row's title and help (right of the icon), of a message line and of an option list's labels
+        const auto folder_fits = [&](const std::vector<entry>& list, std::string_view message, const page_popup* popup, const char* screen)
+        {
+            constexpr float room = 1240 - (375 + 75);
+            for (const entry& e : list)
+            {
+                if (typeface.measure(e.title, 27) > room) { ++folder_cut; std::cout << "fit " << code << ' ' << screen << ": title '" << e.title << "'\n"; }
+                if (typeface.wrap(e.subtitle, 17, room, 3, ar).size() > 2) { ++folder_cut; std::cout << "fit " << code << ' ' << screen << ": help over two lines '" << e.subtitle << "'\n"; }
+            }
+            if (typeface.measure(message, 20) > 1160) { ++folder_cut; std::cout << "fit " << code << ' ' << screen << ": message '" << message << "'\n"; }
+            if (popup)
+            {
+                const float label_room = 540 - 20 - (popup->radio || popup->checks ? 56 : 30);
+                for (const page_choice& choice : popup->choices)
+                    if (typeface.measure(choice.label, 21) > label_room) { ++folder_cut; std::cout << "fit " << code << ' ' << screen << ": option '" << choice.label << "'\n"; }
+                if (typeface.measure(popup->title, 18) > 540 - 60) { ++folder_cut; std::cout << "fit " << code << ' ' << screen << ": heading '" << popup->title << "'\n"; }
+            }
+        };
+        const auto note = [&](const std::vector<entry>& list, std::string_view message, const column_extras& extras)
+        {
+            for (const entry& e : list) { drawn.push_back(e.title); drawn.push_back(e.subtitle); }
+            drawn.emplace_back(message);
+            drawn.emplace_back(extras.triangle_hint);
+            if (extras.header) drawn.push_back(extras.header->title);
+            if (extras.popup)
+            {
+                drawn.push_back(extras.popup->title);
+                for (const page_choice& choice : extras.popup->choices) drawn.push_back(choice.label);
+            }
+        };
+        const auto draw_column = [&](scene& m, const std::vector<entry>& list, std::size_t selected, std::string_view message, const column_extras& extras,
+            const font& face, int frames)
+        {
+            for (int i = 0; i < frames; ++i)
+                m.draw(frame.data(), face, 6, selected, list, 3. + i / 60., 1.f / 60, "01/10  16:53", message, false, {}, &extras);
+        };
+        const auto run_column = [&](const std::vector<entry>& list, std::size_t selected, const std::string& message, const column_extras& extras, const char* screen)
+        {
+            scene m;
+            m.resources = folder_images;
+            draw_column(m, list, selected, message, extras, typeface, 40);
+            note(list, message, extras);
+            folder_fits(list, message, extras.popup, screen);
+            if (!save(screen)) return false;
+            if (!extras.popup) return true;
+            // The same screen without the list: every pixel it changed is right of x 700
+            const std::vector<std::uint32_t> shown = frame;
+            column_extras bare = extras;
+            bare.popup = nullptr;
+            scene plain;
+            plain.resources = folder_images;
+            draw_column(plain, list, selected, message, bare, typeface, 40);
+            int left = 1280;
+            for (int y = 0; y < 720; ++y)
+                for (int x = 0; x < left; ++x)
+                    if (frame[std::size_t(y) * 1280 + std::size_t(x)] != shown[std::size_t(y) * 1280 + std::size_t(x)]) { left = x; break; }
+            if (left < 700) { std::cerr << "FAIL: option list drawn left of x 700 (" << code << ' ' << screen << ": x " << left << ")\n"; return false; }
+            if (!extras.popup->checks && !extras.popup->radio)
+            {
+                // The first label: from x 730, or ending at x 1210 right to left
+                int ink_left = 1280, ink_right = -1;
+                for (int y = 148; y < 184; ++y)
+                    for (int x = 700; x < 1240; ++x)
+                    {
+                        const std::uint32_t p = shown[std::size_t(y) * 1280 + std::size_t(x)];
+                        if (((p >> 16) & 255) > 200 && ((p >> 8) & 255) > 200 && (p & 255) > 200) { ink_left = std::min(ink_left, x); ink_right = std::max(ink_right, x); }
+                    }
+                std::cout << "option list " << code << ' ' << screen << ": changes from x " << left << ", first label ink x " << ink_left << ".." << ink_right << '\n';
+                if (ink_right < 0 || (ar ? std::abs(ink_right - 1209) > 5 : std::abs(ink_left - 730) > 5))
+                {
+                    std::cerr << "FAIL: option list label alignment (" << code << ' ' << screen << ")\n";
+                    return false;
+                }
+            }
+            frame = shown;
+            return true;
+        };
+        // 1 top level, a folder selected: its hint, Triangle names the options
+        {
+            const column_extras extras{nullptr, nullptr, options_hint};
+            if (!run_column(top, 2, i18n::tr(str::FLD_DICA_PASTA), extras, "folders_top")) return -1;
+            // Empty extras draw exactly what no extras draw (the launcher passes them only in the 'Jogo' column)
+            const column_extras none{};
+            scene with, without;
+            with.resources = without.resources = folder_images;
+            draw_column(with, top, 2, "", none, typeface, 40);
+            const std::vector<std::uint32_t> drawn_with = frame;
+            for (int i = 0; i < 40; ++i) without.draw(frame.data(), typeface, 6, 2, top, 3. + i / 60., 1.f / 60, "01/10  16:53", "", false);
+            if (frame != drawn_with) { std::cerr << "FAIL: empty column extras change the frame (" << code << ")\n"; return -1; }
+        }
+        // 2 inside the folder: the folder at the column's place, its games
+        {
+            const column_extras extras{&racing_header, nullptr, options_hint};
+            if (!run_column(racing, 0, i18n::tr(str::LAU_HINT_GAME_ROW), extras, "folders_inside")) return -1;
+            // The header icon (a pure colour stand-in) at x 318..432, y 158..222
+            auto marked = folder_images;
+            const image magenta{314, 178, std::vector<std::uint32_t>(std::size_t(314) * 178, 0xffff00ffu)};
+            const folder_header marked_header{&magenta, folder_names[0]};
+            const column_extras marked_extras{&marked_header, nullptr, options_hint};
+            scene m;
+            m.resources = marked;
+            draw_column(m, racing, 0, "", marked_extras, typeface, 40);
+            int x0 = 1280, y0 = 720, x1 = -1, y1 = -1;
+            for (int y = 0; y < 720; ++y)
+                for (int x = 0; x < 1280; ++x)
+                {
+                    const std::uint32_t p = frame[std::size_t(y) * 1280 + std::size_t(x)];
+                    if (((p >> 16) & 255) > 200 && ((p >> 8) & 255) < 60 && (p & 255) > 200) { x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y); }
+                }
+            std::cout << "folder header " << code << ": icon ink x " << x0 << ".." << x1 << ", y " << y0 << ".." << y1 << '\n';
+            if (std::abs(x0 - 318) > 1 || std::abs(x1 - 432) > 1 || std::abs(y0 - 158) > 1 || std::abs(y1 - 222) > 1)
+            {
+                std::cerr << "FAIL: folder header icon placement (" << code << ")\n";
+                return -1;
+            }
+        }
+        // 3 halfway open (depth 0.5): the bar half a slot left, the folder and its name fading in, the games coming in
+        {
+            scene m;
+            m.resources = folder_images;
+            const column_extras closed{nullptr, nullptr, options_hint}, open{&racing_header, nullptr, options_hint};
+            draw_column(m, top, 2, "", closed, typeface, 40);
+            // one frame of 0.065 * ln 2 s eases the depth from 0 to 0.5
+            m.draw(frame.data(), typeface, 6, 0, racing, 3.7, .0450561f, "01/10  16:53", "", false, {}, &open);
+            note(racing, "", open);
+            if (!save("folders_opening")) return -1;
+        }
+        // 4 the options of a folder with games not in the library now
+        {
+            page_popup popup;
+            popup.title = folder_names[1];
+            popup.radio = false;
+            for (const std::string& label : {std::string(i18n::tr(str::FLD_ABRIR)), std::string(i18n::tr(str::FLD_ADICIONAR)), std::string(i18n::tr(str::FLD_RENOMEAR)),
+                     std::string(i18n::tr(str::FLD_POSICAO)), std::string(i18n::tr(str::FLD_APAGAR)), i18n::trf(str::FLD_ESQUECER, {1u}),
+                     std::string(i18n::tr(str::FLD_CRIAR)), std::string(i18n::tr(str::LAU_ATUALIZAR_BIBLIOTECA))})
+                popup.choices.push_back({label, false, false});
+            const column_extras extras{nullptr, &popup, options_hint};
+            if (!run_column(top, 3, "", extras, "folders_options_folder")) return -1;
+        }
+        // 5 the options of a game in no folder
+        {
+            page_popup popup;
+            popup.title = library[5].title;
+            popup.radio = false;
+            for (const str id : {str::FLD_MOVER, str::FLD_CRIAR, str::LAU_ATUALIZAR_BIBLIOTECA}) popup.choices.push_back({i18n::tr(id), false, false});
+            const column_extras extras{nullptr, &popup, options_hint};
+            if (!run_column(top, 5, "", extras, "folders_options_game")) return -1;
+        }
+        // 6 'Mover para uma pasta': the folders and a new one
+        {
+            page_popup popup;
+            popup.title = i18n::trf(str::FLD_MOVER_TITULO, {library[5].title});
+            popup.radio = false;
+            for (const char* name : folder_names) popup.choices.push_back({name, false, false});
+            popup.choices.push_back({i18n::tr(str::FLD_NOVA_PASTA_ITEM), false, false});
+            popup.selected = 2;
+            const column_extras extras{nullptr, &popup, options_hint};
+            if (!run_column(top, 5, "", extras, "folders_move")) return -1;
+        }
+        // 7 'Adicionar jogos': every game of the library, checked = in this folder, another folder's name after a title
+        {
+            page_popup popup;
+            popup.title = i18n::trf(str::FLD_ADICIONAR_TITULO, {name_arg(folder_names[2])});
+            popup.checks = true;
+            for (std::size_t g = 0; g < library.size(); ++g)
+            {
+                std::string label = library[g].title;
+                if (g < 3) label += std::string(" (") + folder_names[0] + ")";
+                else if (g < 5) label += std::string(" (") + folder_names[1] + ")";
+                popup.choices.push_back({std::move(label), false, g == 5 || g == 6});
+            }
+            popup.selected = 6;
+            const column_extras extras{nullptr, &popup, options_hint};
+            if (!run_column(top, 4, i18n::tr(str::FLD_ADICIONAR_DICA), extras, "folders_checklist")) return -1;
+        }
+        // 8 'Mudar posição': the folder lifted among the folders
+        {
+            column_extras extras{nullptr, nullptr, options_hint};
+            extras.lifted = 3;
+            if (!run_column(top, 3, i18n::tr(str::FLD_POSICAO_DICA), extras, "folders_position")) return -1;
+        }
+        // 9 'Apagar pasta' asks first: no game is deleted
+        if (!run_dialog({{}, {i18n::trf(str::FLD_APAGAR_PERGUNTA, {name_arg(folder_names[0])})}, {i18n::tr(str::FLD_APAGAR_NOTA)}, -1, {}, {}, false, &folder,
+                {cross_button(i18n::tr(str::COM_SIM)), circle_button(i18n::tr(str::COM_NAO))}}, "folders_delete"))
+            return -1;
+        // 10 inside an empty folder: its one row, X shows its help
+        {
+            const folder_header header{&folder_images.at("item_tex_plain_folder"), folder_names[2]};
+            const std::vector<entry> empty{{"@folder-empty:3", i18n::tr(str::FLD_VAZIA), i18n::tr(str::FLD_VAZIA_HELP), "item_tex_plain_folder", {}}};
+            const column_extras extras{&header, nullptr, options_hint};
+            if (!run_column(empty, 0, i18n::tr(str::FLD_VAZIA_HELP), extras, "folders_empty")) return -1;
+        }
+        // 11 no firmware: the bundled font, grey boxes for the category and game icons, the drawn folder
+        {
+            const auto dejavu = ::read(std::filesystem::path(__FILE__).parent_path() / "../../bin/fonts/DejaVuSans.ttf");
+            font fallback;
+            if (dejavu.empty() || !fallback.load(dejavu, dejavu)) { std::cerr << "FAIL: no DejaVu font for the no-firmware folder screen\n"; return -1; }
+            scene m;
+            m.resources.insert_or_assign("item_tex_plain_folder", folder);
+            const column_extras extras{nullptr, nullptr, options_hint};
+            draw_column(m, top, 2, i18n::tr(str::FLD_DICA_PASTA), extras, fallback, 40);
+            std::size_t missing_fallback = fallback.missing_glyphs(i18n::tr(str::FLD_DICA_PASTA), ar) + fallback.missing_glyphs(options_hint, ar);
+            for (const entry& e : top) missing_fallback += fallback.missing_glyphs(e.title, ar) + fallback.missing_glyphs(e.subtitle, ar);
+            if (missing_fallback) { std::cerr << "FAIL: " << missing_fallback << " glyph(s) drawn as '?' with the bundled font (" << code << ")\n"; return -1; }
+            if (!save("folders_no_firmware")) return -1;
+        }
+        std::cout << "Folders " << code << ": 11 screens, " << folder_cut << " text(s) cut\n";
+        if (folder_cut) { std::cerr << "FAIL: folder texts do not fit (" << code << ")\n"; return -1; }
+
+        // 0.40: the selected game's background and overlay (synthetic images): the game row at strength 0, 128 and 255,
+        // each without and with the overlay, a cross-fade between two backgrounds, a dialog over a background; then the
+        // two rows of the Configurações column in their six states. Strength 0 must leave the frame as without media.
+        {
+            const image pic1 = media_samples::background(0), pic1_night = media_samples::background(1), pic0 = media_samples::overlay();
+            const int ov_x = 1280 - pic0.width, ov_y = (720 - pic0.height) / 2;
+            const std::vector<entry> games{savedata, library[5], library[6]};
+            const std::string hint = i18n::tr(str::LAU_HINT_GAME_ROW);
+            const auto media_frame = [&](scene& m)
+            {
+                for (int i = 0; i < 40; ++i) m.draw(frame.data(), typeface, 6, 1, games, 3. + i / 60., 1.f / 60, "01/10  16:53", hint, false);
+            };
+            std::vector<std::uint32_t> waves;
+            {
+                scene m;
+                m.resources = firmware_images;
+                media_frame(m);
+                waves = frame;
+            }
+            for (const unsigned strength : {0u, 128u, 255u})
+                for (const bool with_overlay : {false, true})
+                {
+                    scene m;
+                    m.resources = firmware_images;
+                    m.set_media(pic1, with_overlay ? pic0 : image{}, ov_x, ov_y);
+                    m.set_media_alpha(strength, 0, with_overlay ? 255 : 0);
+                    media_frame(m);
+                    if (strength == 0 && !with_overlay && frame != waves) { std::cerr << "FAIL: a background at strength 0 changed the frame (" << code << ")\n"; return -1; }
+                    const std::string screen = "media_bg_" + std::to_string(strength) + (with_overlay ? "_overlay" : "");
+                    if (!save(screen.c_str())) return -1;
+                }
+            {
+                // the night background fading out while the evening one fades in
+                scene m;
+                m.resources = firmware_images;
+                m.set_media(pic1_night, {}, 0, 0);
+                m.set_media_alpha(255, 0, 0);
+                m.set_media(pic1, {}, 0, 0);
+                m.set_media_alpha(96, 160, 0);
+                media_frame(m);
+                if (!save("media_crossfade")) return -1;
+            }
+            {
+                // Released before a boot: clear_media() frees every image and the XMB draws exactly as a scene that never
+                // had media; images of the wrong size are never kept
+                scene never, cleared;
+                never.resources = cleared.resources = firmware_images;
+                cleared.set_media(pic1, pic0, ov_x, ov_y);
+                cleared.set_media_alpha(255, 0, 255);
+                media_frame(never);
+                media_frame(cleared);
+                const std::size_t held = cleared.media_bytes(), freed = cleared.clear_media();
+                const std::size_t expected = (std::size_t(1280) * 720 + std::size_t(pic0.width) * std::size_t(pic0.height)) * 4;
+                if (held < expected || freed != held || cleared.media_bytes())
+                {
+                    std::cerr << "FAIL: clear_media freed " << freed << " of " << held << " bytes (" << code << ")\n";
+                    return -1;
+                }
+                media_frame(never);
+                const std::vector<std::uint32_t> plain = frame;
+                media_frame(cleared);
+                if (frame != plain) { std::cerr << "FAIL: the XMB after clear_media differs from one without media (" << code << ")\n"; return -1; }
+                scene odd;
+                odd.set_media(image{640, 360, std::vector<std::uint32_t>(std::size_t(640) * 360, 0xff102030u)},
+                    image{1300, 10, std::vector<std::uint32_t>(std::size_t(1300) * 10, 0xff102030u)}, 0, 0);
+                if (odd.media_bytes()) { std::cerr << "FAIL: a wrongly sized background or overlay was kept (" << code << ")\n"; return -1; }
+            }
+            {
+                // a dialog over a background: the overlay stays out of a dialog's backdrop (the frame is the same with and
+                // without it), so the dialog's texts never sit on the game's title art
+                const dialog d{"FIFA 14 (BLES01876)", {s.disc_question}, {s.disc_size, s.disc_free}, -1, {}, {}, false, nullptr,
+                    {cross_button(i18n::tr(str::COM_INSTALAR)), circle_button(i18n::tr(str::COM_VOLTAR))}};
+                const auto dialog_over = [&](const image& overlay)
+                {
+                    scene backdrop;
+                    backdrop.resources = firmware_images;
+                    backdrop.set_media(pic1, overlay, ov_x, ov_y);
+                    backdrop.set_media_alpha(255, 0, overlay ? 255 : 0);
+                    for (int i = 0; i < 20; ++i) backdrop.backdrop(frame.data(), 4. + i / 60.);
+                    canvas c(frame.data(), 1280, 720);
+                    draw_dialog(c, typeface, backdrop.resources, d, 4.5);
+                };
+                dialog_over({});
+                const std::vector<std::uint32_t> plain = frame;
+                dialog_over(pic0);
+                if (frame != plain) { std::cerr << "FAIL: the overlay was drawn under a dialog (" << code << ")\n"; return -1; }
+                if (!save("media_dialog")) return -1;
+            }
+            // The rows after the language row: 'Fundo e música do jogo' and 'Música do jogo'
+            unsigned media_cut = 0;
+            const auto media_rows = [&](bool media_on, str music, std::size_t selected, std::string message, const char* screen)
+            {
+                std::vector<entry> rows{{"@rpcs3", s.rpcs3_settings, s.rpcs3_settings_help, "tex_sysconf", {}},
+                    {"@ui-language", i18n::tr(str::LANG_ROW_TITLE), i18n::trf(str::LANG_ROW_HELP, {i18n::raw(i18n::setting_label(i18n::current_setting()))}), "tex_sysconf", {}},
+                    {"@xmb-media", i18n::trf(str::LAU_XMED_ROW, {media_on ? str::COM_LIGADO : str::COM_DESLIGADO}), i18n::tr(str::LAU_XMED_ROW_HELP), "tex_sysconf", {}},
+                    {"@xmb-music", i18n::trf(str::LAU_XMED_MUSICA_ROW, {music}), i18n::tr(media_on ? str::LAU_XMED_MUSICA_HELP : str::LAU_XMED_MUSICA_HELP_SEM_FUNDO),
+                        "tex_sysconf", {}},
+                    {"@storage", i18n::tr(str::COM_ARMAZENAMENTO_JOGOS), s.storage_help, "tex_sysconf", {}}};
+                scene m;
+                m.resources = firmware_images;
+                run_scene(m, 1, selected, rows, message, false);
+                constexpr float room = 1240 - (375 + 75);
+                for (const entry& e : rows)
+                {
+                    if (typeface.measure(e.title, 27) > room) { ++media_cut; std::cout << "fit " << code << ' ' << screen << ": title '" << e.title << "'\n"; }
+                    if (typeface.wrap(e.subtitle, 17, room, 3, ar).size() > 2) { ++media_cut; std::cout << "fit " << code << ' ' << screen << ": help over two lines '" << e.subtitle << "'\n"; }
+                }
+                if (typeface.measure(message, 20) > 1160) { ++media_cut; std::cout << "fit " << code << ' ' << screen << ": message '" << message << "'\n"; }
+                return save(screen);
+            };
+            if (!media_rows(true, str::LAU_XMED_LIGADA, 2, i18n::tr(str::LAU_XMED_LIGADO_MSG), "media_rows_on")) return -1;
+            if (!media_rows(false, str::LAU_XMED_LIGADA, 2, i18n::tr(str::LAU_XMED_DESLIGADO_MSG), "media_rows_off")) return -1;
+            if (!media_rows(true, str::LAU_XMED_LIGADA, 3, {}, "media_music_on")) return -1;
+            if (!media_rows(true, str::LAU_XMED_BAIXA, 3, {}, "media_music_low")) return -1;
+            if (!media_rows(true, str::LAU_XMED_DESLIGADA, 3, {}, "media_music_off")) return -1;
+            if (!media_rows(false, str::LAU_XMED_LIGADA, 3, {}, "media_music_no_background")) return -1;
+            std::cout << "Media " << code << ": 14 screens, " << media_cut << " text(s) cut\n";
+            if (media_cut) { std::cerr << "FAIL: game media texts do not fit (" << code << ")\n"; return -1; }
+        }
+        // 0.40: the media timeline as the launcher glue drives it. The media director of util/ps4_xmb_media.hpp gets the
+        // selected row every frame; a job it posts is answered 120 ms later by a stand-in loader (synthetic images: game A
+        // has a background, an overlay and music, game B nothing, game C a background and music). Its outputs go to the
+        // scene in the glue's order: present -> set_media (before the music starts), the strengths -> set_media_alpha(bg,
+        // 0, ov) every frame, clear -> clear_media(). A second scene that never gets media draws the same frames: while the
+        // scene holds no media, or both strengths are 0, the two frames must be byte-identical. Then a disc dialog (the
+        // background stays under it, the music stops and starts again after it), the Configurações column (the media
+        // fades out and is freed) and the release before a boot (every image freed, the director sealed).
+        {
+            namespace xm = utils::ps4::xmb_media;
+            struct payload
+            {
+                std::uint32_t generation = 0;
+                image background, overlay;
+                int overlay_x = 0, overlay_y = 0;
+                bool music_file = false, track = false, only_music = false;
+                bool has_background() const { return static_cast<bool>(background); }
+                bool has_overlay() const { return static_cast<bool>(overlay); }
+                bool has_music() const { return track; }
+                bool has_music_file() const { return music_file; }
+                bool music_only() const { return only_music; }
+            };
+            const xm::rect box = xm::overlay_box(1000, 560);
+            const image evening = media_samples::background(0), night = media_samples::background(1), title_art = media_samples::overlay();
+            if (title_art.width != box.w || title_art.height != box.h) { std::cerr << "FAIL: the overlay stand-in does not have the size of a scaled PIC0\n"; return -1; }
+            const std::vector<entry> games{savedata, library[5], library[6], library[7]};
+            // the first rows of the launcher's Configurações column, 'Fundo e música do jogo' selected
+            const std::vector<entry> settings_rows{{"@info", i18n::tr(str::LAU_INFORMACOES_SISTEMA), "", "tex_sysconf", {}},
+                {"@settings", i18n::tr(str::LAU_CONFIGURACOES_RPCS3), i18n::tr(str::LAU_CONFIGURACOES_RPCS3_HELP), "tex_sysconf", {}},
+                {"@ui-language", i18n::tr(str::LANG_ROW_TITLE), i18n::trf(str::LANG_ROW_HELP, {i18n::raw(i18n::setting_label(i18n::current_setting()))}), "tex_sysconf", {}},
+                {"@xmb-media", i18n::trf(str::LAU_XMED_ROW, {str::COM_LIGADO}), i18n::tr(str::LAU_XMED_ROW_HELP), "tex_sysconf", {}},
+                {"@xmb-music", i18n::trf(str::LAU_XMED_MUSICA_ROW, {str::LAU_XMED_LIGADA}), i18n::tr(str::LAU_XMED_MUSICA_HELP), "tex_sysconf", {}},
+                {"@refresh", i18n::tr(str::LAU_ATUALIZAR_BIBLIOTECA), "", "item_tex_plain_folder", {}},
+                {"@patches:import", i18n::tr(str::LAU_IMPORTAR_PATCHES_JOGOS), "", "item_tex_disc_install", {}}};
+            const dialog disc{games[3].title + " (" + games[3].serial + ")", {s.disc_question}, {s.disc_size, s.disc_free}, -1, {}, {}, false, nullptr,
+                {cross_button(i18n::tr(str::COM_INSTALAR)), circle_button(i18n::tr(str::COM_VOLTAR))}};
+            for (const entry& e : settings_rows) { drawn.push_back(e.title); drawn.push_back(e.subtitle); }
+            drawn.push_back(disc.title);
+            const std::string hint = i18n::tr(str::LAU_HINT_GAME_ROW);
+            // the stand-in loader: what each game's own files give
+            const auto job = [&](const xm::media_request& r)
+            {
+                auto p = std::make_shared<payload>();
+                p->generation = r.generation;
+                p->only_music = !r.want_images;
+                const bool a = r.path == games[1].path, c = r.path == games[3].path;
+                if (r.want_images && a)
+                {
+                    p->background = evening;
+                    p->overlay = title_art;
+                    p->overlay_x = box.x;
+                    p->overlay_y = box.y;
+                }
+                if (r.want_images && c) p->background = night;
+                p->music_file = a || c;
+                p->track = (a || c) && r.want_music;
+                return p;
+            };
+            struct pending
+            {
+                std::uint64_t ready;
+                xm::media_request request;
+            };
+            struct shot
+            {
+                std::uint64_t at_ms;
+                const char* screen;
+                unsigned bg_lo, bg_hi, ov_lo, ov_hi;
+            };
+            // when each picture is taken, and the strengths the director must give then
+            static constexpr shot shots[] = {{1033, "media_glue_background_in", 100, 155, 0, 0}, {1633, "media_glue_background", 255, 255, 0, 0},
+                {2683, "media_glue_overlay_in", 255, 255, 100, 155}, {3200, "media_glue_full", 255, 255, 255, 255}, {3700, "media_glue_leaving", 100, 160, 30, 80},
+                {6900, "media_glue_dialog", 255, 255, 0, 0}, {8200, "media_glue_settings_column", 1, 254, 0, 0}, {10700, "media_glue_again", 255, 255, 0, 0}};
+            xm::basic_director<payload> director;
+            director.configure(xm::settings{}, false); // background and music on, 16:9, a loader thread
+            scene m, plain;
+            m.resources = plain.resources = firmware_images;
+            // the waves are drawn every frame in both: the 20 Hz layer cache would leave the two at different phases after
+            // the scene with media skipped the waves while its background was fully shown (no visible difference)
+            m.cached_background = plain.cached_background = false;
+            std::vector<std::uint32_t> other(frame.size());
+            std::vector<pending> jobs;
+            unsigned posts = 0, presents = 0, plays = 0, stops = 0, clears = 0, empty_results = 0, identical = 0;
+            std::uint64_t modal_stop = 0, modal_play = 0;
+            bool music = false, shown_images = false;
+            std::size_t next_shot = 0;
+            double last = 3. - 1. / 60;
+            const auto draw_both = [&](bool modal, int category, std::size_t selected, double seconds)
+            {
+                const float elapsed = float(seconds - last);
+                last = seconds;
+                for (scene* target : {&m, &plain})
+                {
+                    std::uint32_t* pixels = target == &m ? frame.data() : other.data();
+                    if (modal)
+                    {
+                        // a disc question (disc_ui::ask) over the XMB's backdrop
+                        target->backdrop(pixels, seconds);
+                        canvas c(pixels, 1280, 720);
+                        draw_dialog(c, typeface, target->resources, disc, seconds);
+                    }
+                    else
+                        target->draw(pixels, typeface, category, selected, category == 6 ? games : settings_rows, seconds, elapsed, "01/10  16:53",
+                            category == 6 ? std::string_view(hint) : std::string_view{}, false);
+                }
+            };
+            // phases (ms): game A from 0, B from 3500, C from 4800, the disc question 6600..7300, the Configurações column
+            // 8000..9000, C again, the boot at 10800
+            for (std::uint64_t k = 0;; ++k)
+            {
+                const std::uint64_t now = k * 1'000'000 / 60, ms = now / 1000;
+                if (ms >= 10800) break;
+                const bool modal = ms >= 6600 && ms < 7300;
+                const int category = ms >= 8000 && ms < 9000 ? 1 : 6;
+                const std::size_t selected = category == 1 ? 3 : ms < 3500 ? 1 : ms < 4800 ? 2 : 3;
+                // the loader's results first, then the director
+                for (std::size_t i = 0; i < jobs.size();)
+                {
+                    if (jobs[i].ready > now) { ++i; continue; }
+                    if (!director.arrived(job(jobs[i].request))) ++empty_results;
+                    jobs.erase(jobs.begin() + std::ptrdiff_t(i));
+                }
+                const entry& row = category == 6 ? games[selected] : settings_rows[selected];
+                xm::director_input in;
+                in.row = category == 6 && xm::source_of(row.path) != xm::source_kind::none ? std::string_view(row.path) : std::string_view{};
+                in.serial = row.serial;
+                in.hold = modal;
+                in.visible = category == 6;
+                in.music_gate = !modal;
+                auto out = director.tick(now, in);
+                if (out.drop) jobs.clear();
+                if (out.post)
+                {
+                    ++posts;
+                    jobs.push_back({now + 120'000, std::move(*out.post)});
+                }
+                if (out.present)
+                {
+                    ++presents;
+                    shown_images = out.present->has_background() || out.present->has_overlay();
+                    m.set_media(std::move(out.present->background), std::move(out.present->overlay), out.present->overlay_x, out.present->overlay_y);
+                }
+                if (out.stop_music)
+                {
+                    ++stops;
+                    music = false;
+                    if (modal && !modal_stop) modal_stop = ms;
+                }
+                if (out.play)
+                {
+                    ++plays;
+                    music = true;
+                    // a game with images starts its music only once they are in the scene
+                    if (shown_images && !m.media_bytes())
+                    {
+                        std::cerr << "FAIL: the music started before its background was in the scene (" << code << ", " << ms << " ms)\n";
+                        return -1;
+                    }
+                    if (ms >= 7300 && !modal_play) modal_play = ms;
+                }
+                if (out.clear)
+                {
+                    ++clears;
+                    m.clear_media();
+                }
+                m.set_media_alpha(out.background_alpha, 0, out.overlay_alpha);
+                // drawn at 30 frames per second (the launcher's rate while a fade runs) and at every picture
+                if (k % 2 && !(next_shot < std::size(shots) && ms >= shots[next_shot].at_ms)) continue;
+                draw_both(modal, category, selected, 3. + double(now) / 1e6);
+                if (!m.media_bytes() || (!out.background_alpha && !out.overlay_alpha))
+                {
+                    if (frame != other) { std::cerr << "FAIL: without media shown the frame differs from the XMB without media (" << code << ", " << ms << " ms)\n"; return -1; }
+                    ++identical;
+                }
+                if (next_shot < std::size(shots) && ms >= shots[next_shot].at_ms)
+                {
+                    const shot& sh = shots[next_shot++];
+                    if (out.background_alpha < sh.bg_lo || out.background_alpha > sh.bg_hi || out.overlay_alpha < sh.ov_lo || out.overlay_alpha > sh.ov_hi)
+                    {
+                        std::cerr << "FAIL: " << sh.screen << ": strengths " << out.background_alpha << '/' << out.overlay_alpha << " (" << code << ")\n";
+                        return -1;
+                    }
+                    if (!save(sh.screen)) return -1;
+                }
+            }
+            // The release before a boot, in the glue's order: the music, the jobs not started, what the director holds,
+            // then the scene's images
+            const bool music_at_boot = music;
+            jobs.clear();
+            unsigned released = 0;
+            director.drain([&](std::shared_ptr<payload> p) { released += p ? 1 : 0; });
+            const std::size_t held = m.media_bytes(), freed = m.clear_media();
+            xm::director_input again;
+            again.row = games[3].path;
+            again.serial = games[3].serial;
+            const auto sealed = director.tick(11'500'000, again);
+            draw_both(false, 6, 3, 3. + 10.8);
+            std::cout << "Media glue " << code << ": " << posts << " jobs, " << presents << " shown, " << empty_results << " without media, " << plays << " track(s) started, "
+                      << stops << " stopped, " << clears << " freed after a fade, " << identical << " frames identical to the XMB without media; at the boot " << freed
+                      << " bytes and " << released << " result(s) released\n";
+            if (presents != 3 || empty_results != 1 || clears != 2 || modal_stop != 6600 || modal_play <= 7300 || modal_play > 7800 || !music_at_boot)
+            {
+                std::cerr << "FAIL: media timeline (" << code << "): the dialog stopped the music at " << modal_stop << " ms, it started again at " << modal_play << " ms\n";
+                return -1;
+            }
+            if (!held || freed != held || m.media_bytes() || !released || sealed.post || sealed.present || sealed.play)
+            {
+                std::cerr << "FAIL: release before boot (" << code << "): " << freed << " of " << held << " bytes freed\n";
+                return -1;
+            }
+            if (frame != other) { std::cerr << "FAIL: the XMB after the release differs from one that never had media (" << code << ")\n"; return -1; }
+            if (next_shot != std::size(shots)) { std::cerr << "FAIL: media timeline pictures missing (" << code << ")\n"; return -1; }
+        }
         // Mirroring by pixels, with pure-colour stand-ins for the cross (red) and circle (green) glyphs
         {
             auto marked = firmware_images;
@@ -1370,9 +2369,90 @@ inline int render(const std::filesystem::path& out, const std::map<std::string, 
 }
 } // namespace languages
 
+// 0.40: --firmware <dev_flash>: the folder of that firmware (item_tex_plain_folder of explore_plugin_full.rco), decoded
+// as the launcher decodes it, against the known hash of firmware 4.93 (other versions are only reported). Off by
+// default: the default run uses only the drawn folder. Its one picture holds the firmware's texture, so it is written
+// only to an output folder outside the source tree (refused inside it, before anything is written).
+bool inside_source_tree(const std::filesystem::path& path)
+{
+    namespace fs = std::filesystem;
+    const auto lower = [](const fs::path& p)
+    {
+        std::error_code ec;
+        std::string s = fs::weakly_canonical(fs::absolute(p, ec), ec).generic_string();
+        for (char& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        while (s.size() > 1 && s.back() == '/') s.pop_back();
+        return s;
+    };
+    const std::string tree = lower(fs::path(__FILE__).parent_path() / "../.."), target = lower(path);
+    return target == tree || target.starts_with(tree + '/');
+}
+
+int folder_firmware_check(const std::filesystem::path& dev_flash, const std::filesystem::path& output, const font& typeface)
+{
+    namespace fs = std::filesystem;
+    namespace i18n = utils::ps4::i18n;
+    constexpr std::string_view known_493 = "c81579585f590958aec3d8fb040b9dc89e451fb38db694da78c1cf150bcb58eb";
+    const std::string_view abc = "abc";
+    if (sha256_hex(std::span(reinterpret_cast<const std::uint8_t*>(abc.data()), abc.size())) != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    {
+        std::cerr << "FAIL: sha256 self-test\n";
+        return 1;
+    }
+    if (inside_source_tree(output))
+    {
+        std::cerr << "FAIL: --firmware writes the firmware's texture; give an output folder outside the source tree\n";
+        return 1;
+    }
+    const auto bytes = read(dev_flash / "vsh/resource/explore_plugin_full.rco");
+    const std::vector<std::string> wanted{"item_tex_plain_folder"};
+    auto images = read_rco_images(bytes, wanted, inflate_data);
+    const auto found = images.find("item_tex_plain_folder");
+    if (found == images.end() || !found->second)
+    {
+        std::cerr << "FAIL: --firmware: no item_tex_plain_folder in " << (dev_flash / "vsh/resource/explore_plugin_full.rco").string() << '\n';
+        return 1;
+    }
+    const image& icon = found->second;
+    // The ARGB words as the launcher keeps them, little-endian
+    std::vector<std::uint8_t> argb;
+    argb.reserve(icon.pixels.size() * 4);
+    for (const std::uint32_t p : icon.pixels)
+        for (int shift = 0; shift < 32; shift += 8) argb.push_back(std::uint8_t(p >> shift));
+    const std::string hash = sha256_hex(argb);
+    const auto version = read(dev_flash / "vsh/etc/version.txt");
+    const bool fw_493 = std::string_view(reinterpret_cast<const char*>(version.data()), version.size()).find("release:04.9300:") != std::string_view::npos;
+    std::cout << "Firmware folder item_tex_plain_folder: " << icon.width << 'x' << icon.height << ", ARGB sha256 " << hash
+              << (fw_493 ? (hash == known_493 ? " (firmware 4.93: matches)" : " (firmware 4.93: DIFFERENT)") : " (not firmware 4.93: reported only)") << '\n';
+    if (fw_493 && hash != known_493) { std::cerr << "FAIL: the decoded firmware folder differs from the 4.93 reference\n"; return 1; }
+    // The drawn folder replaces it at the same size, so folder rows keep their rhythm either way
+    const image drawn = folder_icon();
+    if (drawn.width != icon.width || drawn.height != icon.height) { std::cerr << "FAIL: drawn folder " << drawn.width << 'x' << drawn.height << " vs firmware\n"; return 1; }
+    // The open folder as the launcher shows it with this firmware
+    scene m;
+    m.resources.insert_or_assign("item_tex_plain_folder", icon);
+    const folder_header header{&m.resources.at("item_tex_plain_folder"), "Corrida"};
+    const column_extras extras{&header, nullptr, i18n::tr(i18n::str::FLD_OPCOES)};
+    const std::vector<entry> rows{{"@folder:1", "Corrida", i18n::trf(i18n::str::FLD_PASTA_SUB_N, {3u}), "item_tex_plain_folder", {}},
+        {"@folder:2", "Luta", i18n::tr(i18n::str::FLD_PASTA_SUB_0), "item_tex_plain_folder", {}}};
+    std::vector<std::uint32_t> frame(1280 * 720);
+    for (int i = 0; i < 40; ++i) m.draw(frame.data(), typeface, 6, 0, rows, 3. + i / 60., 1.f / 60, "01/10  16:53", "", false, {}, &extras);
+    std::error_code ec;
+    fs::create_directories(output, ec);
+    if (!write_png(output / "xmb-folders-firmware.png", frame.data())) { std::cerr << "FAIL: cannot write " << (output / "xmb-folders-firmware.png").string() << '\n'; return 1; }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
-    // xmb_preview <dev_flash> <output dir> [ICON0.PNG] [--lang all <preview dir>]
+    // xmb_preview <dev_flash> <output dir> [ICON0.PNG] [--lang all <preview dir>] [--firmware <dev_flash>]
+    // 0.40: --firmware checks that firmware's folder icon (folder_firmware_check); the default run never reads it
+    std::filesystem::path folder_firmware;
+    if (argc >= 5 && std::string_view(argv[argc - 2]) == "--firmware")
+    {
+        folder_firmware = argv[argc - 1];
+        argc -= 2;
+    }
     std::filesystem::path language_out;
     if (argc >= 5 && std::string_view(argv[argc - 3]) == "--lang" && std::string_view(argv[argc - 2]) == "all")
     {
@@ -1381,6 +2461,11 @@ int main(int argc, char** argv)
     }
     if (argc != 3 && argc != 4) return 2;
     const std::filesystem::path firmware = argv[1], output = argv[2];
+    if (!folder_firmware.empty() && inside_source_tree(output))
+    {
+        std::cerr << "FAIL: --firmware writes the firmware's texture; give an output folder outside the source tree\n";
+        return 1;
+    }
     scene menu;
     std::vector<std::string> names(scene::icons.begin(), scene::icons.end());
     names.push_back("item_tex_ps3util"); names.push_back("item_tex_ps3game_folder");
@@ -1630,6 +2715,25 @@ int main(int argc, char** argv)
             assert(write_crop_png(output / "xmb-locked-firmware-zoom.png", with_firmware.data(), 300, 280, 150, 240, 3));
         }
         else std::cout << "This firmware has no tex_lock_icon: only the drawn padlock was rendered\n";
+    }
+
+    // 0.40: the folder drawn by util/ps4_folder_icon.hpp when the firmware lacks item_tex_plain_folder: the firmware
+    // texture's 314x178 canvas and about its footprint (x 58-254, y 15-148), so folder rows keep their size either way
+    {
+        const auto drawn_start = std::chrono::steady_clock::now();
+        const image drawn_folder = folder_icon();
+        const double drawn_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drawn_start).count();
+        assert(drawn_folder && drawn_folder.width == 314 && drawn_folder.height == 178);
+        int x0 = 314, y0 = 178, x1 = -1, y1 = -1;
+        for (int y = 0; y < 178; ++y)
+            for (int x = 0; x < 314; ++x)
+                if (drawn_folder.pixels[std::size_t(y) * 314 + std::size_t(x)] >> 24) { x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y); }
+        std::cout << "Drawn folder: " << drawn_folder.width << 'x' << drawn_folder.height << " in " << drawn_ms << " ms, visible x " << x0 << ".." << x1 << ", y " << y0 << ".." << y1 << '\n';
+        assert(std::abs(x0 - 58) <= 2 && std::abs(x1 - 255) <= 2 && std::abs(y0 - 18) <= 2 && std::abs(y1 - 155) <= 2);
+        // Sizes outside 16..1024 give no image; other sizes scale the same drawing
+        assert(!folder_icon(15, 100) && !folder_icon(100, 1025) && !folder_icon(0, 0));
+        const image small = folder_icon(16, 16);
+        assert(small.width == 16 && small.height == 16 && small.pixels.size() == 256);
     }
 
     // 0.38: the PS3 system dialogs of the install, disc and firmware screens (util/ps4_xmb_dialog.hpp), each over the XMB
@@ -1884,10 +2988,13 @@ int main(int argc, char** argv)
                 assert(a.sum == b.sum && a.left == b.left && a.right == b.right);
             }
             const int written = languages::render(language_out, firmware_images, with_arabic);
-            assert(written == 132);
+            // 0.40: 8 safe-mode, audio and game language screens per language; 11 folder and 14 game media screens per language;
+            // 9 new settings rows, 14 console-limit and platform screens and 8 pictures of the media timeline per language
+            assert(written == 388);
             std::cout << "Language previews: " << written << " files in " << language_out.string() << '\n';
         }
     }
+    if (!folder_firmware.empty() && folder_firmware_check(folder_firmware, output, typeface) != 0) return 1;
     std::cout << "PASS: original firmware RCO/GIM (RGBA+BC3), 10 category icons, PS3 font (7 exact sizes), bounded decode, animated frames, clipped drawing, "
                  "integer compositor within 3/255 of 0.29, PS3 system dialogs\n";
 }

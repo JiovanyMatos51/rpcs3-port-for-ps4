@@ -98,6 +98,22 @@ static atomic_t<bool> s_ps4_vdec_release_noted{false};
 static atomic_t<bool> s_ps4_vdec_open_failed_noted{false};
 static atomic_t<u32> s_ps4_vdec_queue_lines{0}; // 'VDEC: picture queue' lines written by this process (at most 32)
 
+// Failed decoder opens of this process, and those in a row since the last open that worked. A player such as libsail
+// reopens a refused decoder within a fraction of a millisecond, each try building and freeing a decoder context, so
+// while opens keep failing the lines of the open path go through governor::media_log_due (the first 8, then one in
+// 100); the game sees the same calls and results.
+static std::atomic<u32> s_ps4_vdec_open_failures{0};
+static std::atomic<u32> s_ps4_vdec_failed_in_row{0};
+
+static bool ps4_vdec_open_lines_due() noexcept
+{
+	const u32 n = s_ps4_vdec_failed_in_row.load(std::memory_order_relaxed);
+	return !n || utils::ps4::governor::media_log_due(n);
+}
+
+// 'VDEC: consumer stopped' lines written by this process (one per decoder, at most 16)
+static atomic_t<u32> s_ps4_vdec_consumer_lines{0};
+
 static const char* ps4_vdec_deblock_name(u32 level)
 {
 	return level >= 2 ? "all" : level == 1 ? "nonref" : "default";
@@ -355,6 +371,14 @@ struct vdec_context final
 	u32 ps4_perf_slice_aus = 0; // H.264 AUs scanned for slices (one in four)
 	u32 ps4_perf_slices = 0;
 	std::atomic<u32> ps4_getpic_empty{0}; // cellVdecGetPicture(Ext) found no picture (game threads)
+
+	// 0.40: who takes the pictures, for the line written when the decoder first waits 5 s for a consumer (a movie that
+	// stops while the decoder is healthy): pictures the game took and when, and the PPU thread that took the last one.
+	std::atomic<u32> ps4_pics_taken{0};
+	std::atomic<u64> ps4_getpic_last_us{0};
+	std::atomic<u32> ps4_getpic_last_tid{0};
+	u32 ps4_pics_queued = 0;         // decoder thread only: pictures put in the queue
+	bool ps4_consumer_noted = false; // decoder thread only
 
 	// 0.38: picture queue bound (utils::ps4::hle_memory::vdec_queue_limit): the decoder thread waits while the queue
 	// holds this many pictures. Written by the decoder thread, read by cellVdecGetPicture(Ext) on the game's threads.
@@ -674,6 +698,74 @@ struct vdec_context final
 		}
 	}
 
+	// 0.40: once per decoder (at most 16 per process), when it first waited 5 s for the game to take a picture: whether
+	// the game took any, how long ago and on which thread, that thread's last HLE calls (what it waits on instead), the
+	// AUs in flight and the queue. Decoder thread; reads the other thread through IDM without its lock (no lock held).
+	void ps4_note_consumer_stopped()
+	{
+		if (std::exchange(ps4_consumer_noted, true))
+		{
+			return;
+		}
+
+		const u32 nth = s_ps4_vdec_consumer_lines++;
+
+		if (nth >= 16)
+		{
+			return;
+		}
+
+		usz queued = 0;
+		{
+			std::lock_guard lock{mutex};
+			queued = out_queue.size();
+		}
+
+		const u32 taken = ps4_pics_taken.load(std::memory_order_relaxed);
+		const u64 last_us = ps4_getpic_last_us.load(std::memory_order_relaxed);
+		const u32 tid = ps4_getpic_last_tid.load(std::memory_order_relaxed);
+		std::string who = "no picture taken yet";
+
+		if (last_us)
+		{
+			const u64 now = ps4_vdec_now_us();
+			who = fmt::format("last GetPicture %u ms ago", now > last_us ? (now - last_us) / 1000 : 0);
+
+			if (const auto thread = idm::get_unlocked<named_thread<ppu_thread>>(tid))
+			{
+				fmt::append(who, " by '%s'", *thread->ppu_tname.load());
+
+				ps4_hle_call calls[6];
+				const u32 n = ps4_ppu_recent_calls(*thread, calls, static_cast<u32>(std::size(calls)));
+
+				if (n)
+				{
+					who += " (its last calls:";
+
+					for (u32 i = 0; i < n; i++)
+					{
+						fmt::append(who, " %s(0x%llx)", calls[i].name ? calls[i].name : "?", calls[i].ret);
+					}
+
+					who += ")";
+				}
+			}
+			else if (tid)
+			{
+				fmt::append(who, " by PPU thread 0x%x (gone)", tid);
+			}
+		}
+
+		const std::string line = fmt::format("VDEC: consumer stopped: pictures taken %u of %u, %s, AUs in flight %d, queue %u/%u, memory level %d (handle=0x%x)",
+			taken, ps4_pics_queued, who, au_count.load(), queued, ps4_queue_limit.load(std::memory_order_relaxed), utils::ps4::governor::memory_level(), handle);
+		cellVdec.error("%s", line);
+
+		if (nth == 0)
+		{
+			ps4_startup_checkpoint(line.c_str());
+		}
+	}
+
 	// One line per window with the decoder thread's cost: avg/max per decode call (send_packet + receive loop) and
 	// busy = decode time / window wall time. Busy near 100% means the decoder thread itself is the bottleneck.
 	void ps4_report_perf(const char* why)
@@ -820,9 +912,12 @@ struct vdec_context final
 			// 0.33: the slice worker is a plain pthread; when the console is out of thread resources its creation fails
 			// and so does avcodec_open2. Decode on this thread alone, as without the flag, instead of failing the open.
 			// A context whose open failed must be freed, not reopened.
-			const std::string line = fmt::format("VDEC: avcodec_open2 with slice threads failed (err=0x%x='%s'); opening single-threaded", err, utils::av_error_to_string(err));
-			cellVdec.error("%s", line);
-			ps4_startup_checkpoint(line.c_str());
+			if (ps4_vdec_open_lines_due())
+			{
+				const std::string line = fmt::format("VDEC: avcodec_open2 with slice threads failed (err=0x%x='%s'); opening single-threaded", err, utils::av_error_to_string(err));
+				cellVdec.error("%s", line);
+				ps4_startup_checkpoint(line.c_str());
+			}
 
 			av_dict_free(&opts);
 			avcodec_free_context(&ctx);
@@ -855,7 +950,10 @@ struct vdec_context final
 			}
 #ifdef RPCS3_PS4
 			av_dict_free(&opts);
-			cellVdec.error("avcodec_open2() failed (err=0x%x='%s', opts=%s)", err, utils::av_error_to_string(err), dict_content);
+			if (ps4_vdec_open_lines_due())
+			{
+				cellVdec.error("avcodec_open2() failed (err=0x%x='%s', opts=%s)", err, utils::av_error_to_string(err), dict_content);
+			}
 			ps4_open_error = "avcodec_open2() failed";
 			return;
 #else
@@ -866,7 +964,7 @@ struct vdec_context final
 		av_dict_free(&opts);
 
 #ifdef RPCS3_PS4
-		if (ps4_slice_threads)
+		if (ps4_slice_threads && ps4_vdec_open_lines_due())
 		{
 			// What FFmpeg actually started (it falls back to thread_count=1 on its own in some cases)
 			cellVdec.notice("VDEC: %s opened with thread_count=%d active_thread_type=%d", codec->name, ctx->thread_count, ctx->active_thread_type);
@@ -1299,6 +1397,9 @@ struct vdec_context final
 							if (elapsed++ >= 500) // 5 seconds
 							{
 								cellVdec.error("Video au decode has been waiting for a consumer for 5 seconds. (handle=0x%x, seq_id=%d, cmd_id=%d, queue_size=%d)", handle, cmd->seq_id, cmd->id, out_queue.size());
+#ifdef RPCS3_PS4
+								ps4_note_consumer_stopped();
+#endif
 								elapsed = 0;
 							}
 						}
@@ -1321,6 +1422,7 @@ struct vdec_context final
 							decoded_frames.pop_front();
 #ifdef RPCS3_PS4
 							ps4_perf_queue_max = std::max<u32>(ps4_perf_queue_max, static_cast<u32>(out_queue.size()));
+							ps4_pics_queued++;
 #endif
 						}
 
@@ -1938,6 +2040,9 @@ static inline u32 get_unk_size(u32 unk1, u32 unk2)
 
 error_code cellVdecQueryAttr(ppu_thread& ppu, vm::cptr<CellVdecType> type, vm::ptr<CellVdecAttr> attr)
 {
+#ifdef RPCS3_PS4
+	if (ps4_vdec_open_lines_due())
+#endif
 	cellVdec.notice("cellVdecQueryAttr(type=*0x%x, attr=*0x%x)", type, attr);
 
 	if (!type)
@@ -1951,6 +2056,9 @@ error_code cellVdecQueryAttr(ppu_thread& ppu, vm::cptr<CellVdecType> type, vm::p
 
 error_code cellVdecQueryAttrEx(ppu_thread& ppu, vm::cptr<CellVdecTypeEx> type, vm::ptr<CellVdecAttr> attr)
 {
+#ifdef RPCS3_PS4
+	if (ps4_vdec_open_lines_due())
+#endif
 	cellVdec.notice("cellVdecQueryAttrEx(type=*0x%x, attr=*0x%x)", type, attr);
 
 	if (!type || !attr)
@@ -2172,14 +2280,19 @@ static error_code vdecOpen(ppu_thread& ppu, T type, U res, vm::cptr<CellVdecCb> 
 
 		if (failure)
 		{
-			const utils::ps4::governor::heap_sample heap = utils::ps4::governor::sample_heap(false);
-			const std::string line = fmt::format("VDEC: open failed (%s; codec type %d, memSize %u KiB, heap live %u of %u MiB): CELL_VDEC_ERROR_FATAL returned to the game",
-				failure, type->codecType, res->memSize >> 10, heap.live >> 20, heap.cap >> 20);
-			cellVdec.error("%s", line);
+			s_ps4_vdec_failed_in_row.fetch_add(1, std::memory_order_relaxed);
 
-			if (!s_ps4_vdec_open_failed_noted.exchange(true))
+			if (u32 number = 0; utils::ps4::governor::media_log_due(s_ps4_vdec_open_failures, number))
 			{
-				ps4_startup_checkpoint(line.c_str());
+				const utils::ps4::governor::heap_sample heap = utils::ps4::governor::sample_heap(false);
+				const std::string line = fmt::format("VDEC: open failed (%s; codec type %d, memSize %u KiB, heap live %u of %u MiB): CELL_VDEC_ERROR_FATAL returned to the game (open failure %u of this process; the first 8, then one in 100 are logged)",
+					failure, type->codecType, res->memSize >> 10, heap.live >> 20, heap.cap >> 20, number);
+				cellVdec.error("%s", line);
+
+				if (!s_ps4_vdec_open_failed_noted.exchange(true))
+				{
+					ps4_startup_checkpoint(line.c_str());
+				}
 			}
 
 			return { CELL_VDEC_ERROR_FATAL, "%s", failure };
@@ -2207,9 +2320,16 @@ static error_code vdecOpen(ppu_thread& ppu, T type, U res, vm::cptr<CellVdecCb> 
 	{
 		// 0.29: the decoder thread was not created (CELL_EAGAIN when the console is out of thread resources). Undo the
 		// context instead of dereferencing a thread that does not exist (thrd->cmd_list below). The FFmpeg decoder is
-		// freed when the last reference ('vdec') goes away.
+		// freed when the last reference ('vdec') goes away. The error report below repeats an identical text at most 3
+		// times per thread (then one count at the thread's end), so only the open lines need the rate above.
 		idm::remove<vdec_context>(vid);
+		s_ps4_vdec_failed_in_row.fetch_add(1, std::memory_order_relaxed);
 		return { CELL_VDEC_ERROR_FATAL, "sys_ppu_thread_create() failed (0x%x)", static_cast<u32>(static_cast<s32>(err)) };
+	}
+
+	if (const u32 failed = s_ps4_vdec_failed_in_row.exchange(0, std::memory_order_relaxed); failed > 8)
+	{
+		cellVdec.notice("VDEC: decoder opened after %u failed opens in a row (their open lines were rate limited)", failed);
 	}
 #else
 	ppu_execute<&sys_ppu_thread_create>(ppu, +_tid, 0x10000, vid, +res->ppuThreadPriority, +res->ppuThreadStackSize, SYS_PPU_THREAD_CREATE_INTERRUPT, +_name);
@@ -2232,6 +2352,9 @@ static error_code vdecOpen(ppu_thread& ppu, T type, U res, vm::cptr<CellVdecCb> 
 
 error_code cellVdecOpen(ppu_thread& ppu, vm::cptr<CellVdecType> type, vm::cptr<CellVdecResource> res, vm::cptr<CellVdecCb> cb, vm::ptr<u32> handle)
 {
+#ifdef RPCS3_PS4
+	if (ps4_vdec_open_lines_due())
+#endif
 	cellVdec.warning("cellVdecOpen(type=*0x%x, res=*0x%x, cb=*0x%x, handle=*0x%x)", type, res, cb, handle);
 
 	return vdecOpen(ppu, type, res, cb, handle);
@@ -2239,6 +2362,9 @@ error_code cellVdecOpen(ppu_thread& ppu, vm::cptr<CellVdecType> type, vm::cptr<C
 
 error_code cellVdecOpenEx(ppu_thread& ppu, vm::cptr<CellVdecTypeEx> type, vm::cptr<CellVdecResourceEx> res, vm::cptr<CellVdecCb> cb, vm::ptr<u32> handle)
 {
+#ifdef RPCS3_PS4
+	if (ps4_vdec_open_lines_due())
+#endif
 	cellVdec.warning("cellVdecOpenEx(type=*0x%x, res=*0x%x, cb=*0x%x, handle=*0x%x)", type, res, cb, handle);
 
 	return vdecOpen(ppu, type, res, cb, handle);
@@ -2606,6 +2732,10 @@ error_code cellVdecGetPictureExt(ppu_thread& ppu, u32 handle, vm::cptr<CellVdecP
 
 		vdec->out_queue.pop_front();
 #ifdef RPCS3_PS4
+		vdec->ps4_pics_taken.fetch_add(1, std::memory_order_relaxed);
+		vdec->ps4_getpic_last_us.store(ps4_vdec_now_us(), std::memory_order_relaxed);
+		vdec->ps4_getpic_last_tid.store(ppu.id, std::memory_order_relaxed);
+
 		// The decoder waits while the queue holds ps4_queue_limit pictures
 		if (vdec->out_queue.size() + 1 == vdec->ps4_queue_limit.load(std::memory_order_relaxed))
 #else
@@ -3065,6 +3195,9 @@ error_code cellVdecSetFrameRate(u32 handle, CellVdecFrameRate frameRateCode)
 
 error_code cellVdecOpenExt(ppu_thread& ppu, vm::cptr<CellVdecType> type, vm::cptr<CellVdecResourceExt> res, vm::cptr<CellVdecCb> cb, vm::ptr<u32> handle)
 {
+#ifdef RPCS3_PS4
+	if (ps4_vdec_open_lines_due())
+#endif
 	cellVdec.warning("cellVdecOpenExt(type=*0x%x, res=*0x%x, cb=*0x%x, handle=*0x%x)", type, res, cb, handle);
 
 	if (!res)

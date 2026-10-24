@@ -41,8 +41,8 @@
 // bytes that fell back to flexible memory keep growing (thread stacks live there). The handler uninstalls itself when
 // the reserve is empty, so operator new then fails as before. Releases log through ps4_fatal_note (no allocation).
 // "Modo frio" (util/ps4_cool_mode.hpp) also serializes compiles and keeps the boot SPU cache build at upstream's
-// worker count. During a boot compile stage it allows two compiles in total and no optional workers
-// (slot_mode::two_in_total; /data/rpcs3/cool-mode-serial-boot.flag: one, as in 0.38).
+// worker count. With the 0.39 rules, during a boot compile stage it allows two compiles in total and no optional
+// workers (slot_mode::two_in_total; /data/rpcs3/cool-mode-serial-boot.flag: one, as in 0.38).
 //
 // 0.38 (governor v2): the budget authority and non-sticky levels. Once a second (budget_tick, from heap_pressure() and
 // the main loop) the owners of the direct-memory pool are measured: the orbis-compat ledger (free total, largest run,
@@ -60,11 +60,17 @@
 // flexible memory: it gives the heap reserve (one 48 MiB block, re-armed every time the XMB opens) to the failing
 // request. /data/rpcs3/no-mem-budget.flag keeps the build cap and no reservation (0.37 caps; the levels stay).
 //
-// 0.39: memory level 1 from max(512 MiB, cap / 4) of room or a slope sustained over two 30 s windows outside boot
-// compile stages (util/ps4_mem_budget.hpp); at level 1 PPU/SPU compiles serialize only below 384 MiB of room or on
-// that slope. compile_slot has classes (slot_kind: cpu, rsx, interp): one per class while level 1 serializes, one in
-// total from level 2 on, and only cpu slots wait for level 2 to fall. /data/rpcs3/governor-v038.flag restores the
-// 0.38 rules (768 MiB, one-window slope, one shared slot).
+// 0.39 rules: memory level 1 from max(512 MiB, cap / 4) of room or a slope sustained over two 30 s windows outside
+// boot compile stages (util/ps4_mem_budget.hpp); at level 1 PPU/SPU compiles serialize only below 384 MiB of room or
+// on that slope. compile_slot has classes (slot_kind: cpu, rsx, interp): one per class while level 1 serializes, one
+// in total from level 2 on, and only cpu slots wait for level 2 to fall. Thread levels from the count the console's
+// cap applies to, with a cap learned from the first refused create.
+// 0.40: they change compile and memory concurrency for every game, so the 0.38 rules (768 MiB, one-window slope, one
+// shared slot, thread levels from the registry at 56/64) are the default; the 0.39 rules run with
+// /data/rpcs3/governor-v039.flag or the governor_v039 line of features.txt (util/ps4_safe_mode.hpp; governor-v038.flag
+// and the safe mode keep the 0.38 rules). The optional-thread rule (optional_thread_allowed) is independent of both
+// (after a console refusal below the cap it counts against that load, optional_thread_cap), and so is the single paced
+// retry of a refused HLE media create (is_hle_media_thread, media_retry_pace).
 //
 // Outside the PS4 build everything reports level 0 and compile_slot does nothing.
 
@@ -72,6 +78,7 @@
 #include "util/ps4_mem_budget.hpp"
 
 #include <atomic>
+#include <cstdio>
 #include <string>
 #include <string_view>
 
@@ -80,6 +87,7 @@
 #include "util/ps4_adapt.hpp"
 #include "util/ps4_cool_mode.hpp"
 #include "util/ps4_i18n.hpp"           // toasts (tr: constant tables, no allocation)
+#include "util/ps4_safe_mode.hpp"      // feature switches (optional-thread rule)
 #include "util/ps4_virtual_memory.hpp" // private (JIT, own stacks) and shared (guest) direct commits
 #include "util/ps4_vram_policy.hpp"    // GPU window meter
 
@@ -166,6 +174,166 @@ constexpr int classify_thread_load(u32 total, u32 cap) noexcept
 {
     const u32 c = clamp_thread_cap(cap);
     return total + thread_l2_margin >= c ? 2 : total + thread_l1_margin >= c ? 1 : 0;
+}
+
+// 0.40: an optional emulator thread group of 'n' threads may start while the count the console's cap applies to
+// ('total': orbis live + exited not joined), with those threads added, leaves the last thread_l2_margin slots free:
+// those belong to the game, whose creates fail with CELL_EAGAIN when the cap is reached.
+constexpr bool optional_allowed(u32 total, u32 n, u32 cap) noexcept
+{
+    return total + n + thread_l2_margin <= clamp_thread_cap(cap);
+}
+
+// optional_thread_allowed() with its inputs: 'rule_on' is the optional_thread_rule row (optional-threads-free.flag
+// turns it off: every optional thread may start, as in 0.39).
+constexpr bool optional_decision(bool rule_on, u32 total, u32 n, u32 cap) noexcept
+{
+    return !rule_on || optional_allowed(total, n, cap);
+}
+
+// 0.40: how many of 'wanted' optional threads may start now: the largest n <= wanted with optional_decision() true
+// (all of them with the rule off).
+constexpr u32 optional_allowed_count(bool rule_on, u32 total, u32 wanted, u32 cap) noexcept
+{
+    if (!rule_on) return wanted;
+    const u32 c = clamp_thread_cap(cap);
+    const u32 used = total + thread_l2_margin;
+    const u32 room = c > used ? c - used : 0;
+    return wanted < room ? wanted : room;
+}
+
+// 0.40: the cap the optional-thread rule counts against. Once the console refused a create while fewer threads counted
+// than the cap in force ('refused_at': the count right after the first refused create of the process, 0 = none), that
+// count, for the rest of the process and under either governor rule set: with a cap of 80 and a refusal at 78 the last
+// 8 slots below 78 stay with the game, not 6. The 0.38 thread levels keep their registry count; the 0.39 rules learn
+// the same cap (note_thread_refusal). A count below thread_cap_min is not taken as a cap (such a refusal had another
+// cause, such as no memory for a stack).
+constexpr u32 optional_cap(u32 cap, u32 refused_at) noexcept
+{
+    return refused_at >= thread_cap_min && refused_at < clamp_thread_cap(cap) ? refused_at : cap;
+}
+
+// 0.40: the threads the emulator itself creates through sys_ppu_thread_create when a game opens an HLE codec
+// (cellVdec, cellAtracXdec, cellAdec, cellDmuxPamf). With the guest create retry off, a refused one of these fails at
+// once and libsail reopens the decoder within a fraction of a millisecond, so the refused create waits for a slot
+// once (media_retry_pace). Exact names only: the vdec reaper and every game-created thread keep the immediate
+// CELL_EAGAIN.
+constexpr bool is_hle_media_thread(std::string_view name) noexcept
+{
+    return name == "HLE Video Decoder" || name == "HLE ATRAC3plus decoder" || name == "HLE LPCM decoder" || name == "HLE PAMF demuxer";
+}
+
+inline constexpr u32 media_retry_ceiling_ms = 250; // 0.39 spent ~230 ms per refused vdec open in its retries
+inline constexpr u32 media_retry_step_ms = 10;
+
+// Next sleep in ms before an HLE media create is tried once more, 0 = create now: a slot came back (fewer threads than
+// right after the refusal, 'load_at_refusal'; the cap in force can sit above the count the console refused at, so it
+// is not the condition), or 'waited_ms' reached the ceiling. A load of 0 (not known) waits for the ceiling.
+constexpr u32 media_retry_wait_ms(u32 total_now, u32 load_at_refusal, u32 waited_ms) noexcept
+{
+    if (total_now < load_at_refusal || waited_ms >= media_retry_ceiling_ms) return 0;
+    const u32 left = media_retry_ceiling_ms - waited_ms;
+    return left < media_retry_step_ms ? left : media_retry_step_ms;
+}
+
+// The wait of media_retry_pace with its clock, thread count and sleep passed in (host tests use fakes): sleeps in
+// media_retry_wait_ms steps from 'since_us' until a slot comes back, the ceiling passes or 'stopped()' is true, and
+// returns the ms waited since 'since_us'. Bounded by a sleep count as well, so a clock that does not advance cannot
+// keep it waiting.
+template <typename Now, typename Total, typename Sleep, typename Stop>
+inline u32 media_retry_pace_with(u64 since_us, u32 load_at_refusal, Now&& now_us, Total&& total_now, Sleep&& sleep_ms, Stop&& stopped) noexcept
+{
+    const auto elapsed_ms = [&]() noexcept -> u32
+    {
+        const u64 now = now_us();
+        const u64 ms = now > since_us ? (now - since_us) / 1000 : 0;
+        return ms > 0xffffffffull ? 0xffffffffu : static_cast<u32>(ms);
+    };
+    for (u32 sleeps = 0; sleeps < 2 * (media_retry_ceiling_ms / media_retry_step_ms); sleeps++)
+    {
+        if (stopped()) break;
+        const u32 step = media_retry_wait_ms(total_now(), load_at_refusal, elapsed_ms());
+        if (!step) break;
+        sleep_ms(step);
+    }
+    return elapsed_ms();
+}
+
+// 0.40: rate of the failure lines of the HLE codec opens and of the decoder diagnostics: a game may reopen a refused
+// decoder in a tight loop, so the first 8 of a counter are logged, then one in 100.
+constexpr bool media_log_due(u32 number) noexcept
+{
+    return number <= 8 || number % 100 == 0;
+}
+
+// Counts one more in 'count'; 'number' receives its 1-based count. True when its line is due. Any thread, lock-free.
+inline bool media_log_due(std::atomic<u32>& count, u32& number) noexcept
+{
+    number = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    return media_log_due(number);
+}
+
+// 0.40 opt-in (row ppu_boot_workers, ppu-boot-workers.flag or features.txt): the boot compile stage of the PPU modules
+// (the main thread's initialize: no game code has run and no other guest thread exists) uses up to boot_workers_total
+// compile threads, the 2 LLVM threads plus both optional workers, while nothing presses: memory and thread level 0, at
+// most 48 RPCS3 threads, at least 1 GiB of heap room, and no adapt key of the title from an out-of-memory compile, a
+// refused thread or the heap cap. Its compiles are admitted against boot_compile_budget (boot_compile_admit) while the
+// memory level stays 0: any level change brings the normal rules back for the next module.
+inline constexpr u32 boot_workers_total = 4;
+inline constexpr u32 boot_workers_base = 2; // the PS4 policy's LLVM thread count
+inline constexpr u32 boot_workers_max_threads = 48;
+inline constexpr u64 boot_workers_min_room = 1ull << 30;
+inline constexpr u64 boot_compile_budget = 2 * ::utils::ps4::mem_budget::compile_budget;
+
+struct boot_workers_state
+{
+    bool row_on = false;     // the ppu_boot_workers row
+    bool boot_stage = false; // the main thread's boot compile with no other guest thread
+    u32 llvm_threads = 0;    // LLVM threads in force
+    u32 modules = 0;         // modules of this workload
+    int memory_level = 0;
+    int thread_level = 0;
+    u32 threads = 0;         // live RPCS3 threads
+    bool room_known = false;
+    s64 room = 0;            // heap room in bytes
+    bool adapt_key = false;  // an adapt key of the title that asks for fewer compile threads
+};
+
+// nullptr: the boot rule applies; else the first condition that keeps the normal workers (for the startup line).
+constexpr const char* boot_workers_block(const boot_workers_state& s) noexcept
+{
+    if (!s.row_on) return "ppu_boot_workers off";
+    if (!s.boot_stage) return "not the boot compile stage";
+    if (s.llvm_threads != boot_workers_base) return "LLVM threads not 2";
+    if (s.modules <= boot_workers_base) return "2 modules or fewer";
+    if (s.memory_level != 0) return "memory level above 0";
+    if (s.thread_level != 0) return "thread level above 0";
+    if (s.threads > boot_workers_max_threads) return "more than 48 RPCS3 threads";
+    if (!s.room_known || s.room < static_cast<s64>(boot_workers_min_room)) return "heap room below 1 GiB";
+    if (s.adapt_key) return "adapt key of this title (llvm_threads=1, threads=low or heap_cap)";
+    return nullptr;
+}
+
+// Optional workers on top of the 2 LLVM threads under the boot rule (0 when it does not apply), at most
+// 'optional_max' (the permits of the optional workers) and never more than the modules left for them.
+constexpr u32 boot_workers_optional(const boot_workers_state& s, u32 optional_max) noexcept
+{
+    if (boot_workers_block(s)) return 0;
+    const u32 extra = boot_workers_total - boot_workers_base;
+    const u32 n = extra < optional_max ? extra : optional_max;
+    const u32 left = s.modules - boot_workers_base;
+    return n < left ? n : left;
+}
+
+// Compile admission of a boot-rule worker: the normal rule (mem_budget::compile_admit) at any memory level above 0;
+// at level 0 the larger in-flight budget, with the same room guard (the compiles in flight leave the level 2 room
+// free). The first compile always passes.
+constexpr bool boot_compile_admit(s64 room, u64 in_flight, u64 bytes, int level) noexcept
+{
+    if (level != 0) return ::utils::ps4::mem_budget::compile_admit(room, in_flight, bytes, level);
+    if (!in_flight) return true;
+    if (in_flight + bytes > boot_compile_budget) return false;
+    return room - static_cast<s64>(in_flight + bytes) >= static_cast<s64>(::utils::ps4::mem_budget::l2_room);
 }
 
 // First word of a firmware text ("13.020.001 (0x13020001)" -> "13.020.001"), leading blanks skipped.
@@ -327,6 +495,81 @@ constexpr u32 spu_cache_extra_workers_for(u32 workers, u64 programs, const heap_
     return static_cast<u32>(total) - workers;
 }
 
+// 0.40: the inputs of the compile serialization decision, for the text that names why a build runs on one thread
+// (serialize_reason).
+struct serialize_state
+{
+    bool v038 = true;        // the rules in force (the 0.38 rules are the default)
+    int memory_level = 0;    // 0..3
+    bool room_known = false; // the heap cap is known
+    s64 room = 0;            // heap room under the cap, bytes
+    bool cpu_l1 = false;     // 0.39 rules: memory level 1 also serializes PPU/SPU compiles
+    u32 threads = 0;         // 0.38 rules: live RPCS3 threads (registry); 0.39 rules: live + exited not joined
+    u32 cap = 0;             // 0.39 rules: the thread cap in force
+    bool cool = false;       // "Modo frio"
+    bool cool_stage = false; // a boot compile stage runs (0.39 rules: "Modo frio" then allows two compiles in total)
+};
+
+// The causes that serialize compiles under the rules in force, in the order the slot mode looks at them
+// (mem_budget::slot_mode_v038 / slot_mode_v039), each one enough on its own, joined by "; ":
+//   "memory level 2, room 300 MiB"
+//   "thread level 2, 74 of 80"                                 (0.39 rules: live + exited not joined of the cap)
+//   "thread level 2, 66 live RPCS3 threads (levels at 56/64)"  (0.38 rules: the thread registry)
+//   "cool mode"
+// and "none now" once none holds any more (the levels can fall between the decision and this text). NUL-terminated,
+// truncated to fit; returns the length. Allocation-free.
+inline usz format_serialize_reason(char* out, usz size, const serialize_state& st) noexcept
+{
+    if (!out || !size) return 0;
+    out[0] = '\0';
+    usz len = 0;
+    u32 causes = 0;
+    const auto append = [&](const char* text) noexcept
+    {
+        for (const char* p = causes ? "; " : ""; *p && len + 1 < size; ++p) out[len++] = *p;
+        for (const char* p = text; *p && len + 1 < size; ++p) out[len++] = *p;
+        out[len] = '\0';
+        causes++;
+    };
+
+    char part[128];
+    const int level = st.memory_level < 0 ? 0 : st.memory_level > 3 ? 3 : st.memory_level;
+    const auto memory = [&](const char* why) noexcept
+    {
+        if (st.room_known)
+            std::snprintf(part, sizeof(part), "memory level %d, room %lld MiB%s", level, static_cast<long long>(st.room / (s64{1} << 20)), why);
+        else
+            std::snprintf(part, sizeof(part), "memory level %d%s", level, why);
+        append(part);
+    };
+
+    if (st.v038)
+    {
+        if (level > 0) memory("");
+        if (classify_threads(st.threads) >= 2)
+        {
+            std::snprintf(part, sizeof(part), "thread level 2, %u live RPCS3 threads (levels at %u/%u)", st.threads, thread_warn, thread_high);
+            append(part);
+        }
+        if (st.cool) append("cool mode");
+    }
+    else
+    {
+        // Memory level 1 serializes PPU/SPU only on its floor (room, flexible memory) or a sustained slope
+        if (level >= 2) memory("");
+        else if (level == 1 && st.cpu_l1) memory(" (below 384 MiB of room, low flexible memory or a sustained slope)");
+        if (classify_thread_load(st.threads, st.cap) >= 2)
+        {
+            std::snprintf(part, sizeof(part), "thread level 2, %u of %u", st.threads, clamp_thread_cap(st.cap));
+            append(part);
+        }
+        // A boot compile stage keeps two compiles in "Modo frio": not serialized by it
+        if (st.cool && !st.cool_stage) append("cool mode");
+    }
+    if (!causes) append("none now");
+    return len;
+}
+
 #ifdef RPCS3_PS4
 namespace detail
 {
@@ -393,6 +636,8 @@ inline s64 g_slope_room = 0;
 inline u64 g_slope_us = 0;
 inline unsigned g_slope_streak = 0;            // 0.39: closed windows in a row that predicted level 2
 inline std::atomic<bool> g_cpu_l1{false};      // 0.39: level 1 also serializes PPU/SPU compiles
+inline std::atomic<bool> g_cpu_l1_floor{false}; // the 0.38 rules, flexible floor or room < 384 MiB (any stage)
+inline std::atomic<bool> g_cpu_l1_slope{false}; // the slope rule at the last sample, the compile stage not considered
 inline std::atomic<u32> g_compile_stage{0};    // 0.39: boot compile stages in progress (compile_stage)
 inline std::atomic<u64> g_refusals_seen{0};
 inline std::atomic<u64> g_refusal_us{0};       // last refused or unserved allocation (counters, hook, new_handler)
@@ -664,18 +909,34 @@ inline void level_fell_below_2() noexcept
     orbis::mmapDirectClearCritical();
 }
 
-// 0.39: governor-v038.flag (read once; the rules in force are written to startup.log).
+// The rules in force, written to startup.log at the first call and whenever they change (a game boot can switch them).
+inline void log_rules(bool v038) noexcept
+{
+    if (!v038)
+    {
+        ps4_startup_checkpoint("memory governor: 0.39 rules (governor-v039.flag or features.txt): level 1 below max(512 MiB, cap/4) of room or a slope over two 30 s windows outside compile stages; level 1 serializes PPU/SPU only below 384 MiB or on that slope; slots one per class (cpu/rsx/interp) at level 1, one in total from level 2; thread levels at cap - 16 / cap - 8");
+        return;
+    }
+    const bool killed = ::access(v038_flag, F_OK) == 0;
+    const bool safe = ::utils::ps4::safe_mode::g_level.load(std::memory_order_relaxed) != 0;
+    ps4_startup_checkpoint(killed
+        ? "memory governor: 0.38 rules (governor-v038.flag): level 1 below 768 MiB of room or one slope window, every compile shares one slot from level 1, thread levels from the registry at 56/64"
+        : safe ? "memory governor: 0.38 rules (safe mode): level 1 below 768 MiB of room or one slope window, every compile shares one slot from level 1, thread levels from the registry at 56/64"
+        : "memory governor: 0.38 rules (default; governor-v039.flag: 0.39 rules): level 1 below 768 MiB of room or one slope window, every compile shares one slot from level 1, thread levels from the registry at 56/64");
+}
+
+// The 0.38 rules unless the governor_v039 row is on (util/ps4_safe_mode.hpp). Read at every decision, so a game's
+// safe-mode level or a changed flag file applies from its boot on. One relaxed load while nothing changes.
 inline bool governor_v038() noexcept
 {
-    static const bool on = []() noexcept
+    static std::atomic<int> s_logged{-1};
+    const bool v038 = !::utils::ps4::safe_mode::enabled(::utils::ps4::safe_mode::feature::governor_v039);
+    const int value = v038 ? 1 : 0;
+    if (s_logged.load(std::memory_order_relaxed) != value && s_logged.exchange(value, std::memory_order_relaxed) != value)
     {
-        const bool present = ::access(v038_flag, F_OK) == 0;
-        ps4_startup_checkpoint(present
-            ? "memory governor: 0.38 rules (governor-v038.flag): level 1 below 768 MiB of room or one slope window, every compile shares one slot from level 1, thread levels from the registry at 56/64"
-            : "memory governor: level 1 below max(512 MiB, cap/4) of room or a slope over two 30 s windows outside compile stages; level 1 serializes PPU/SPU only below 384 MiB or on that slope; slots one per class (cpu/rsx/interp) at level 1, one in total from level 2 (governor-v038.flag: 0.38 rules)");
-        return present;
-    }();
-    return on;
+        log_rules(v038);
+    }
+    return v038;
 }
 
 inline bool compile_stage_active() noexcept
@@ -683,13 +944,22 @@ inline bool compile_stage_active() noexcept
     return g_compile_stage.load(std::memory_order_relaxed) != 0;
 }
 
+// Whether level 1 serializes PPU/SPU compiles now (0.39 rules). The slope part never counts while a compile stage
+// runs: g_cpu_l1 is the value of the last heap sample, which may predate the stage (Demon's Souls 0.39 built its SPU
+// cache on 1 worker, 92 ms before the sample that would have cleared it).
+inline bool cpu_l1_now() noexcept
+{
+    return ::utils::ps4::mem_budget::cpu_l1_in_stage(g_cpu_l1_floor.load(std::memory_order_relaxed),
+        g_cpu_l1_slope.load(std::memory_order_relaxed), compile_stage_active());
+}
+
 // Effect text of a heap level change under the rules in force.
 inline const char* level_effect_now(int to) noexcept
 {
     if (to == 1 && !governor_v038())
     {
-        return g_cpu_l1.load(std::memory_order_relaxed) ? "PPU/SPU compiles serialized (room below 384 MiB or a sustained slope), no optional workers"
-                                                        : "no optional workers, compiles stay parallel";
+        return cpu_l1_now() ? "PPU/SPU compiles serialized (room below 384 MiB or a sustained slope), no optional workers"
+                            : "no optional workers, compiles stay parallel";
     }
     return level_effect(to);
 }
@@ -730,7 +1000,12 @@ inline int update_level(const heap_sample& s) noexcept
     // Thread stacks live in flexible memory: below the floor compiles are serialized, as in 0.37.
     const bool flexible_low = s.flexible_free && s.flexible_free < flexible_floor;
     if (flexible_low && raw < 1) raw = 1;
-    g_cpu_l1.store(v038 || flexible_low || mb::l1_serializes_cpu(room, mb::slope_rule_v039(room, slope, g_slope_streak, stage)), std::memory_order_relaxed);
+    // Same value as l1_serializes_cpu(room, slope_rule_v039(..., stage)), kept in two parts for cpu_l1_now()
+    const bool cpu_floor = v038 || flexible_low || room < static_cast<s64>(mb::cpu_serialize_room);
+    const bool slope_cpu = !v038 && mb::slope_rule_v039(room, slope, g_slope_streak, false);
+    g_cpu_l1_floor.store(cpu_floor, std::memory_order_relaxed);
+    g_cpu_l1_slope.store(slope_cpu, std::memory_order_relaxed);
+    g_cpu_l1.store(mb::cpu_l1_in_stage(cpu_floor, slope_cpu, stage), std::memory_order_relaxed);
     const int level = mb::step_level(g_level_state, raw, room, s.fallback_live != 0, now, l1_clear_room);
     const int previous = g_level.exchange(level, std::memory_order_relaxed);
     if (previous >= 2 && level < 2) level_fell_below_2();
@@ -1087,19 +1362,52 @@ inline s64 room_now() noexcept
     return s.cap ? static_cast<s64>(s.cap) - static_cast<s64>(s.live) : (s64{1} << 40);
 }
 
+namespace detail
+{
+// 0.40: this thread is a PPU compile worker of the boot compile stage under the ppu_boot_workers rule
+// (boot_compile_scope): its admissions use boot_compile_admit.
+inline thread_local bool t_boot_compile = false;
+} // namespace detail
+
 // 0.38: compile admission for a working set of 'bytes' (PPU module, SPU program, RSX pipeline), see
 // mem_budget::compile_admit. True: admitted, and release_compile(bytes) must follow when the compile ends.
 inline bool try_admit_compile(u64 bytes) noexcept
 {
     const heap_sample s = sample_heap(false);
     const s64 room = s.cap ? static_cast<s64>(s.cap) - static_cast<s64>(s.live) : (s64{1} << 40);
+    const bool boot = detail::t_boot_compile;
     s64 in = detail::g_compile_in_flight.load(std::memory_order_relaxed);
     for (;;)
     {
-        if (!::utils::ps4::mem_budget::compile_admit(room, static_cast<u64>(in > 0 ? in : 0), bytes, memory_level())) return false;
+        const u64 in_flight = static_cast<u64>(in > 0 ? in : 0);
+        const int level = memory_level();
+        if (!(boot ? boot_compile_admit(room, in_flight, bytes, level) : ::utils::ps4::mem_budget::compile_admit(room, in_flight, bytes, level))) return false;
         if (detail::g_compile_in_flight.compare_exchange_weak(in, in + static_cast<s64>(bytes), std::memory_order_acq_rel)) return true;
     }
 }
+
+// 0.40: held by a PPU compile worker of the boot compile stage while the ppu_boot_workers rule applies to its
+// workload ('on'): its compile admissions use the boot budget (boot_compile_admit). Nested scopes keep the outer one.
+class boot_compile_scope
+{
+public:
+    explicit boot_compile_scope(bool on) noexcept
+        : m_prev(detail::t_boot_compile)
+    {
+        detail::t_boot_compile = on || m_prev;
+    }
+
+    ~boot_compile_scope()
+    {
+        detail::t_boot_compile = m_prev;
+    }
+
+    boot_compile_scope(const boot_compile_scope&) = delete;
+    boot_compile_scope& operator=(const boot_compile_scope&) = delete;
+
+private:
+    bool m_prev;
+};
 
 inline void release_compile(u64 bytes) noexcept
 {
@@ -1171,10 +1479,11 @@ private:
 };
 
 // 0.38: optional compile workers beyond the base count (mem_budget::optional_workers_allowed); 'per_worker_peak' 0 =
-// the default estimate. "Modo frio" never adds them (its boot compile stage runs on the two base slots).
+// the default estimate. With the 0.39 rules "Modo frio" never adds them (its boot compile stage runs on the two base
+// slots); with the 0.38 rules it serializes the compile instead.
 inline bool optional_workers_allowed(u32 extra, u64 per_worker_peak) noexcept
 {
-    if (::utils::ps4::cool_mode::enabled()) return false;
+    if (!detail::governor_v038() && ::utils::ps4::cool_mode::enabled()) return false;
     const heap_sample s = sample_heap(false);
     const s64 room = s.cap ? static_cast<s64>(s.cap) - static_cast<s64>(s.live) : (s64{1} << 40);
     return ::utils::ps4::mem_budget::optional_workers_allowed(memory_level(), room, extra, per_worker_peak);
@@ -1349,9 +1658,9 @@ inline u32 load_thread_cap() noexcept
     usz got = 0;
     const u32 from_file = firmware[0] && read_small_file(thread_cap_file, text, sizeof(text), got) ? parse_thread_cap(std::string_view(text, got), firmware) : 0;
     const u32 cap = from_file ? from_file : thread_cap_default;
-    char line[224];
-    std::snprintf(line, sizeof(line), "memory governor: thread cap %u (%s) for firmware %s; thread levels at %u/%u of live + exited-not-joined threads",
-        cap, from_file ? "thread-cap.txt" : "default", firmware[0] ? firmware : "unknown", cap - thread_l1_margin, cap - thread_l2_margin);
+    char line[256];
+    std::snprintf(line, sizeof(line), "memory governor: thread cap %u (%s) for firmware %s; optional threads leave the last %u slots free; 0.39 thread levels at %u/%u of live + exited-not-joined threads",
+        cap, from_file ? "thread-cap.txt" : "default", firmware[0] ? firmware : "unknown", thread_l2_margin, cap - thread_l1_margin, cap - thread_l2_margin);
     log_line(line, g_thread_lines, true);
     return cap;
 }
@@ -1421,8 +1730,8 @@ inline void note_thread_refusal(const ps4_thread_load& load) noexcept
     detail::log_line(line, detail::g_thread_lines, true);
 }
 
-// 0 / 1 / 2: 0.39 from the threads the console's cap counts (see thread_cap); governor-v038.flag: from the number of
-// live RPCS3 threads (thread registry) at 56/64. Any thread; a few relaxed loads.
+// 0 / 1 / 2: the 0.38 rules (the default): from the number of live RPCS3 threads (thread registry) at 56/64; the 0.39
+// rules: from the threads the console's cap counts (see thread_cap). Any thread; a few relaxed loads.
 inline int thread_pressure() noexcept
 {
     if (detail::governor_v038())
@@ -1435,6 +1744,8 @@ inline int thread_pressure() noexcept
             char text[96];
             std::snprintf(text, sizeof(text), "live RPCS3 threads %u, levels at %u/%u", live, thread_warn, thread_high);
             detail::log_transition("thread", old, level, text, detail::thread_effect(old, level), detail::g_thread_lines);
+            // Who holds the slots, printed by the frontend's next 1 s pass
+            if (old >= 0 || level != 0) ::ps4_census_request();
         }
         return level;
     }
@@ -1454,32 +1765,36 @@ inline int thread_pressure() noexcept
         std::snprintf(text, sizeof(text), "threads %u (orbis live %u + exited not joined %u) of cap %u, levels at %u/%u", load.total, load.live, load.unjoined,
             cap, clamp_thread_cap(cap) - thread_l1_margin, clamp_thread_cap(cap) - thread_l2_margin);
         detail::log_transition("thread", old, level, text, detail::thread_effect_v039(old, level), detail::g_thread_lines);
+        if (old >= 0 || level != 0) ::ps4_census_request();
     }
     return level;
 }
 
-inline constexpr char thread_no_retry_flag[] = "/data/rpcs3/thread-no-retry.flag";
-
 namespace detail
 {
+// The retry of refused guest creates never recovered a thread on the console and held the creating guest thread up to
+// 1.1 s per refusal, so it is off by default (CELL_EAGAIN at once, as in 0.38); the thread_retry row
+// (thread-retry.flag or features.txt; thread-no-retry.flag still wins) turns it on. Read per call; the rule in force
+// is written to startup.log at its first use and whenever it changes.
 inline bool thread_retry_disabled() noexcept
 {
-    static const bool off = []() noexcept
+    static std::atomic<int> s_logged{-1};
+    const bool off = !::utils::ps4::safe_mode::enabled(::utils::ps4::safe_mode::feature::thread_retry);
+    const int value = off ? 1 : 0;
+    if (s_logged.load(std::memory_order_relaxed) != value && s_logged.exchange(value, std::memory_order_relaxed) != value)
     {
-        const bool present = ::access(thread_no_retry_flag, F_OK) == 0;
-        ps4_startup_checkpoint(present ? "PS4 threads: a refused guest thread create fails at once (thread-no-retry.flag)"
-                                       : "PS4 threads: a refused guest thread create is retried (up to 5 tries in 5 s, waiting up to 50 ms for a slot; thread-no-retry.flag: at once)");
-        return present;
-    }();
+        ps4_startup_checkpoint(off ? "PS4 threads: a refused guest thread create fails at once (0.38 default; thread-retry.flag: retried)"
+                                   : "PS4 threads: a refused guest thread create is retried (up to 5 tries in 5 s, waiting up to 50 ms for a slot; thread-retry.flag or features.txt)");
+    }
     return off;
 }
 } // namespace detail
 
-// 0.39: a guest thread create the console refused gets more tries. Call after the 'tries'-th refused create,
-// started at 'since_us' (steady clock, detail::now_us): waits up to 50 ms (5 ms steps) for a thread slot to come back
-// (a join, or fewer threads than now) and returns true when the caller should create again. false after 'max_tries'
-// creates or 5 s, with thread-no-retry.flag, or once 'stopped()' is true. Never call it while holding a lock that
-// other creates or joins need (idm, an SPU group mutex).
+// 0.39 (opt-in in 0.40, see thread_retry_disabled): a guest thread create the console refused gets more tries. Call
+// after the 'tries'-th refused create, started at 'since_us' (steady clock, detail::now_us): waits up to 50 ms (5 ms
+// steps) for a thread slot to come back (a join, or fewer threads than now) and returns true when the caller should
+// create again. false after 'max_tries' creates or 5 s, while the retry is off, or once 'stopped()' is true. Never call
+// it while holding a lock that other creates or joins need (idm, an SPU group mutex).
 template <typename Stopped>
 inline bool retry_refused_create(u32 tries, u32 max_tries, u64 since_us, Stopped&& stopped) noexcept
 {
@@ -1494,6 +1809,20 @@ inline bool retry_refused_create(u32 tries, u32 max_tries, u64 since_us, Stopped
         if (now.joined != before.joined || now.total < before.total) break;
     }
     return !stopped() && detail::now_us() - since_us < window_us;
+}
+
+// 0.40: an HLE media create (is_hle_media_thread) the console refused while the guest create retry is off: waits in
+// media_retry_step_ms sleeps, at most media_retry_ceiling_ms after 'since_us' (steady clock, detail::now_us), until
+// fewer threads than 'load_at_refusal' (ps4_thread_load_now().total taken right after the refusal) count against the
+// console's cap, and returns the ms waited since 'since_us'; the caller then creates once more. Ends early once
+// 'stopped()' is true (the caller checks for stop itself before creating). Holds no lock; never call it while holding
+// one that other creates or joins need (idm, an SPU group mutex).
+template <typename Stop>
+inline u32 media_retry_pace(u64 since_us, u32 load_at_refusal, Stop&& stopped) noexcept
+{
+    return media_retry_pace_with(since_us, load_at_refusal, []() noexcept { return detail::now_us(); },
+        []() noexcept { return ::ps4_thread_load_now().total; },
+        [](u32 ms) noexcept { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }, stopped);
 }
 
 // 0.39: rate limit of the per-name refusal lines: the first 4 of a name, then every power of two. Returns the count
@@ -1530,6 +1859,80 @@ inline u32 refusal_line_due(std::string_view name) noexcept
 
 namespace detail
 {
+inline std::atomic<u32> g_optional_refusal_cap{0};      // 0.40: the count at the first refused create taken as a cap
+inline std::atomic<bool> g_optional_refusal_seen{false};
+} // namespace detail
+
+// 0.40: the cap optional threads count against (optional_cap): thread_cap() until the console refuses a create at
+// fewer threads, then that count for the rest of this process, with either governor rule set. A guard: it changes
+// nothing before a refusal, and a refusal for another reason only keeps optional threads off sooner. One startup.log
+// line when it takes effect under the 0.38 rules (the 0.39 rules write their own learned-cap line). Any thread.
+inline u32 optional_thread_cap() noexcept
+{
+    const u32 cap = thread_cap();
+    if (!detail::g_optional_refusal_seen.load(std::memory_order_acquire))
+    {
+        ps4_thread_load at{};
+        if (!::ps4_thread_first_refusal(at)) return cap;
+        // The cap first, then 'seen': a reader that sees 'seen' also sees the cap
+        if (u32 none = 0; optional_cap(cap, at.total) != cap &&
+            detail::g_optional_refusal_cap.compare_exchange_strong(none, at.total, std::memory_order_acq_rel) && detail::governor_v038())
+        {
+            char line[224];
+            std::snprintf(line, sizeof(line), "PS4 threads: first refused create at %u threads (live %u + exited not joined %u, cap %u): optional threads keep the last %u slots below %u for the game, this process only",
+                at.total, at.live, at.unjoined, clamp_thread_cap(cap), thread_l2_margin, at.total);
+            detail::log_line(line, detail::g_thread_lines, true);
+        }
+        detail::g_optional_refusal_seen.store(true, std::memory_order_release);
+    }
+    return optional_cap(cap, detail::g_optional_refusal_cap.load(std::memory_order_acquire));
+}
+
+// 0.40: call before starting an optional emulator thread (online client, request workers, launcher helpers, a lazily
+// started worker) with the number of threads it adds. False while those threads would take one of the last
+// thread_l2_margin slots of the console's cap (see optional_allowed; the cap is optional_thread_cap); the caller then
+// takes its offline, inline or later path. Independent of the governor rules in force. One startup.log line per name
+// and process. Any thread, allocation-free. optional-threads-free.flag turns the rule off (always true).
+inline bool optional_thread_allowed(std::string_view name, u32 n = 1) noexcept
+{
+    if (!::utils::ps4::safe_mode::enabled(::utils::ps4::safe_mode::feature::optional_thread_rule)) return true;
+    const ps4_thread_load load = ::ps4_thread_load_now();
+    const u32 cap = optional_thread_cap();
+    if (optional_decision(true, load.total, n, cap)) return true;
+
+    // Own key space, so the refusal lines of real creates with the same name keep their own count
+    char key[96] = "optional:";
+    usz len = 9;
+    for (const char ch : name)
+    {
+        if (len + 1 >= sizeof(key)) break;
+        key[len++] = ch;
+    }
+    if (refusal_line_due(std::string_view(key, len)) == 1)
+    {
+        char line[256];
+        std::snprintf(line, sizeof(line), "PS4 threads: optional '%.*s' not started: thread budget (%u of cap %u; the last %u slots are kept for the game)",
+            static_cast<int>(name.size() > 64 ? 64 : name.size()), name.data(), load.total, clamp_thread_cap(cap), thread_l2_margin);
+        detail::log_line(line, detail::g_thread_lines, true);
+    }
+    return false;
+}
+
+// 0.40: optional_thread_allowed for a group of 'wanted' threads: how many of them may start now (optional_allowed_count;
+// all of them with the rule off). When not all may, the refusal is logged as optional_thread_allowed logs it.
+inline u32 optional_threads_allowed(std::string_view name, u32 wanted) noexcept
+{
+    if (!wanted || !::utils::ps4::safe_mode::enabled(::utils::ps4::safe_mode::feature::optional_thread_rule)) return wanted;
+    const u32 n = optional_allowed_count(true, ::ps4_thread_load_now().total, wanted, optional_thread_cap());
+    if (n < wanted)
+    {
+        static_cast<void>(optional_thread_allowed(name, n + 1));
+    }
+    return n;
+}
+
+namespace detail
+{
 inline bool cool_serializes() noexcept
 {
     if (!::utils::ps4::cool_mode::enabled()) return false;
@@ -1549,7 +1952,7 @@ inline bool cool_serial_boot() noexcept
     return on;
 }
 
-// 0.39: slot mode of the rules in force (governor-v038.flag: one shared slot whenever compiles serialize).
+// Slot mode of the rules in force. 0.38 rules (the default): one shared slot whenever compiles serialize. 0.39 rules:
 // "Modo frio" keeps one compile in the whole process during play; a boot compile stage (PPU modules, SPU cache: no game
 // code runs yet) gets two, unless memory or thread pressure asks for less or cool-mode-serial-boot.flag is present.
 inline ::utils::ps4::mem_budget::slot_mode slot_mode_now() noexcept
@@ -1558,11 +1961,14 @@ inline ::utils::ps4::mem_budget::slot_mode slot_mode_now() noexcept
     const int heap = heap_pressure();
     if (governor_v038())
     {
-        return heap > 0 || thread_pressure() >= 2 || cool_serializes() ? mb::slot_mode::one_in_total : mb::slot_mode::parallel;
+        // The 0.38 order: the thread level and "Modo frio" are looked at only while the heap level is 0
+        const bool threads_high = heap == 0 && thread_pressure() >= 2;
+        const bool cool = heap == 0 && !threads_high && cool_serializes();
+        return mb::slot_mode_v038(heap, threads_high, cool);
     }
     const bool cool = ::utils::ps4::cool_mode::enabled();
     const bool cool_stage = cool && compile_stage_active() && !cool_serial_boot();
-    const mb::slot_mode mode = mb::slot_mode_v039(heap, g_cpu_l1.load(std::memory_order_relaxed), thread_pressure() >= 2, cool, cool_stage);
+    const mb::slot_mode mode = mb::slot_mode_v039(heap, cpu_l1_now(), thread_pressure() >= 2, cool, cool_stage);
     if (mode == mb::slot_mode::two_in_total)
     {
         if (!g_cool_stage_logged.exchange(true, std::memory_order_relaxed))
@@ -1587,6 +1993,47 @@ inline bool serialize_compiles() noexcept
     namespace mb = ::utils::ps4::mem_budget;
     const mb::slot_mode mode = detail::slot_mode_now();
     return mode == mb::slot_mode::one_per_class || mode == mb::slot_mode::one_in_total;
+}
+
+// What serialize_compiles() last looked at, for the lines that say why a build runs on fewer workers:
+// "memory level L, cpu_l1 X, thread level T, stage S, cool mode C, 0.38|0.39 rules". Reads the stored levels (no new
+// sample, no log line). Any thread, allocation-free.
+inline void serialize_reason(char* out, usz size) noexcept
+{
+    if (!out || !size) return;
+    const bool v038 = detail::governor_v038();
+    const int thread_level = detail::g_thread_level.load(std::memory_order_relaxed);
+    std::snprintf(out, size, "memory level %d, cpu_l1 %d, thread level %d, stage %d, cool mode %d, %s rules", memory_level(),
+        detail::cpu_l1_now() ? 1 : 0, thread_level < 0 ? 0 : thread_level, detail::compile_stage_active() ? 1 : 0,
+        ::utils::ps4::cool_mode::enabled() ? 1 : 0, v038 ? "0.38" : "0.39");
+}
+
+// 0.40: the causes behind serialize_compiles() now (format_serialize_reason), e.g. "thread level 2, 74 of 80", for the
+// lines that say why a build runs on one thread. Relaxed reads of the stored levels and the thread counters and a heap
+// sample without the flexible-memory query: no level change, no log line. The view points into a buffer of the calling
+// thread and stays valid until that thread calls again. Any thread, allocation-free.
+inline std::string_view serialize_reason() noexcept
+{
+    static thread_local char t_text[192];
+    serialize_state st{};
+    st.v038 = detail::governor_v038();
+    st.memory_level = memory_level();
+    const heap_sample s = sample_heap(false);
+    st.room_known = s.cap != 0;
+    st.room = s.cap ? static_cast<s64>(s.cap) - static_cast<s64>(s.live) : 0;
+    st.cpu_l1 = detail::cpu_l1_now();
+    if (st.v038)
+    {
+        st.threads = ::ps4_thread_registry::get_counters().live;
+    }
+    else
+    {
+        st.threads = ::ps4_thread_load_now().total;
+        st.cap = thread_cap();
+    }
+    st.cool = ::utils::ps4::cool_mode::enabled();
+    st.cool_stage = st.cool && detail::compile_stage_active() && !detail::cool_serial_boot();
+    return std::string_view(t_text, format_serialize_reason(t_text, sizeof(t_text), st));
 }
 
 // Live RPCS3 threads (thread registry), without touching the thread level.
@@ -1743,7 +2190,14 @@ inline u32 reserve_left() noexcept { return 0; }
 inline u32 reserve_released() noexcept { return 0; }
 inline bool reserve_armed() noexcept { return false; }
 inline int thread_pressure() noexcept { return 0; }
+inline u32 optional_thread_cap() noexcept { return thread_cap_default; }
+inline bool optional_thread_allowed(std::string_view, u32 = 1) noexcept { return true; }
+inline u32 optional_threads_allowed(std::string_view, u32 wanted) noexcept { return wanted; }
 inline bool serialize_compiles() noexcept { return false; }
+inline void serialize_reason(char* out, usz size) noexcept { if (out && size) out[0] = '\0'; }
+inline std::string_view serialize_reason() noexcept { return {}; }
+template <typename Stop>
+inline u32 media_retry_pace(u64, u32, Stop&&) noexcept { return 0; }
 inline u32 live_threads() noexcept { return 0; }
 inline u32 spu_recycle_programs_setting() noexcept { return 0; }
 inline bool extra_spu_workers_disabled() noexcept { return true; }
@@ -1780,6 +2234,15 @@ public:
     compile_admission& operator=(const compile_admission&) = delete;
 };
 inline bool optional_workers_allowed(u32, u64) noexcept { return true; }
+
+class boot_compile_scope
+{
+public:
+    explicit boot_compile_scope(bool) noexcept {}
+
+    boot_compile_scope(const boot_compile_scope&) = delete;
+    boot_compile_scope& operator=(const boot_compile_scope&) = delete;
+};
 inline void begin_session() noexcept {}
 inline bool end_session(::utils::ps4::mem_budget::record&, int&) noexcept { return false; }
 inline void rearm_reserve() noexcept {}

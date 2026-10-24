@@ -17,6 +17,10 @@ void ps4_note_thread_fatal(const char* reason) noexcept;           // emergency_
 [[noreturn]] void ps4_leave_application(const char* why) noexcept; // frontend exit ladder
 bool ps4_try_leave_application(const char* why) noexcept;          // returns only if the shell did not close us
 bool ps4_in_background() noexcept;                                 // PS button / home screen owns the display
+// 0.40: changes each time the process really was away: the system overlay or background state changed, or the console
+// resumed from rest mode. A long gap of the frontend's own polling does not change it (a blocked main thread is not a
+// suspension). Any thread; one relaxed load.
+std::uint32_t ps4_focus_epoch() noexcept;
 extern "C" [[noreturn]] void ps4_exit_called(int code);            // runtime/ps4_exit_guard.c (exit/_Exit)
 
 // Frontend-only helpers (main thread unless stated otherwise).
@@ -204,7 +208,7 @@ std::string ps4_sample_thread_stack(std::uint64_t native_thread);
 unsigned long long ps4_internal_memory_free() noexcept;
 // 0.28: free flexible memory (thread stacks); threads created / returned through orbis-compat.
 // (Kept for Utilities/Thread.cpp. 'returned' counts only start routines that returned: thread_base threads
-// leave through pthread_exit, so created - returned is not a live count; see ps4_thread_census_line.)
+// leave through pthread_exit, so created - returned is not a live count; see ps4_orbis_census_line.)
 unsigned long long ps4_flexible_memory_free() noexcept;
 void ps4_thread_census(unsigned long* created, unsigned long* finished) noexcept;
 // 0.29: free flexible memory when main() started (recorded by ps4_fatal_init); 0 if unknown.
@@ -212,4 +216,6 @@ unsigned long long ps4_boot_flexible_memory_free() noexcept;
 // 0.29: one allocation-free line with the orbis-compat thread census (created, failed, running,
 // exited but not joined, joined, returned), the libkernel stack estimate (flexible memory used since main / 2 MiB)
 // and the live-thread registry counters. Any thread, also the fatal path. Returns the length (NUL-terminated).
-std::size_t ps4_thread_census_line(char* out, std::size_t size) noexcept;
+// 0.40: renamed from ps4_thread_census_line, which is now the class census of Utilities/Thread.h (guest, emulator
+// registry, outside the registry, unjoined).
+std::size_t ps4_orbis_census_line(char* out, std::size_t size) noexcept;

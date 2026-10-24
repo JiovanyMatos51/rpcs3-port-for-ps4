@@ -744,6 +744,41 @@ public:
     std::string use_global(std::size_t i) { return with_row(i, [&](state& s) { return do_use_global(s); }, false); }
     // Options > Keep this value / Unpin
     std::string toggle_pin(std::size_t i) { return with_row(i, [&](state& s) { return do_toggle_pin(s); }, false); }
+    // 0.40: Options > Use my saved value: the value the settings files hold, as this scope's pin. Offered only when the
+    // boot would run another value (saved_differs); saved_text() is that value as the value column shows it.
+    bool saved_differs(std::size_t i) const
+    {
+        const state* s = state_of(i);
+        return s && !is_locked(*s) && !platform_locked(*s) && detail::canonical(*s->leaf) != s->saved;
+    }
+    std::string saved_text(std::size_t i) const
+    {
+        const state* s = state_of(i);
+        return s ? shown_value(*s, s->saved) : std::string{};
+    }
+    std::string use_saved(std::size_t i) { return with_row(i, [&](state& s) { return do_use_saved(s); }); }
+    std::string use_saved_key(std::string_view key) { return with_key(key, [&](state& s) { return do_use_saved(s); }); }
+    // 0.40: Square on an unavailable or hidden row whose files hold another value (unused_saved): the value goes back to
+    // the one the row starts from, so the next save writes that; false when the row has none
+    bool has_unused_saved(std::size_t i) const
+    {
+        const state* s = state_of(i);
+        return s && unused_saved(*s) && (!s->chosen || *s->chosen != baseline_value(*s));
+    }
+    std::string remove_unused_saved(std::size_t i)
+    {
+        if (!has_unused_saved(i)) return {};
+        state& s = m_states[m_page_states[i]];
+        m_last_row = i;
+        s.chosen = baseline_value(s);
+        s.edited = true;
+        s.reset = true;
+        s.force_pin = false;
+        s.unpinned = false;
+        detail::restore(*s.leaf, *s.chosen);
+        refresh();
+        return i18n::trf(i18n::str::CFGU_RESET_AUTO_DONE, {i18n::raw(label_of(s)), i18n::raw(value_text(s))});
+    }
 
     // The same edits by setting key (sub-pages, tests, the launcher's shortcuts)
     std::string step_key(std::string_view key, int direction, bool coarse = false) { return with_key(key, [&](state& s) { return do_step(s, direction, coarse); }); }
@@ -1461,7 +1496,33 @@ private:
             reason = i18n::str::CFGR_VALUE_PSN_SIMULATED;
             return detail::verdict::greyed;
         }
+        // OpenGL is warned for its own reason (Zink: slower, no video memory budget); the row's reason is Null's
+        if (s.leaf == &m_cfg->video.renderer && spelling == "OpenGL" && v == detail::verdict::warn) reason = i18n::str::CFGH_AVISO_OPENGL_ZINK;
         return v;
+    }
+
+    // 0.40: a row the platform makes meaningless for the current values: VSync on Vulkan (the surface always presents
+    // with FIFO). Shown locked with the reason, like an unavailable row.
+    bool platform_locked(const state& s) const
+    {
+        return m_cfg && s.leaf == &m_cfg->video.vsync && platform_vsync_ignored(m_cfg->video.renderer);
+    }
+
+    // 0.40: a note after the help line of rows whose value the emulator or the game may not follow
+    static i18n::str note_of(const state& s)
+    {
+        if (s.key == "Video > Enable Frame Skip") return i18n::str::CFGH_NOTA_FRAME_SKIP;
+        if (s.key == "Audio > Audio Provider" || s.key == "Audio > RSXAudio Avport") return i18n::str::CFGH_NOTA_POR_EXECUTAVEL;
+        return i18n::str::count_;
+    }
+
+    // 0.40: an unavailable or hidden row whose files hold another value than the one it starts from (upstream default, or
+    // per game the global value): the value has no effect on PS4, and Square removes it from the file
+    bool unused_saved(const state& s) const
+    {
+        if (!s.meta || (s.meta->kind != klass::unavailable && s.meta->kind != klass::hidden)) return false;
+        if (s.meta->flags & cat::flag::no_default) return false;
+        return s.saved != baseline_value(s);
     }
 
     std::string value_label(const state& s, std::string_view spelling) const
@@ -1591,12 +1652,23 @@ private:
     {
         using i18n::str;
         mark = badge::none;
+        // 0.40: a saved value an unavailable or hidden row cannot use says so (Square removes it from the file)
+        const bool removed = s.chosen && *s.chosen == baseline_value(s);
+        const std::string unused = unused_saved(s) && !removed ? " \xC2\xB7 " + std::string(i18n::tr(str::CFGU_VALOR_SALVO_SEM_EFEITO)) : std::string();
         if (s.meta && s.meta->kind == klass::unavailable)
         {
             mark = badge::ps4;
-            return std::string(i18n::tr(str::COM_INDISPONIVEL_PS4)) + (s.meta->reason != str::count_ ? i18n::tr(s.meta->reason) : "");
+            // a saved value the boot replaces (Audio Renderer Null) names why that value has no meaning here
+            const unsafe_value* u = s.changed && s.from == origin::console ? unsafe_value_for(*s.leaf) : nullptr;
+            const str reason = u ? u->menu : s.meta->reason;
+            return std::string(i18n::tr(str::COM_INDISPONIVEL_PS4)) + (reason != str::count_ ? i18n::tr(reason) : "") + unused;
         }
-        if (s.meta && s.meta->kind == klass::hidden) return i18n::trf(str::CFGU_HIDDEN_ROW, {str(s.meta->reason)});
+        if (s.meta && s.meta->kind == klass::hidden) return i18n::trf(str::CFGU_HIDDEN_ROW, {str(s.meta->reason)}) + unused;
+        if (platform_locked(s))
+        {
+            mark = badge::ps4;
+            return std::string(i18n::tr(str::COM_INDISPONIVEL_PS4)) + i18n::tr(str::CFGR_VSYNC_FIFO_PS4);
+        }
         if (scope_blocked(s)) return i18n::tr(s.meta->where_scope == cat::scope::game_only ? str::CFGU_NOTE_GAME_ONLY : str::CFGU_NOTE_GLOBAL_ONLY);
         if (const std::string dep = failing_dependency(s); !dep.empty())
         {
@@ -1616,6 +1688,9 @@ private:
             case origin::console:
                 mark = badge::ps4;
                 if (const unsafe_option* u = unsafe_option_for(*m_cfg, *s.leaf)) return std::string(i18n::tr(str::COM_INDISPONIVEL_PS4)) + i18n::tr(u->menu);
+                if (const unsafe_value* u = unsafe_value_for(*s.leaf)) return std::string(i18n::tr(str::COM_INDISPONIVEL_PS4)) + i18n::tr(u->menu);
+                if (s.leaf == &m_cfg->video.resolution_scale_percent) return i18n::trf(str::CFGR_LIMIT_RESOLUTION_SCALE, {static_cast<unsigned>(resolution_scale_cap_percent)});
+                if (s.why.starts_with(platform_reason_prefix)) return i18n::tr(str::CFGR_VALUE_GL_ASYNC);
                 return i18n::tr(str::SET_LIMITE_PS4_BOOT_USA_MAXIMO);
             case origin::switch_:
                 mark = badge::switch_;
@@ -1632,7 +1707,7 @@ private:
                 if (s.leaf == &m_cfg->video.vk.vram_allocation_limit) return i18n::trf(str::SET_BOOT_LIMITA_VRAM_MB_VRAM, {vram_cap_mb});
                 if (s.leaf == &m_cfg->vfs.host_root) return i18n::tr(str::SET_SEMPRE_DESLIGADO_PS4_JOGO_NAO);
                 if (s.leaf == &m_cfg->vfs.limit_cache_size || s.leaf == &m_cfg->vfs.cache_max_size)
-                    return i18n::trf(str::SET_BOOT_MANTEM_LIMITE_CACHE_ENTRE, {disk_cache_floor_mb, disk_cache_max_mb});
+                    return i18n::trf(str::SET_BOOT_MANTEM_LIMITE_CACHE_ENTRE, {disk_cache_floor_mb, disk_cache_limit_max_mb(m_inputs)});
                 if (s.leaf == &m_cfg->video.shader_compiler_threads_count) return i18n::tr(str::CFGR_LIMIT_2_THREADS);
                 return i18n::tr(str::SET_BOOT_APLICA_LIMITE_PS4);
             case origin::hardware:
@@ -1660,6 +1735,7 @@ private:
             return i18n::trf(str::CFGU_NOTE_GLOBAL, {i18n::raw(shown_value(s, s.global))});
         }
         if (!s.meta) return i18n::tr(str::CFGU_NEW_SETTING_HELP);
+        if (const str note = note_of(s); note != str::count_) return std::string(i18n::tr(s.meta->help)) + " \xC2\xB7 " + i18n::tr(note);
         return i18n::tr(s.meta->help);
     }
 
@@ -1717,7 +1793,7 @@ private:
             r.page = page_of(s);
             r.pinned = pinned(s);
             r.differs_global = differs_global(s);
-            r.locked = is_locked(s);
+            r.locked = is_locked(s) || platform_locked(s);
             r.dimmed = scope_blocked(s) || !failing_dependency(s).empty();
             r.warn = r.kind == klass::warn;
             r.dynamic = s.leaf->get_is_dynamic();
@@ -1785,6 +1861,7 @@ private:
             return std::string(i18n::tr(str::COM_INDISPONIVEL_PS4)) + (s.meta->reason != str::count_ ? i18n::tr(s.meta->reason) : "");
         if (s.meta && s.meta->kind == klass::hidden) return i18n::trf(str::CFGU_HIDDEN_ROW, {str(s.meta->reason)});
         if (s.meta && s.meta->edit == editor::readonly) return i18n::tr(str::CFGU_READONLY);
+        if (platform_locked(s)) return std::string(i18n::tr(str::COM_INDISPONIVEL_PS4)) + i18n::tr(str::CFGR_VSYNC_FIFO_PS4);
         if (const ps4_switch w = redirect_of(s); w != ps4_switch::none && is_change) return i18n::trf(str::CFGU_FOLLOWS_SWITCH, {switch_name(w)});
         if (is_change && scope_blocked(s)) return i18n::tr(s.meta->where_scope == cat::scope::game_only ? str::CFGU_NOTE_GAME_ONLY : str::CFGU_NOTE_GLOBAL_ONLY);
         if (is_change)
@@ -1983,8 +2060,15 @@ private:
         switch (s.kind)
         {
         case detail::vkind::boolean:
-            if (!s.leaf->from_string(s.leaf->to_string() == "true" ? "false" : "true")) return {};
+        {
+            // 0.40: a warned value (Enable Buffering off) asks once, as for a list
+            const std::string next = s.leaf->to_string() == "true" ? "false" : "true";
+            bool ok = false;
+            std::string refused = admit(s, next, ok);
+            if (!ok) return refused;
+            if (!s.leaf->from_string(next)) return {};
             return changed(s);
+        }
         case detail::vkind::enumeration:
         {
             const auto list = allowed_spellings(s);
@@ -2258,6 +2342,21 @@ private:
         s.edited = true;
         refresh();
         return i18n::trf(i18n::str::CFGU_PINNED, {i18n::raw(label_of(s))});
+    }
+
+    // The files' value back as this scope's choice and pin (the row's value rules still apply)
+    std::string do_use_saved(state& s)
+    {
+        bool ok = true;
+        std::string refused;
+        if (s.kind == detail::vkind::enumeration || s.kind == detail::vkind::boolean) refused = admit(s, s.saved, ok);
+        else if (s.kind == detail::vkind::integer || s.kind == detail::vkind::unsigned_ || s.kind == detail::vkind::floating)
+            if (const auto v = detail::parse_double(s.saved)) refused = admit_number(s, *v, ok);
+        if (!ok) return refused;
+        if (!detail::restore(*s.leaf, s.saved)) return i18n::tr(i18n::str::CFGU_BAD_NUMBER);
+        s.force_pin = true;
+        changed(s);
+        return i18n::trf(i18n::str::CFGU_PINNED, {i18n::raw(label_of(s))}) + " \xC2\xB7 " + value_text(s);
     }
 
     // --- the preview ---

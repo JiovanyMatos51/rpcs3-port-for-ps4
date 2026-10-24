@@ -524,7 +524,12 @@ void GLGSRender::flip(const rsx::display_flip_info_t& info)
 		.min_scalable_dimension = static_cast<u16>(g_cfg.video.min_scalable_dimension),
 	};
 
+#ifdef RPCS3_PS4
+	// With MSAA on, a live change waits for the next boot (the running config stays latched)
+	if (active_res_scaling_config != this->resolution_scaling_config && !ps4_scale_change_deferred(active_res_scaling_config))
+#else
 	if (active_res_scaling_config != this->resolution_scaling_config)
+#endif
 	{
 		m_rtts.sync_scaling_config(cmd, active_res_scaling_config);
 		this->resolution_scaling_config = active_res_scaling_config;

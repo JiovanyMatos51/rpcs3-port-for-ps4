@@ -172,6 +172,7 @@ static fs::error to_error(DWORD e)
 #include <fstream>
 #include "util/ps4_directory.hpp"
 #include "util/ps4_disc_probe.hpp"
+#include "util/ps4_safe_mode.hpp"
 #include <optional>
 #include <atomic>
 #include <cerrno>
@@ -1415,6 +1416,147 @@ std::string fs::get_path_if_dir(const std::string& path)
 	return path + '/';
 }
 
+#ifdef RPCS3_PS4
+namespace
+{
+	// The three calls of the stat EIO resolver. Plain system calls only: nothing here may come back into fs::get_stat.
+	struct ps4_stat_eio_calls
+	{
+		int open_stat(const std::string& p, struct ::stat& st) const
+		{
+			const int fd = ::open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+
+			if (fd < 0)
+			{
+				return errno ? errno : EIO;
+			}
+
+			const int error = ::fstat(fd, &st) == 0 ? 0 : errno ? errno : EIO;
+			::close(fd);
+			return error;
+		}
+
+		int stat_kind(const std::string& p, bool& is_dir) const
+		{
+			struct ::stat st{};
+
+			if (::stat(p.c_str(), &st) != 0)
+			{
+				return errno ? errno : EIO;
+			}
+
+			is_dir = S_ISDIR(st.st_mode);
+			return 0;
+		}
+
+		template <typename Visit>
+		int list(const std::string& p, Visit&& visit) const
+		{
+			::DIR* const dir = ::opendir(p.c_str());
+
+			if (!dir)
+			{
+				return errno ? errno : EIO;
+			}
+
+			int error = 0;
+
+			while (true)
+			{
+				errno = 0;
+				const ::dirent* const entry = ::readdir(dir);
+
+				if (!entry)
+				{
+					// A listing cut short by an error is not a listing without the name
+					error = errno;
+					break;
+				}
+
+				if (visit(std::string_view(entry->d_name)))
+				{
+					break;
+				}
+			}
+
+			::closedir(dir);
+			return error;
+		}
+	};
+}
+
+// Right after a failed ::stat(): the console answers EIO, not ENOENT, for some paths under a missing folder, while open()
+// of the same path says ENOENT (util/ps4_disc_probe.hpp, stat_eio). True when the path exists after all ('out' filled);
+// false with errno set to the answer. errno is left alone unless it was EIO and the fs_eio_probe row is on.
+static bool ps4_stat_eio_resolve(const std::string& path, struct ::stat& out)
+{
+	if (errno != EIO || !utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::fs_eio_probe))
+	{
+		return false;
+	}
+
+	ps4_stat_eio_calls calls;
+
+	using utils::ps4::stat_eio::answer;
+	using utils::ps4::stat_eio::step;
+	const utils::ps4::stat_eio::result found = utils::ps4::stat_eio::resolve(path, calls, out);
+
+	// One line per game boot (and per XMB stay) for an answer that changed, the first EIO kept once per process
+	static std::atomic<u32> s_noted_generation{~0u};
+	static std::atomic<bool> s_kept_noted{false};
+	static std::atomic<u32> s_changed{0};
+
+	const u32 changed = found.what == answer::kept ? 0 : s_changed.fetch_add(1, std::memory_order_relaxed) + 1;
+	const u32 generation = utils::ps4::adapt::g_title_seq.load(std::memory_order_acquire) & ~1u;
+	const bool note = found.what == answer::kept ? !s_kept_noted.exchange(true, std::memory_order_relaxed)
+		: s_noted_generation.exchange(generation, std::memory_order_relaxed) != generation;
+
+	if (note)
+	{
+		const char* why = "";
+		const char* reported = "";
+
+		switch (found.what)
+		{
+		case answer::found:
+			why = "open() and fstat() read it";
+			reported = "reported as present";
+			break;
+		case answer::missing:
+			why = found.how == step::open ? "a parent folder is missing; open() answered ENOENT"
+				: found.how == step::parent ? "a parent folder is missing"
+				: "a parent folder is missing; the deepest existing folder does not list it";
+			reported = "reported as not found";
+			break;
+		case answer::not_dir:
+			why = found.how == step::open ? "open() answered ENOTDIR" : "a parent is not a folder";
+			reported = "reported as not a folder";
+			break;
+		case answer::kept:
+			why = found.how == step::listing ? "the deepest existing folder lists it, or its listing failed"
+				: found.how == step::parent ? "a parent answered another error" : "a device node, or no parent answered";
+			reported = "kept as an I/O error";
+			break;
+		}
+
+		char detail[768];
+		std::snprintf(detail, sizeof(detail), "stat answered EIO for '%.400s' (%s%s%.200s%s); %s (fs-eio-raw.flag keeps EIO; %u answer(s) changed so far)",
+			path.c_str(), why, found.folder.empty() ? "" : ": '", found.folder.c_str(), found.folder.empty() ? "" : "'", reported, changed ? changed : s_changed.load(std::memory_order_relaxed));
+		ps4_fatal_note("PS4 fs: ", detail);
+	}
+
+	switch (found.what)
+	{
+	case answer::found: return true;
+	case answer::missing: errno = ENOENT; break;
+	case answer::not_dir: errno = ENOTDIR; break;
+	case answer::kept: errno = EIO; break;
+	}
+
+	return false;
+}
+#endif
+
 bool fs::get_stat(const std::string& path, stat_t& info)
 {
 	// Ensure consistent information on failure
@@ -1509,7 +1651,12 @@ bool fs::get_stat(const std::string& path, stat_t& info)
 	info.ctime = info.mtime;
 #else
 	struct ::stat file_info;
+#ifdef RPCS3_PS4
+	// An EIO is asked again before it reaches the caller (a game probing for an optional file expects ENOENT)
+	if (::stat(path.c_str(), &file_info) != 0 && !ps4_stat_eio_resolve(path, file_info))
+#else
 	if (::stat(path.c_str(), &file_info) != 0)
+#endif
 	{
 		g_tls_error = to_error(errno);
 		return false;

@@ -19,6 +19,11 @@
 // startup.log through the caller's log function ("disc probe: ...").
 //
 // disc_keys: what the .dkey import accepts (16 raw bytes or 32 hex characters) and how it names the copy.
+//
+// stat_eio::resolve(): what a stat() that answered EIO really meant (the file layer's stat of a path under a missing
+// folder). Only reads; generic over the three calls it makes, so a host test can stand in for the console.
+//
+// disk_cache: the order in which the boot trims dev_hdd1/caches (Emu/cache_utils.cpp); pure, the caller removes.
 
 #include <algorithm>
 #include <array>
@@ -125,6 +130,288 @@ inline bool plain_image_without_header(std::uint32_t region_count, bool has_ps3_
 {
     return region_count == 0 && has_ps3_game_sfo;
 }
+
+// File names compared without ASCII case (other bytes exactly)
+constexpr bool same_name(std::string_view a, std::string_view b) noexcept
+{
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+        const char x = a[i] >= 'A' && a[i] <= 'Z' ? static_cast<char>(a[i] - 'A' + 'a') : a[i];
+        const char y = b[i] >= 'A' && b[i] <= 'Z' ? static_cast<char>(b[i] - 'A' + 'a') : b[i];
+        if (x != y) return false;
+    }
+    return true;
+}
+
+// Why an image without a PS3 disc header cannot be read as a PS3 game (the XMB names the kind)
+enum class iso_refusal : std::uint8_t
+{
+    none,       // a PS3 game: PS3_GAME/PARAM.SFO at the root or one wrapper folder down
+    psn_layout, // PARAM.SFO and USRDIR without PS3_GAME: a PSN game folder made into an ISO (it needs its PKG and .rap)
+    ps2,        // SYSTEM.CNF at the root: a PS2 disc
+    psp,        // UMD_DATA.BIN or PSP_GAME at the root: a PSP disc
+    unknown,    // none of these (the root listing in the log shows what it holds)
+};
+
+inline const char* refusal_name(iso_refusal r) noexcept
+{
+    switch (r)
+    {
+    case iso_refusal::none: return "a PS3 game";
+    case iso_refusal::psn_layout: return "a PSN game folder (PARAM.SFO and USRDIR at its root, no PS3_GAME)";
+    case iso_refusal::ps2: return "a PS2 disc (SYSTEM.CNF)";
+    case iso_refusal::psp: return "a PSP disc (UMD_DATA.BIN or PSP_GAME)";
+    case iso_refusal::unknown: break;
+    }
+    return "no PS3_GAME/PARAM.SFO";
+}
+
+// XMB text of a refusal kind; null for none and unknown (the caller keeps its own message)
+inline const char* refusal_text(iso_refusal r) noexcept
+{
+    switch (r)
+    {
+    case iso_refusal::psn_layout: return i18n::tr(i18n::str::LAU_ISO_JOGO_PSN);
+    case iso_refusal::ps2: return i18n::tr(i18n::str::LAU_ISO_JOGO_PS2);
+    case iso_refusal::psp: return i18n::tr(i18n::str::LAU_ISO_JOGO_PSP);
+    case iso_refusal::none:
+    case iso_refusal::unknown: break;
+    }
+    return nullptr;
+}
+
+// The tree of an image as the ISO loader forms it (Loader/ISO.h iso_fs_node: metadata.name, metadata.is_directory,
+// children as unique_ptr). Generic so the host test builds its own trees; nothing here reads the image.
+namespace iso_tree
+{
+inline constexpr std::size_t max_listed = 16;   // names per folder in the refusal listing
+inline constexpr std::size_t max_wrappers = 64; // top folders looked into for PS3_GAME
+inline constexpr std::size_t max_name_text = 64; // bytes of one name in the listing
+
+constexpr bool is_dot(std::string_view name) noexcept
+{
+    return name == "." || name == "..";
+}
+
+// The child 'name' of 'dir' of the given kind: the exact name, else the first one equal without ASCII case.
+// 'variants' (optional) gets the number of children that match only without case.
+template <typename Node>
+Node* child(const Node& dir, std::string_view name, bool directory, std::size_t* variants = nullptr)
+{
+    Node* exact = nullptr;
+    Node* folded = nullptr;
+    std::size_t count = 0;
+    for (const auto& c : dir.children)
+    {
+        if (!c || c->metadata.is_directory != directory || !same_name(c->metadata.name, name)) continue;
+        if (c->metadata.name == name)
+        {
+            if (!exact) exact = c.get();
+            continue;
+        }
+        ++count;
+        if (!folded) folded = c.get();
+    }
+    if (variants) *variants = count;
+    return exact ? exact : folded;
+}
+
+template <typename Node>
+bool holds_ps3_game(const Node& dir)
+{
+    const Node* game = child(dir, "PS3_GAME", true);
+    return game && child(*game, "PARAM.SFO", false);
+}
+
+template <typename Node>
+bool holds_psn_layout(const Node& dir)
+{
+    return child(dir, "PARAM.SFO", false) && child(dir, "USRDIR", true) && !child(dir, "PS3_GAME", true);
+}
+
+// The only folder at the root (files beside it allowed), null when there is none or more than one
+template <typename Node>
+const Node* single_top_folder(const Node& root)
+{
+    const Node* only = nullptr;
+    for (const auto& c : root.children)
+    {
+        if (!c || !c->metadata.is_directory || is_dot(c->metadata.name)) continue;
+        if (only) return nullptr;
+        only = c.get();
+    }
+    return only;
+}
+
+// The PS3 disc's own system names, whose case is fixed on every disc. An image tool that changed the case (lower-case
+// Joliet names) is the only way they differ, so they get it back; the game's other files keep the image's names.
+struct system_name
+{
+    std::string_view folder; // relative to the game root, folders already restored
+    std::string_view name;
+    bool directory;
+};
+
+inline constexpr system_name system_names[] = {
+    {"", "PS3_GAME", true},
+    {"", "PS3_DISC.SFB", false},
+    {"", "PS3_UPDATE", true},
+    {"PS3_GAME", "PARAM.SFO", false},
+    {"PS3_GAME", "USRDIR", true},
+    {"PS3_GAME", "LICDIR", true},
+    {"PS3_GAME", "TROPDIR", true},
+    {"PS3_GAME", "ICON0.PNG", false},
+    {"PS3_GAME", "ICON1.PAM", false},
+    {"PS3_GAME", "PIC0.PNG", false},
+    {"PS3_GAME", "PIC1.PNG", false},
+    {"PS3_GAME", "PIC2.PNG", false},
+    {"PS3_GAME", "SND0.AT3", false},
+    {"PS3_GAME", "PS3LOGO.DAT", false},
+    {"PS3_GAME/USRDIR", "EBOOT.BIN", false},
+    {"PS3_GAME/LICDIR", "LIC.DAT", false},
+};
+
+// A name of the image as a log shows it (printable ASCII, '?' for anything else, cut to max_name_text bytes)
+inline std::string name_text(std::string_view name)
+{
+    std::string out = detail::printable(reinterpret_cast<const unsigned char*>(name.data()), std::min(name.size(), max_name_text));
+    if (name.size() > max_name_text) out += "...";
+    return out;
+}
+
+// Gives the system names of the game root back their disc case: only a name whose exact form is absent and that has
+// exactly one variant of the right kind. Returns "old -> NEW" for each one renamed.
+template <typename Node>
+std::vector<std::string> restore_system_names(Node& game_root)
+{
+    std::vector<std::string> renamed;
+    for (const system_name& s : system_names)
+    {
+        Node* folder = &game_root;
+        for (std::string_view rest = s.folder; folder && !rest.empty();)
+        {
+            const std::size_t slash = rest.find('/');
+            const std::string_view part = rest.substr(0, slash);
+            Node* next = nullptr;
+            for (const auto& c : folder->children)
+                if (c && c->metadata.is_directory && c->metadata.name == part) next = c.get();
+            folder = next;
+            rest = slash == std::string_view::npos ? std::string_view{} : rest.substr(slash + 1);
+        }
+        if (!folder) continue;
+        std::size_t variants = 0;
+        Node* found = child(*folder, s.name, s.directory, &variants);
+        if (!found || found->metadata.name == s.name || variants != 1) continue;
+        renamed.push_back(name_text(found->metadata.name) + " -> " + std::string(s.name));
+        found->metadata.name = std::string(s.name);
+    }
+    return renamed;
+}
+
+struct header_less_layout
+{
+    iso_refusal refusal = iso_refusal::unknown;
+    std::string wrapper;              // the top folder that holds the game (PS3_GAME or a PSN layout); empty: the root
+    std::size_t candidates = 0;       // top folders that hold PS3_GAME/PARAM.SFO (more than one is refused as unknown)
+    std::vector<std::string> renamed; // system names given back their disc case (apply only)
+};
+
+// An image without a PS3 disc header (sector 0 holds no region table) whose tree has no exact PS3_GAME/PARAM.SFO at
+// the root: the caller asks only then, so an image read today is never changed. PS3_GAME and PARAM.SFO are looked up
+// without case, at the root and one wrapper folder down. With 'apply', a game found in a wrapper folder becomes the
+// root of the tree, and the system names get their disc case back (restore_system_names), so the loader reads it like
+// a game folder at the root.
+template <typename Node>
+header_less_layout probe_header_less(Node& root, bool apply)
+{
+    header_less_layout out;
+    Node* game_root = nullptr;
+    std::size_t game_index = 0;
+    if (holds_ps3_game(root))
+    {
+        game_root = &root;
+    }
+    else
+    {
+        std::size_t looked = 0;
+        for (std::size_t i = 0; i < root.children.size(); ++i)
+        {
+            const auto& c = root.children[i];
+            if (!c || !c->metadata.is_directory || is_dot(c->metadata.name)) continue;
+            if (++looked > max_wrappers) break;
+            if (!holds_ps3_game(*c)) continue;
+            if (!out.candidates++)
+            {
+                game_root = c.get();
+                game_index = i;
+            }
+        }
+        if (out.candidates > 1) return out; // ambiguous: which game would boot is not known
+    }
+
+    if (game_root)
+    {
+        out.refusal = iso_refusal::none;
+        if (game_root != &root) out.wrapper = game_root->metadata.name;
+        if (!apply) return out;
+        if (game_root != &root)
+        {
+            // Detach the wrapper first: the assignment below replaces the vector that held it
+            std::unique_ptr<Node> keep = std::move(root.children[game_index]);
+            root = std::move(*keep);
+        }
+        out.renamed = restore_system_names(root);
+        return out;
+    }
+
+    if (holds_psn_layout(root))
+    {
+        out.refusal = iso_refusal::psn_layout;
+        return out;
+    }
+    if (const Node* top = single_top_folder(root); top && holds_psn_layout(*top))
+    {
+        out.refusal = iso_refusal::psn_layout;
+        out.wrapper = top->metadata.name;
+        return out;
+    }
+    if (child(root, "SYSTEM.CNF", false))
+    {
+        out.refusal = iso_refusal::ps2;
+        return out;
+    }
+    if (child(root, "UMD_DATA.BIN", false) || child(root, "PSP_GAME", true)) out.refusal = iso_refusal::psp;
+    return out;
+}
+
+// "N names: A/, B, C, ..." (folders end with '/'; at most max_listed names)
+template <typename Node>
+std::string folder_listing(const Node& dir)
+{
+    std::string names;
+    std::size_t count = 0;
+    for (const auto& c : dir.children)
+    {
+        if (!c || is_dot(c->metadata.name)) continue;
+        if (++count > max_listed) continue;
+        if (!names.empty()) names += ", ";
+        names += name_text(c->metadata.name);
+        if (c->metadata.is_directory) names += '/';
+    }
+    if (count > max_listed) names += ", ...";
+    return std::to_string(count) + (count == 1 ? " name" : " names") + (count ? ": " + names : std::string());
+}
+
+// The refusal listing: the root, and the only folder at the root when there is one
+template <typename Node>
+std::string root_listing(const Node& root)
+{
+    std::string out = "root " + folder_listing(root);
+    if (const Node* top = single_top_folder(root)) out += "; top folder '" + name_text(top->metadata.name) + "/' " + folder_listing(*top);
+    return out;
+}
+} // namespace iso_tree
 
 struct node_info
 {
@@ -878,5 +1165,179 @@ inline bool read_past_image_end(std::uint64_t file_size, std::uint64_t offset, s
 inline bool iso_disc_sfb_missing(std::string_view category, bool sfb_exists, std::string_view sfb_first_bytes) noexcept
 {
     return category == "DG" && (!sfb_exists || sfb_first_bytes.substr(0, 4) != ".SFB");
+}
+}
+
+// A stat() that failed with EIO. The console answers EIO, not ENOENT, for some paths under a missing folder (the kernel
+// code is outside the range the C library turns into an errno), while open() of the same path says ENOENT, so a game
+// probing for an optional file got an I/O error instead of "not found". resolve() asks again with calls whose answers
+// are unambiguous:
+//   1. open() read-only: ENOENT / ENOTDIR are the answer; success means the path exists (fstat() gives its data);
+//   2. otherwise the deepest parent that stats: a parent that is not a folder means ENOTDIR, and a folder that does not
+//      list the next component means ENOENT (names compared without ASCII case, so on a case-insensitive drive an
+//      existing name is never reported missing); a parent that itself answers ENOENT / ENOTDIR is the answer;
+//   3. anything else keeps EIO: a read error of an existing file, a listing that failed or ran past its limit.
+// Device nodes (/dev) are never opened here. 'ops' provides (the console's calls in the file layer, a fake tree in tests):
+//   int open_stat(const std::string& path, Stat& out)      0, or the errno of open() / fstat()
+//   int stat_kind(const std::string& path, bool& is_dir)   0, or the errno of stat()
+//   int list(const std::string& dir, Visit&& visit)        0 once the listing ended or visit(name) returned true (stop),
+//                                                          or the errno of opendir() / readdir()
+namespace utils::ps4::stat_eio
+{
+enum class answer : std::uint8_t
+{
+    found,   // the path exists after all: 'out' holds its data
+    missing, // ENOENT
+    not_dir, // ENOTDIR
+    kept,    // EIO stays
+};
+
+enum class step : std::uint8_t
+{
+    none,    // nothing was asked (device node, path that cannot be walked)
+    open,    // open() answered
+    parent,  // the stat() of a parent answered
+    listing, // the listing of the deepest parent that exists answered
+};
+
+struct result
+{
+    answer what = answer::kept;
+    step how = step::none;
+    std::string folder; // the parent of steps parent / listing
+};
+
+inline constexpr std::size_t max_listing = 16384; // names read from one folder at most
+inline constexpr std::size_t max_depth = 64;      // parents walked at most
+
+using disc_probe::same_name;
+
+template <typename Ops, typename Stat>
+result resolve(std::string_view path, Ops& ops, Stat& out)
+{
+    while (path.size() > 1 && path.back() == '/') path.remove_suffix(1);
+    if (path.size() < 2 || path.front() != '/' || path == "/dev" || path.starts_with("/dev/")) return {};
+
+    const std::string full(path);
+    switch (ops.open_stat(full, out))
+    {
+    case 0: return {answer::found, step::open, {}};
+    case ENOENT: return {answer::missing, step::open, {}};
+    case ENOTDIR: return {answer::not_dir, step::open, {}};
+    default: break;
+    }
+
+    std::string_view below = path; // ends with the component 'name' of the folder looked at
+    for (std::size_t depth = 0; depth < max_depth; ++depth)
+    {
+        const std::size_t slash = below.rfind('/');
+        if (slash == std::string_view::npos) break;
+        const std::string_view name = below.substr(slash + 1);
+        if (name.empty()) break;
+        std::string folder(slash ? below.substr(0, slash) : std::string_view("/"));
+
+        bool is_dir = false;
+        const int error = ops.stat_kind(folder, is_dir);
+        if (error == 0)
+        {
+            if (!is_dir) return {answer::not_dir, step::parent, std::move(folder)};
+            bool listed = false, cut = false;
+            std::size_t names = 0;
+            const int list_error = ops.list(folder, [&](std::string_view entry) -> bool
+            {
+                listed = same_name(entry, name);
+                cut = !listed && ++names >= max_listing;
+                return listed || cut;
+            });
+            if (list_error || listed || cut) return {answer::kept, step::listing, std::move(folder)};
+            return {answer::missing, step::listing, std::move(folder)};
+        }
+        if (error == ENOENT) return {answer::missing, step::parent, std::move(folder)};
+        if (error == ENOTDIR) return {answer::not_dir, step::parent, std::move(folder)};
+        if (error != EIO || slash == 0) return {answer::kept, step::parent, std::move(folder)};
+        below = below.substr(0, slash);
+    }
+    return {};
+}
+}
+
+// The boot trims dev_hdd1/caches (the games' own HDD1 cache folders, one per game cache id) to its size limit. It
+// runs in Emulator::Init, before the booted game's PARAM.SFO is read, so the game is not known there: the most recently
+// modified folders stay (a game that ran before is among them), which keeps a large cache (several GB) from being
+// thrown away and filled again at every boot of the game that owns it. Entries that are rebuilt quickly go first and
+// compiled code last, each group oldest first.
+namespace utils::ps4::disk_cache
+{
+enum class kind : std::uint8_t
+{
+    rebuilt,    // shader or SPU caches: rebuilt in seconds
+    game_cache, // a game's own cache data: the game fills it again
+    compiled,   // PPU objects (ppu-*): 10-59 minutes to build again
+};
+
+struct entry
+{
+    std::string name;
+    std::int64_t mtime = 0;
+    bool directory = false;
+};
+
+inline constexpr std::size_t protected_newest = 2; // folders kept whatever their size
+inline constexpr std::size_t names_logged = 8;     // folder names a log line lists at most
+
+constexpr kind kind_of(std::string_view name, bool directory) noexcept
+{
+    if (directory && name.starts_with("ppu-")) return kind::compiled;
+    if (name == "shaders_cache" || name.starts_with("spu-") || name.starts_with("spu_progs")) return kind::rebuilt;
+    return kind::game_cache;
+}
+
+// Bytes to remove: down to 80 % of the limit, as before (a trim is not repeated at every boot); 0 within the limit
+constexpr std::uint64_t bytes_to_remove(std::uint64_t total, std::uint64_t limit) noexcept
+{
+    if (total <= limit) return 0;
+    const std::uint64_t target = limit / 10 * 8 + limit % 10 * 8 / 10;
+    return total - target;
+}
+
+// Indexes of 'entries' in removal order, without the 'keep' most recently modified game cache folders (their indexes
+// go to 'kept', newest first). Ties keep the listing order; "." and ".." are never listed.
+inline std::vector<std::size_t> eviction_order(const std::vector<entry>& entries, std::size_t keep = protected_newest, std::vector<std::size_t>* kept = nullptr)
+{
+    std::vector<std::size_t> folders;
+    for (std::size_t i = 0; i < entries.size(); ++i)
+        if (entries[i].directory && entries[i].name != "." && entries[i].name != ".." && kind_of(entries[i].name, true) == kind::game_cache)
+            folders.push_back(i);
+    std::stable_sort(folders.begin(), folders.end(), [&](std::size_t a, std::size_t b) { return entries[a].mtime > entries[b].mtime; });
+    if (folders.size() > keep) folders.resize(keep);
+    if (kept) *kept = folders;
+
+    std::vector<std::size_t> order;
+    for (std::size_t i = 0; i < entries.size(); ++i)
+    {
+        if (entries[i].name == "." || entries[i].name == "..") continue;
+        if (std::find(folders.begin(), folders.end(), i) == folders.end()) order.push_back(i);
+    }
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b)
+    {
+        const kind ka = kind_of(entries[a].name, entries[a].directory), kb = kind_of(entries[b].name, entries[b].directory);
+        if (ka != kb) return static_cast<int>(ka) < static_cast<int>(kb);
+        return entries[a].mtime < entries[b].mtime;
+    });
+    return order;
+}
+
+// "A, B, C (+N more)" for a log line
+inline std::string names_text(const std::vector<std::string>& names)
+{
+    if (names.empty()) return "none";
+    std::string out;
+    for (std::size_t i = 0; i < names.size() && i < names_logged; ++i)
+    {
+        if (i) out += ", ";
+        out += disc_probe::iso_tree::name_text(names[i]);
+    }
+    if (names.size() > names_logged) out += " (+" + std::to_string(names.size() - names_logged) + " more)";
+    return out;
 }
 }

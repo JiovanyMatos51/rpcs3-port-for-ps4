@@ -41,6 +41,10 @@ namespace rsx
 			bool pending;
 			bool active;
 			bool owned;
+#ifdef RPCS3_PS4
+			// A draw of this query was skipped because its program was not ready: the host count misses its samples.
+			bool ps4_incomplete;
+#endif
 		};
 
 		struct queued_report_write
@@ -247,6 +251,19 @@ namespace rsx
 			// Writes every claimed report now (blocking query reads, bounded by the backend's query deadline).
 			// Returns the number of queue entries retired. RSX thread only.
 			u32 ps4_drain(class ::rsx::thread* ptimer);
+
+			// The backend skipped the current draw because its program was not ready (call before the draw's
+			// rsx::thread::end). With zcull_skip_visible the active query is marked incomplete, so a read-back that
+			// finds no samples reports visible instead of occluded. RSX thread only.
+			void ps4_on_skipped_draw();
+
+			// zcull_skip_visible as read when this unit was created (one per renderer).
+			bool ps4_skip_visible() const { return m_ps4_skip_visible; }
+
+		private:
+			bool m_ps4_skip_visible = true;
+
+		public:
 #endif
 
 			// Backend methods (optional, will return everything as always visible by default)

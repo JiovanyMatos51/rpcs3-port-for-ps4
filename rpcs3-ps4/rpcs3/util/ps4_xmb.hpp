@@ -77,6 +77,18 @@ public:
             for (int px = x0; px < x1; ++px) row[px] = mix(row[px], color, weight);
         }
     }
+    // 0.40: an opaque image of exactly the canvas size over the whole canvas with one weight (a full-screen cross-fade);
+    // an image of any other size is ignored. At 255 the result is the image itself.
+    void mix_full(const image& source, unsigned int opacity)
+    {
+        if (!source || source.width != width || source.height != height) return;
+        const unsigned int strength = std::min(opacity, 255u);
+        if (!strength) return;
+        const unsigned int weight = to256(strength);
+        const std::uint32_t* const from = source.pixels.data();
+        const std::size_t count = std::size_t(width) * unsigned(height);
+        for (std::size_t i = 0; i < count; ++i) m_pixels[i] = mix(m_pixels[i], from[i], weight);
+    }
     // Bilinear scaled copy. The destination is clipped once and source coordinates step in 16.16 fixed
     // point; the mapping is the same as the old per-pixel float version (texel centres, edge clamp).
     void blit(const image& source, float x, float y, float w, float h, unsigned int opacity = 255)
@@ -420,6 +432,8 @@ public:
         }
         return missing;
     }
+    // 0.40: the same in the interface's direction (a name the player typed, before it is shown)
+    std::size_t missing_glyphs(std::string_view logical) const { return missing_glyphs(logical, i18n::rtl()); }
 
     // 0.38: advance width of 'value' at 'size', as paint() lays it out (for centred text)
     float measure(std::string_view value, float size = 28.f) const
@@ -589,6 +603,7 @@ struct page_popup
     std::vector<page_choice> choices;
     std::size_t selected = 0;
     bool radio = true; // values of a setting (radio dots); false: a list of actions
+    bool checks = false; // 0.40: a checklist (check boxes; 'current' is the check mark); takes precedence over 'radio'
 };
 
 struct settings_page
@@ -602,6 +617,23 @@ struct settings_page
     std::vector<page_button> buttons;
     std::string footer_help;
     const page_popup* popup = nullptr;
+};
+
+// 0.40: the open folder of the 'Jogo' column: its icon takes the column's place in the category bar, its name the
+// category name's
+struct folder_header
+{
+    const image* icon = nullptr; // not owned; the scene keeps a copy while the header fades out
+    std::string title;
+};
+
+// 0.40: what scene::draw adds to the 'Jogo' column for folders (pointers not owned, valid for the call)
+struct column_extras
+{
+    const folder_header* header = nullptr; // a folder is open: the bar moves one slot left (eased)
+    const page_popup* popup = nullptr;     // the option list or checklist over the right half, never mirrored
+    std::string_view triangle_hint;        // replaces the Triangle label of the footer when not empty
+    std::size_t lifted = std::size_t(-1);  // the row being moved: drawn higher, on a soft glow
 };
 
 class scene
@@ -641,6 +673,63 @@ class scene
     float m_page_scroll = 0, m_page_cursor = 0, m_popup_scroll = 0, m_popup_cursor = 0;
     wrapped_text m_page_help, m_page_message;
 
+    // 0.40: the selected game's own background (PIC1, screen-sized, opaque), the one fading out, and its overlay
+    // (PIC0/PIC2, straight alpha) with their strengths (0..255) of this frame. Empty unless the launcher sets them.
+    image m_media_bg, m_media_out, m_media_ov;
+    int m_ov_x = 0, m_ov_y = 0;
+    unsigned int m_bg_alpha = 0, m_out_alpha = 0, m_ov_alpha = 0;
+
+    // 0.40: folders of the 'Jogo' column. m_depth eases from 0 (top level) to 1 (inside a folder); the header is copied
+    // so it can fade out after the launcher stops passing it; the list identity snaps the row cursor when a folder opens
+    // or closes, so it does not scroll across two different lists.
+    float m_depth = 0;
+    image m_header_icon;
+    const std::uint32_t* m_header_source = nullptr;
+    std::string m_header_title;
+    int m_header_category = 6;
+    bool m_list_in_folder = false;
+    std::string m_list_folder;
+    int m_list_category = -1;
+
+    unsigned int media_shade() const
+    {
+        return std::max({m_media_bg ? m_bg_alpha : 0u, m_media_out ? m_out_alpha : 0u, m_media_ov ? m_ov_alpha : 0u});
+    }
+
+    // Keeps the open folder's header for its fade-out and tells whether the list shown is another one than the last frame's
+    // (a folder opened or closed in the same column)
+    bool track_folder(const folder_header* header, int category)
+    {
+        if (header)
+        {
+            if (m_header_title != header->title) m_header_title = header->title;
+            const image* icon = header->icon && *header->icon ? header->icon : nullptr;
+            if (!icon) { m_header_icon = {}; m_header_source = nullptr; }
+            else if (icon->pixels.data() != m_header_source || icon->width != m_header_icon.width || icon->height != m_header_icon.height)
+            {
+                m_header_icon = *icon;
+                m_header_source = icon->pixels.data();
+            }
+            m_header_category = category;
+        }
+        else if (m_depth <= 0 && (m_header_icon || !m_header_title.empty()))
+        {
+            m_header_icon = {};
+            m_header_source = nullptr;
+            m_header_title.clear();
+        }
+        const bool in_folder = header != nullptr;
+        const bool changed = in_folder != m_list_in_folder || (in_folder && header->title != m_list_folder);
+        const bool new_list = changed && category == m_list_category;
+        if (changed)
+        {
+            m_list_in_folder = in_folder;
+            m_list_folder = in_folder ? header->title : std::string();
+        }
+        m_list_category = category;
+        return new_list;
+    }
+
     const image* resource(std::string_view name) const
     {
         const auto found = resources.find(name);
@@ -656,6 +745,34 @@ class scene
                 const float d = std::hypot(x + .5f - cx, y + .5f - cy);
                 const float cover = std::clamp(outer + .5f - d, 0.f, 1.f) - (inner > 0 ? std::clamp(inner + .5f - d, 0.f, 1.f) : 0.f);
                 if (cover > 0) c.blend(x, y, color, unsigned(cover * 255 + .5f));
+            }
+    }
+
+    // 0.40: a 15 px check box centred on (cx, cy) in white, its frame at 210/255 of 'strength'; 'checked' adds the tick.
+    // Coverage by 4x4 samples per pixel (about 300 pixels).
+    static void check_box(canvas& c, float cx, float cy, bool checked, unsigned int strength)
+    {
+        constexpr float half = 7.5f, frame_width = 1.6f, tick_half_width = 1.25f;
+        const auto segment = [](float px, float py, float ax, float ay, float bx, float by)
+        {
+            const float dx = bx - ax, dy = by - ay;
+            const float t = std::clamp(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy), 0.f, 1.f);
+            return std::hypot(px - ax - t * dx, py - ay - t * dy);
+        };
+        for (int y = int(std::floor(cy - half - 1)); y <= int(std::ceil(cy + half + 1)); ++y)
+            for (int x = int(std::floor(cx - half - 1)); x <= int(std::ceil(cx + half + 1)); ++x)
+            {
+                int frame = 0, tick = 0;
+                for (int sy = 0; sy < 4; ++sy)
+                    for (int sx = 0; sx < 4; ++sx)
+                    {
+                        const float px = float(x) + (float(sx) + .5f) / 4 - cx, py = float(y) + (float(sy) + .5f) / 4 - cy;
+                        const float edge = std::max(std::abs(px), std::abs(py));
+                        frame += edge <= half && edge >= half - frame_width;
+                        tick += checked && std::min(segment(px, py, -4.2f, .2f, -1.3f, 3.4f), segment(px, py, -1.3f, 3.4f, 4.6f, -3.8f)) <= tick_half_width;
+                    }
+                if (frame) c.blend(x, y, 0xffffffffu, unsigned(frame) * strength * 210 / (255 * 16));
+                if (tick) c.blend(x, y, 0xffffffffu, unsigned(tick) * strength / 16);
             }
     }
 
@@ -751,15 +868,18 @@ class scene
                 }
         }
     }
-    static void particles(std::uint32_t* pixels, double seconds)
+    // 0.40: 'opacity' below 255 fades them with the waves under a game's background (255 draws them as before)
+    static void particles(std::uint32_t* pixels, double seconds, unsigned int opacity = 255)
     {
+        if (!opacity) return;
         canvas c(pixels, width, height);
         for (unsigned int i = 0; i < 190; ++i)
         {
             const float u = float((i * 719 + 17) % 1280);
             const int x = int(std::fmod(u + float(seconds) * (1 + i % 3), 1280.f));
             const int y = int(490 - 103 * std::sin(x / 1280.f * 3.141593f) + 18 * std::sin(x / 1280.f * 4.1f + float(seconds) * .17f) + int((i * 79) % 148) - 70);
-            const unsigned int alpha = unsigned(30 + 90 * (.5f + .5f * std::sin(float(seconds) * .7f + i)));
+            const unsigned int full = unsigned(30 + 90 * (.5f + .5f * std::sin(float(seconds) * .7f + i)));
+            const unsigned int alpha = opacity < 255 ? full * opacity / 255 : full;
             c.blend(x, y, 0xfff4f0ff, alpha);
             if (i % 11 == 0) { c.blend(x - 1, y, 0xfff4f0ff, alpha / 3); c.blend(x + 1, y, 0xfff4f0ff, alpha / 3); }
         }
@@ -810,57 +930,177 @@ public:
         particles(pixels, seconds);
     }
     // 0.38: the waves alone (cached layer + particles), under the system dialogs (ps4_xmb_dialog.hpp)
+    // 0.40: with a game's background (set_media): fully shown it is copied instead of the waves (no ribbons or particles
+    // are computed); while it fades it is mixed over the waves and the particles fade with them. The overlay is not part
+    // of it: draw() adds it under the XMB items, and a system dialog over this backdrop keeps its texts on a plain
+    // background (a game's overlay is mostly bright title art right where the dialog band sits).
     void backdrop(std::uint32_t* pixels, double seconds)
     {
-        if (cached_background && m_layer.size() == m_background.size())
+        const unsigned int bg = m_media_bg ? m_bg_alpha : 0, out = m_media_out ? m_out_alpha : 0;
+        if (bg >= 255) std::copy(m_media_bg.pixels.begin(), m_media_bg.pixels.end(), pixels);
+        else if (out >= 255)
         {
-            if (!m_layer_valid || !(seconds >= m_layer_time) || seconds - m_layer_time >= layer_period)
-            {
-                layer(m_layer.data(), seconds);
-                m_layer_time = seconds;
-                m_layer_valid = true;
-            }
-            std::copy(m_layer.begin(), m_layer.end(), pixels);
-            particles(pixels, seconds);
+            std::copy(m_media_out.pixels.begin(), m_media_out.pixels.end(), pixels);
+            if (bg) canvas(pixels, width, height).mix_full(m_media_bg, bg);
         }
-        else background(pixels, seconds);
+        else
+        {
+            if (cached_background && m_layer.size() == m_background.size())
+            {
+                if (!m_layer_valid || !(seconds >= m_layer_time) || seconds - m_layer_time >= layer_period)
+                {
+                    layer(m_layer.data(), seconds);
+                    m_layer_time = seconds;
+                    m_layer_valid = true;
+                }
+                std::copy(m_layer.begin(), m_layer.end(), pixels);
+            }
+            else layer(pixels, seconds);
+            if (out || bg)
+            {
+                canvas c(pixels, width, height);
+                c.mix_full(m_media_out, out);
+                c.mix_full(m_media_bg, bg);
+            }
+            particles(pixels, seconds, 255 - std::max(bg, out));
+        }
     }
+
+    // 0.40: the selected game's own background and overlay, both decoded and scaled by the launcher: 'background' exactly
+    // 1280x720 and opaque, 'overlay' straight alpha, at most the screen, drawn 1:1 at (x, y); an image of another size is
+    // not kept (an empty one is no image: the waves stay). The visible background becomes the one fading out, keeping
+    // its strength; the new ones start at 0. set_media_alpha() then gives the strengths of every frame.
+    void set_media(image background, image overlay, int x, int y)
+    {
+        if (m_media_bg && m_bg_alpha)
+        {
+            m_media_out = std::move(m_media_bg);
+            m_out_alpha = m_bg_alpha;
+        }
+        const bool screen = background && background.width == width && background.height == height;
+        m_media_bg = screen ? std::move(background) : image{};
+        m_bg_alpha = 0;
+        const bool fits = overlay && overlay.width <= width && overlay.height <= height;
+        m_media_ov = fits ? std::move(overlay) : image{};
+        m_ov_x = std::clamp(x, -width, width);
+        m_ov_y = std::clamp(y, -height, height);
+        m_ov_alpha = 0;
+    }
+    // 0.40: strengths (0..255) of the background, of the one fading out (freed when it reaches 0) and of the overlay
+    void set_media_alpha(unsigned int background, unsigned int fading_out, unsigned int overlay)
+    {
+        m_bg_alpha = std::min(background, 255u);
+        m_out_alpha = std::min(fading_out, 255u);
+        m_ov_alpha = std::min(overlay, 255u);
+        if (!m_out_alpha && m_media_out) m_media_out = {};
+    }
+    // 0.40: frees every media image (the launcher calls it before a game boots); returns the bytes freed
+    std::size_t clear_media()
+    {
+        const std::size_t bytes = media_bytes();
+        m_media_bg = {};
+        m_media_out = {};
+        m_media_ov = {};
+        m_bg_alpha = m_out_alpha = m_ov_alpha = 0;
+        return bytes;
+    }
+    // 0.40: bytes held by the media images
+    std::size_t media_bytes() const
+    {
+        return (m_media_bg.pixels.capacity() + m_media_out.pixels.capacity() + m_media_ov.pixels.capacity()) * sizeof(std::uint32_t);
+    }
+    // 0.40: 'extras' adds the folders of the 'Jogo' column (the open folder's header, an option list or checklist, the
+    // Triangle label, the row being moved); without it, and once a folder has closed, the column is drawn as before.
+    // While a game's background or overlay shows, the selected row's texts and the message line get a dark 1 px shadow.
     void draw(std::uint32_t* pixels, const font& typeface, int category, std::size_t selected,
         std::span<const entry> entries, double seconds, float elapsed, std::string_view clock, std::string_view message, bool settings = false,
-        std::string_view settings_help = {})
+        std::string_view settings_help = {}, const column_extras* extras = nullptr)
     {
         // A single slow frame moves the selection at most as far as a 50 ms step.
         const float step = elapsed > 0.f ? std::min(elapsed, .05f) : 0.f;
         const float ease = 1.f - std::exp(-step / .065f);
         m_category += (category - m_category) * ease;
-        m_row += (float(selected) - m_row) * ease;
+        const folder_header* const header = extras ? extras->header : nullptr;
+        if (track_folder(header, category)) m_row = float(selected);
+        else m_row += (float(selected) - m_row) * ease;
+        // 0 at the top level, 1 inside a folder; it settles exactly on its target so the top level draws as before
+        const float depth_target = header ? 1.f : 0.f;
+        m_depth += (depth_target - m_depth) * ease;
+        if (std::abs(depth_target - m_depth) < 1.f / 256) m_depth = depth_target;
         backdrop(pixels, seconds);
         canvas c(pixels, width, height);
+        // 0.40: the game's overlay (PIC0/PIC2) between its background and the XMB items, 1:1
+        if (m_media_ov && m_ov_alpha)
+            c.blit(m_media_ov, float(m_ov_x), float(m_ov_y), float(m_media_ov.width), float(m_media_ov.height), m_ov_alpha);
         c.rectangle(900, 50, 380, 39, 0x167d90ac);
         c.rectangle(900, 50, 380, 1, 0x54dae0f2); c.rectangle(900, 88, 380, 1, 0x30dae0f2);
         c.rectangle(900, 50, 1, 39, 0x54dae0f2);
         typeface.paint(c, 1050, 77, clock, 23);
         const bool right_to_left = rtl_layout();
+        const unsigned int shade = media_shade();
+        const auto shadowed = [&](float x, float y, std::string_view text, float size, std::uint32_t color)
+        {
+            if (shade)
+                if (const unsigned int a = 0x60 * shade / 255 * (color >> 24) / 255) typeface.paint(c, x + 1, y + 1, text, size, a << 24);
+            typeface.paint(c, x, y, text, size, color);
+        };
+        // Inside a folder the bar moves one slot left: the column's own icon stays as the parent (side size, half
+        // strength) and the others fade out
+        const float shift = 136 * m_depth;
         for (int i = 0; i < int(category_count); ++i)
         {
-            const float x = 375 + (i - m_category) * 136;
+            const float x = 375 + (i - m_category) * 136 - shift;
             const float focus = std::max(0.f, 1.f - std::abs(i - m_category));
-            const float size = 68 + 46 * focus;
-            if (const auto found = resources.find(icons[i]); found != resources.end()) c.blit(found->second, x - size / 2, 190 - size / 2, size, size, unsigned(140 + 115 * focus));
+            float size = 68 + 46 * focus;
+            unsigned int opacity = unsigned(140 + 115 * focus);
+            float fade = 1;
+            if (m_depth > 0)
+            {
+                fade = i == m_header_category ? 1 - .5f * m_depth : 1 - m_depth;
+                if (i == m_header_category) size += (68 - size) * m_depth;
+                opacity = unsigned(float(opacity) * fade);
+                if (!opacity) continue;
+            }
+            if (const auto found = resources.find(icons[i]); found != resources.end()) c.blit(found->second, x - size / 2, 190 - size / 2, size, size, opacity);
+            else if (m_depth > 0) c.rectangle(int(x) - 19, 174, 38, 30, (std::uint32_t(float(0x65) * fade) << 24) | 0xe1e0f3);
             else { c.rectangle(int(x) - 19, 174, 38, 30, 0x65e1e0f3); }
         }
-        typeface.paint(c, 352, 238, category_name(category), 21);
+        if (m_depth <= 0) typeface.paint(c, 352, 238, category_name(category), 21);
+        else
+        {
+            // The open folder at the column's place, 114 px wide like a focused category icon; its name cross-fades with
+            // the category name
+            if (m_header_icon)
+            {
+                const float w = 114, h = w * float(m_header_icon.height) / float(m_header_icon.width);
+                c.blit(m_header_icon, 375 - w / 2, 190 - h / 2, w, h, unsigned(255 * m_depth));
+            }
+            if (m_depth < .5f) typeface.paint(c, 352, 238, category_name(category), 21, (std::uint32_t(255 * (1 - 2 * m_depth)) << 24) | 0xeeeeee);
+            else typeface.paint(c, 352, 238, typeface.fit(m_header_title, 21, 600, right_to_left), 21, (std::uint32_t(255 * (2 * m_depth - 1)) << 24) | 0xeeeeee);
+        }
+        // Opening or closing a folder fades the new list in during the second half of the move
+        const float list_fade = m_depth == depth_target ? 1.f : std::clamp(1.6f * (1 - std::abs(depth_target - m_depth)) - .6f, 0.f, 1.f);
+        const std::size_t lifted = extras ? extras->lifted : std::size_t(-1);
         const float column = 375 + (category - m_category) * 136;
         for (std::size_t i = 0; i < entries.size(); ++i)
         {
             const float distance = float(i) - m_row;
-            const float y = distance < -1 ? 112 + (distance + 1) * 68 : distance < 0 ? 335 + distance * 223 : distance < 1 ? 335 + distance * 124 : 459 + (distance - 1) * 65;
+            float y = distance < -1 ? 112 + (distance + 1) * 68 : distance < 0 ? 335 + distance * 223 : distance < 1 ? 335 + distance * 124 : 459 + (distance - 1) * 65;
             if (y < -90 || y > 692) continue;
             const float focus = std::max(0.f, 1.f - std::abs(distance));
             const float size = 42 + 54 * focus;
-            const unsigned int opacity = unsigned(96 + 159 * focus);
+            unsigned int opacity = unsigned(96 + 159 * focus);
+            if (list_fade < 1) opacity = unsigned(float(opacity) * list_fade);
             const image* icon = entries[i].artwork ? &entries[i].artwork : nullptr;
             if (!icon) if (const auto found = resources.find(entries[i].icon_name); found != resources.end()) icon = &found->second;
+            if (i == lifted)
+            {
+                // The row being moved: 6 px higher, on a soft glow a little larger than its icon
+                y -= 6;
+                const float w = size, h = icon ? size * float(icon->height) / float(icon->width) : size * 2 / 3;
+                for (int k = 0; k < 4; ++k)
+                    c.rectangle(int(column - w / 2) - 12 + 3 * k, int(y - h / 2) - 12 + 3 * k, int(w) + 24 - 6 * k, int(h) + 24 - 6 * k, 0x16ffffff);
+            }
             // 0.37: a locked game is dimmed and carries the padlock (tex_lock_icon) in its middle
             const bool locked = entries[i].locked;
             const unsigned int icon_opacity = locked ? opacity * 3 / 5 : opacity;
@@ -882,16 +1122,16 @@ public:
             {
                 // 0.39: the text stays on the icon side in both directions. A line with Arabic wider than the screen ends
                 // with "…" (the right edge would cut the start of its sentence); other lines keep the edge cut.
-                const auto alpha = std::uint32_t(255 * focus) << 24;
+                const auto alpha = std::uint32_t(list_fade < 1 ? 255 * focus * list_fade : 255 * focus) << 24;
                 const float room = 1240 - (column + 75);
                 const auto fitted = [&](const std::string& text, float size)
                 { return arabic::has_arabic(text) ? typeface.fit(text, size, room, right_to_left) : text; };
-                typeface.paint(c, column + 75, y + 8, fitted(entries[i].title, 27), 27, alpha | 0xfbfbff);
+                shadowed(column + 75, y + 8, fitted(entries[i].title, 27), 27, alpha | 0xfbfbff);
                 // The help line wider than the room continues on a second line (the firmware font is wider than DejaVu)
                 const std::string subtitle = locked ? entries[i].subtitle + i18n::tr(i18n::str::XMB_PRECISA_DISCO_LEITOR) : entries[i].subtitle;
                 const std::vector<std::string>& lines = m_subtitle.get(typeface, subtitle, 17, room, 2, right_to_left);
                 for (std::size_t k = 0; k < lines.size(); ++k)
-                    typeface.paint(c, column + 75, y + 33 + float(k) * 21, lines[k], 17, alpha | 0xdfdce9);
+                    shadowed(column + 75, y + 33 + float(k) * 21, lines[k], 17, alpha | 0xdfdce9);
             }
         }
         // 0.39: the message line: from x 60 left to right, or ending at x 1220 right to left, fitted to 1160 px when it
@@ -900,12 +1140,13 @@ public:
         {
             const std::string line = right_to_left || arabic::has_arabic(message) ? typeface.fit(message, 20, 1160, right_to_left) : std::string(message);
             const float x = right_to_left ? std::round(1220 - typeface.measure(line, 20)) : 60.f;
-            typeface.paint(c, x, 632, line, 20, 0xffffd8b3);
+            shadowed(x, 632, line, 20, 0xffffd8b3);
         }
         using i18n::str;
         // The settings lists (top level, PS4 tab) take X and Circle only; 'settings_help' names their other buttons
         const std::array<const char*, 3> buttons{"tex_cross", "tex_circle", "tex_triangle"};
-        const std::array<const char*, 3> hints{i18n::tr(str::COM_SELECIONAR), i18n::tr(str::COM_VOLTAR), i18n::tr(str::COM_ATUALIZAR)};
+        const std::string_view triangle = extras && !extras->triangle_hint.empty() ? extras->triangle_hint : std::string_view(i18n::tr(str::COM_ATUALIZAR));
+        const std::array<std::string_view, 3> hints{i18n::tr(str::COM_SELECIONAR), i18n::tr(str::COM_VOLTAR), triangle};
         for (int i = 0; i < (settings ? 2 : 3); ++i)
         {
             // 0.39: mirrored for a right-to-left interface: the pairs from the right edge, each hint left of its glyph
@@ -918,6 +1159,9 @@ public:
         // Options no longer leaves the application (0.25): closing is the PS button menu.
         const std::string_view help = settings ? settings_help : std::string_view(i18n::tr(str::XMB_QUADRADO_CONFIGURAR_JOGO_BOTAO_PS));
         if (!help.empty()) typeface.paint(c, right_to_left ? std::round(760 - typeface.measure(help, 18)) : 520.f, 682, help, 18, 0xffd5d2e5);
+        // 0.40: the option list or checklist of the 'Jogo' column, on the right in both directions
+        if (extras && extras->popup) draw_popup(c, typeface, *extras->popup, ease, false);
+        else m_popup_key.clear();
     }
 
     // A settings page (one tab of the settings browser) in the PS3 'Settings' list look: the waves, the tab's icon and
@@ -1072,10 +1316,28 @@ public:
             m_popup_key.clear();
             return;
         }
-        const page_popup& popup = *page.popup;
+        draw_popup(c, typeface, *page.popup, ease, rtl);
+    }
+
+    // 0.40: the list of values (radio dots), actions or checks (a checklist) over the right half: a heading, an eased
+    // highlight band and scroll, a scroll bar. mirror = the whole layout is mirrored (a settings page right to left: the
+    // panel over the left half). In the XMB the panel stays on the right in both directions: a right-to-left interface
+    // only moves its texts and marks to the panel's right side.
+    void draw_popup(canvas& c, const font& typeface, const page_popup& popup, float ease, bool mirror)
+    {
+        const bool rtl = rtl_layout();
+        // x of a span that starts at 'x' left to right: mirrored on the screen, or inside the panel
+        const auto at = [&](float x, float w)
+        {
+            if (mirror) return std::round(float(width) - x - w);
+            return rtl ? std::round(float(2 * popup_left + popup_width) - x - w) : x;
+        };
+        // the panel, its band and its scroll bar move only with a mirrored layout
+        const auto box = [&](int x, int y, int w, int h, std::uint32_t color)
+        { c.rectangle(int(mirror ? std::round(float(width) - float(x) - float(w)) : float(x)), y, w, h, color); };
         const std::size_t choices = popup.choices.size();
         const std::size_t current = choices ? std::min(popup.selected, choices - 1) : 0;
-        std::string popup_key = popup.title + '\x1f' + std::to_string(choices) + (popup.radio ? "r" : "a");
+        std::string popup_key = popup.title + '\x1f' + std::to_string(choices) + (popup.checks ? "c" : popup.radio ? "r" : "a");
         const bool popup_fresh = popup_key != m_popup_key;
         m_popup_first = window_first(popup_fresh ? 0 : m_popup_first, current, choices, popup_rows);
         if (popup_fresh)
@@ -1104,7 +1366,7 @@ public:
             box(popup_left + 10, y, popup_width - 20, 1, 0x50ffffff);
             box(popup_left + 10, y + popup_row_height - 1, popup_width - 20, 1, 0x34ffffff);
         }
-        const float text_x = float(popup_left + (popup.radio ? 56 : 30));
+        const float text_x = float(popup_left + (popup.radio || popup.checks ? 56 : 30));
         const float text_room = float(popup_left + popup_width - 20) - text_x;
         const int from = std::max(0, int(std::floor(m_popup_scroll)) - 1);
         const int to = std::min(int(choices), int(std::ceil(m_popup_scroll)) + popup_rows + 1);
@@ -1116,7 +1378,8 @@ public:
             const unsigned opacity = unsigned(255 * std::clamp(fade, 0.f, 1.f));
             const page_choice& choice = popup.choices[std::size_t(i)];
             const unsigned strength = (choice.greyed ? 120 : 255) * opacity / 255;
-            if (popup.radio)
+            if (popup.checks) check_box(c, at(float(popup_left + 30), 0), top + item_h / 2, choice.current, strength);
+            else if (popup.radio)
             {
                 const float cx = at(float(popup_left + 30), 0), cy = top + item_h / 2;
                 disc(c, cx, cy, 7.f, 5.2f, (std::uint32_t(strength * 210 / 255) << 24) | 0xffffff);

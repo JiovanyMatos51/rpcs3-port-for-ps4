@@ -150,6 +150,10 @@ add_library(rpcs3_ps4_frontend OBJECT
     # -fno-exceptions. Objects of this target are always linked, so rpcs3_ps4_input
     # resolves ps4_pads:: here. The on-screen keyboard wrapper is added below.
     ../rpcs3/ps4_pads.cpp
+    # 0.40: the selected game's own XMB background and music (its PIC1/PIC0/PIC2 and SND0.AT3), read, decoded and
+    # played only while no game runs. Exception-free, so it stays -fno-exceptions. FFmpeg's headers come from the
+    # include block of the Vulkan section below, zlib's from the source property after this target.
+    ../rpcs3/ps4_xmb_media.cpp
     runtime/ps4_virtual_memory.cpp
     runtime/ps4_shared_memory.cpp
     # These override libc.a members (real x86-64 fenv instead of the SDK's
@@ -191,6 +195,10 @@ target_compile_options(rpcs3_ps4_frontend PRIVATE
 # Source options follow the target options, so -fexceptions wins (as for yaml.cpp).
 set_source_files_properties("${CMAKE_SOURCE_DIR}/rpcs3/ps4_fatal.cpp"
     PROPERTIES COMPILE_OPTIONS -fexceptions)
+# The XMB media cache stores its overlays zlib-compressed (zlib is linked already). Only this source gets zlib's
+# folder, so no other frontend file's includes resolve differently.
+set_source_files_properties("${CMAKE_SOURCE_DIR}/rpcs3/ps4_xmb_media.cpp"
+    PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/3rdparty/zlib/zlib")
 
 # Guest address-space mapping and JIT memory protection for the console ABI.
 add_library(rpcs3_ps4_vm OBJECT

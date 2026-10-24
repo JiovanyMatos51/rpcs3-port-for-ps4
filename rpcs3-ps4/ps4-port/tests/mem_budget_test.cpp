@@ -2,6 +2,8 @@
 // cap it gives, checked against the 0.37 console figures (FIFA 14 at its fatal, the XMB before a game) and the example
 // budget line worked out by hand; the governor v2 levels with their hysteresis; compile admission; the per-title record.
 // 0.39: the L1 rules (relative threshold, two-window slope outside compile stages) and the compile slot classes.
+// 0.40: the paced retry of a refused HLE media create and the reason text of serialized compiles; the optional-thread
+// cap after a refusal, the group count of optional threads, the codec line rate and the opt-in boot compile stage rule.
 //
 // Build and run from any scratch directory (llvm-mingw):
 //   clang++ -std=c++20 -static -Wall -Wextra -I rpcs3 ps4-port/tests/mem_budget_test.cpp -o mem_budget_test.exe
@@ -338,6 +340,311 @@ void test_thread_cap()
     CHECK(gov::with_thread_cap("x 1\n", "", 80).empty());
 }
 
+// 0.40: the 0.38 rules are the default slot mode; the stage-aware level 1 decision of the 0.39 rules; the optional
+// thread rule (the last 8 slots of the console's cap stay with the game)
+void test_rules_040()
+{
+    using K = mb::slot_kind;
+    using S = mb::slot_mode;
+    namespace gov = utils::ps4::governor;
+    const mb::s64 M = static_cast<mb::s64>(MiB);
+
+    // 0.38 rules: any memory level, thread level 2 or "Modo frio" -> one compile in the whole process
+    CHECK(mb::slot_mode_v038(0, false, false) == S::parallel);
+    CHECK(mb::slot_mode_v038(1, false, false) == S::one_in_total);
+    CHECK(mb::slot_mode_v038(2, false, false) == S::one_in_total);
+    CHECK(mb::slot_mode_v038(3, false, false) == S::one_in_total);
+    CHECK(mb::slot_mode_v038(0, true, false) == S::one_in_total);
+    CHECK(mb::slot_mode_v038(0, false, true) == S::one_in_total);
+    // ... every class waits for level 2 to fall, none at level 1, and one held slot of any class blocks the others
+    for (const K k : {K::cpu, K::rsx, K::interp})
+    {
+        CHECK(mb::slot_waits_for_level(k, 2, true) && mb::slot_waits_for_level(k, 3, true));
+        CHECK(!mb::slot_waits_for_level(k, 1, true));
+        CHECK(!mb::slot_admits(S::one_in_total, mb::slot_unit(K::rsx), k));
+        CHECK(mb::slot_admits(S::one_in_total, 0, k));
+        CHECK(mb::slot_admits(S::parallel, mb::slot_unit(K::cpu) + mb::slot_unit(K::rsx), k));
+    }
+    // The 0.38 level machine keeps its default: level 1 below 768 MiB, cleared at 832 MiB
+    {
+        mb::level_state st{};
+        CHECK(mb::step_level(st, mb::raw_level(700 * M, 0, false), 700 * M, false, 1'000'000) == 1);
+        CHECK(mb::step_level(st, mb::raw_level(831 * M, 0, false), 831 * M, false, 2'000'000) == 1);
+        CHECK(mb::step_level(st, mb::raw_level(832 * M, 0, false), 832 * M, false, 3'000'000) == 0);
+    }
+
+    // 0.39 rules: a slope-only level 1 never serializes PPU/SPU while a compile stage runs, even when the level was
+    // sampled before the stage began; the room floor (below 384 MiB) serializes in any stage
+    CHECK(mb::cpu_l1_in_stage(false, true, false));
+    CHECK(!mb::cpu_l1_in_stage(false, true, true));
+    CHECK(mb::cpu_l1_in_stage(true, false, true) && mb::cpu_l1_in_stage(true, true, true));
+    CHECK(!mb::cpu_l1_in_stage(false, false, false));
+    CHECK(mb::slot_mode_v039(1, mb::cpu_l1_in_stage(false, true, true), false, false) == S::parallel);
+    CHECK(mb::slot_mode_v039(1, mb::cpu_l1_in_stage(false, true, false), false, false) == S::one_per_class);
+    CHECK(mb::slot_mode_v039(1, mb::cpu_l1_in_stage(300 * M < static_cast<mb::s64>(mb::cpu_serialize_room), true, true), false, false) == S::one_per_class);
+    // Split in two parts, the decision equals l1_serializes_cpu(room, slope_rule_v039(..., stage)) of the 0.39 governor
+    for (const mb::s64 room : {300 * M, 450 * M, 900 * M})
+        for (const unsigned streak : {0u, 1u, 2u, 5u})
+            for (const mb::s64 slope : {mb::s64{0}, -60 * M, -170 * M})
+                for (const bool stage : {false, true})
+                {
+                    const bool floor = room < static_cast<mb::s64>(mb::cpu_serialize_room);
+                    const bool slope_any = mb::slope_rule_v039(room, slope, streak, false);
+                    CHECK(mb::cpu_l1_in_stage(floor, slope_any, stage) == mb::l1_serializes_cpu(room, mb::slope_rule_v039(room, slope, streak, stage)));
+                }
+
+    // Optional threads (cap 80): one up to 71 threads, the three RPCN threads up to 69, a connect (none) up to 72
+    CHECK(gov::optional_allowed(71, 1, 80) && !gov::optional_allowed(72, 1, 80));
+    CHECK(gov::optional_allowed(69, 3, 80) && !gov::optional_allowed(70, 3, 80));
+    CHECK(gov::optional_allowed(72, 0, 80) && !gov::optional_allowed(73, 0, 80));
+    // Demon's Souls 0.39 started RPCN at 72 threads of cap 80: refused now
+    CHECK(!gov::optional_allowed(72, 3, 80));
+    // A file or learned cap is clamped (64 at least)
+    CHECK(gov::optional_allowed(55, 1, 10) && !gov::optional_allowed(56, 1, 10));
+    CHECK(gov::optional_allowed(1000, 1, 2000));
+    // One optional thread is refused exactly where the 0.39 thread level 2 begins
+    for (unsigned t = 40; t < 100; t++)
+    {
+        CHECK(gov::optional_allowed(t, 1, 80) == (gov::classify_thread_load(t, 80) < 2));
+    }
+    // optional-threads-free.flag: the rule is off and every optional thread may start
+    CHECK(gov::optional_decision(false, 79, 3, 80));
+    CHECK(!gov::optional_decision(true, 79, 3, 80));
+    CHECK(gov::optional_decision(true, 10, 3, 80));
+
+    // Host build: no rule, no reason text
+    CHECK(gov::optional_thread_allowed("RPCN start", 3));
+    char reason[8] = "x";
+    gov::serialize_reason(reason, sizeof(reason));
+    CHECK(reason[0] == '\0');
+}
+
+// 0.40: one paced retry of a refused HLE media create (the guest create retry is off by default)
+void test_media_pacing_040()
+{
+    namespace gov = utils::ps4::governor;
+
+    // Only the emulator's four media threads, by exact name
+    CHECK(gov::is_hle_media_thread("HLE Video Decoder"));
+    CHECK(gov::is_hle_media_thread("HLE ATRAC3plus decoder"));
+    CHECK(gov::is_hle_media_thread("HLE LPCM decoder"));
+    CHECK(gov::is_hle_media_thread("HLE PAMF demuxer"));
+    CHECK(!gov::is_hle_media_thread("HLE Video Decoder Reaper"));
+    CHECK(!gov::is_hle_media_thread("HLE Video Decoder "));
+    CHECK(!gov::is_hle_media_thread("hle video decoder"));
+    CHECK(!gov::is_hle_media_thread("HLE LPCM"));
+    CHECK(!gov::is_hle_media_thread("HLE SceNpBandwidthTest"));
+    CHECK(!gov::is_hle_media_thread("_libsail-control"));
+    CHECK(!gov::is_hle_media_thread("_cellVdecCtrlThread"));
+    CHECK(!gov::is_hle_media_thread("MainThread"));
+    CHECK(!gov::is_hle_media_thread(""));
+    static_assert(gov::is_hle_media_thread("HLE PAMF demuxer") && !gov::is_hle_media_thread("HLE PAMF"));
+
+    // Demon's Souls: refused at 78 counted while the cap in force stayed 80. A wait for "below the cap" would create
+    // again at once; the wait for a slot below the load at the refusal does wait
+    CHECK(78 < gov::thread_cap_default);
+    CHECK(gov::media_retry_wait_ms(78, 78, 0) == gov::media_retry_step_ms);
+    CHECK(gov::media_retry_wait_ms(79, 78, 30) == 10); // more threads since the refusal
+    // A freed slot ends the wait (also before the first sleep)
+    CHECK(gov::media_retry_wait_ms(77, 78, 40) == 0);
+    CHECK(gov::media_retry_wait_ms(77, 78, 0) == 0);
+    CHECK(gov::media_retry_wait_ms(60, 78, 120) == 0);
+    // 250 ms ceiling: the last step is cut to what is left, then create once more
+    CHECK(gov::media_retry_wait_ms(78, 78, 240) == 10);
+    CHECK(gov::media_retry_wait_ms(78, 78, 245) == 5);
+    CHECK(gov::media_retry_wait_ms(78, 78, 249) == 1);
+    CHECK(gov::media_retry_wait_ms(78, 78, 250) == 0);
+    CHECK(gov::media_retry_wait_ms(78, 78, 1000) == 0);
+    CHECK(gov::media_retry_wait_ms(78, 78, 0xffffffffu) == 0);
+    // Load not known (0): waits for the ceiling
+    CHECK(gov::media_retry_wait_ms(5, 0, 0) == 10 && gov::media_retry_wait_ms(5, 0, 250) == 0);
+    // The steps from 0 add up to the ceiling exactly
+    {
+        u32 waited = 0, steps = 0;
+        while (const u32 step = gov::media_retry_wait_ms(78, 78, waited))
+        {
+            waited += step;
+            steps++;
+        }
+        CHECK(waited == gov::media_retry_ceiling_ms && steps == 25);
+    }
+    static_assert(gov::media_retry_wait_ms(78, 78, 0) == 10 && gov::media_retry_wait_ms(77, 78, 0) == 0);
+
+    // The wait loop on a fake clock: 'load' is the count after 'free_after_ms' (or forever when 0)
+    struct fake
+    {
+        u64 t = 5'000'000; // steady clock, us
+        u64 since = 5'000'000;
+        u32 sleeps = 0;
+        u32 oversleep_us = 0;
+        bool clock_runs = true;
+        u32 free_after_ms = 0;
+        u32 stop_after_ms = 0;
+
+        u32 run(u32 load_at_refusal)
+        {
+            return gov::media_retry_pace_with(
+                since, load_at_refusal, [&]() noexcept { return t; },
+                [&]() noexcept -> u32 { return free_after_ms && t - since >= u64{free_after_ms} * 1000 ? load_at_refusal - 1 : load_at_refusal; },
+                [&](u32 ms) noexcept
+                {
+                    sleeps++;
+                    if (clock_runs) t += u64{ms} * 1000 + oversleep_us;
+                },
+                [&]() noexcept { return stop_after_ms && t - since >= u64{stop_after_ms} * 1000; });
+        }
+    };
+    {
+        fake f; // nothing frees: the full ceiling, 25 sleeps of 10 ms
+        CHECK(f.run(78) == 250 && f.sleeps == 25);
+    }
+    {
+        fake f; // a join after 40 ms
+        f.free_after_ms = 40;
+        CHECK(f.run(78) == 40 && f.sleeps == 4);
+    }
+    {
+        fake f; // the emulator stops after 20 ms
+        f.stop_after_ms = 20;
+        CHECK(f.run(78) == 20 && f.sleeps == 2);
+    }
+    {
+        fake f; // stopped already: no sleep
+        f.stop_after_ms = 1;
+        f.t += 1000;
+        CHECK(f.run(78) == 1 && f.sleeps == 0);
+    }
+    {
+        fake f; // each sleep 3 ms longer than asked: still ends right after the ceiling
+        f.oversleep_us = 3000;
+        const u32 waited = f.run(78);
+        CHECK(waited >= 250 && waited < 263 && f.sleeps == 20);
+    }
+    {
+        fake f; // a clock that does not advance: bounded by the sleep count
+        f.clock_runs = false;
+        CHECK(f.run(78) == 0 && f.sleeps == 50);
+    }
+    {
+        fake f; // 'since' ahead of the clock: counted from 0, still bounded
+        f.since = f.t + 100'000;
+        const u32 waited = f.run(78);
+        CHECK(f.sleeps <= 50 && waited <= 250);
+    }
+
+    // Host build: no pacing
+    CHECK(gov::media_retry_pace(0, 78, []() noexcept { return false; }) == 0);
+}
+
+// 0.40: the reason text of a serialized compile (the PPU and SPU "one thread only" lines)
+void test_serialize_reason_040()
+{
+    namespace gov = utils::ps4::governor;
+    using S = mb::slot_mode;
+    const mb::s64 M = static_cast<mb::s64>(MiB);
+    char text[192];
+
+    const auto reason = [&](const gov::serialize_state& st) -> std::string
+    {
+        const auto n = gov::format_serialize_reason(text, sizeof(text), st);
+        CHECK(n == std::strlen(text));
+        return text;
+    };
+
+    gov::serialize_state st{};
+    st.v038 = false;
+    st.threads = 74;
+    st.cap = 80;
+    CHECK(reason(st) == "thread level 2, 74 of 80");
+    st.threads = 71;
+    CHECK(reason(st) == "none now");
+    st.memory_level = 2;
+    st.room_known = true;
+    st.room = 300 * M;
+    CHECK(reason(st) == "memory level 2, room 300 MiB");
+    // 0.39 level 1 serializes PPU/SPU only with cpu_l1
+    st.memory_level = 1;
+    st.room = 700 * M;
+    CHECK(reason(st) == "none now");
+    st.cpu_l1 = true;
+    st.room = 350 * M;
+    CHECK(reason(st) == "memory level 1, room 350 MiB (below 384 MiB of room, low flexible memory or a sustained slope)");
+    st.threads = 78;
+    st.cool = true;
+    CHECK(reason(st) == "memory level 1, room 350 MiB (below 384 MiB of room, low flexible memory or a sustained slope); thread level 2, 78 of 80; cool mode");
+    // "Modo frio" in a boot compile stage keeps two compiles: not a cause of its own
+    st = {};
+    st.v038 = false;
+    st.cap = 80;
+    st.cool = true;
+    CHECK(reason(st) == "cool mode");
+    st.cool_stage = true;
+    CHECK(reason(st) == "none now");
+    // A learned or file cap
+    st.cool = false;
+    st.threads = 70;
+    st.cap = 78;
+    CHECK(reason(st) == "thread level 2, 70 of 78");
+
+    // 0.38 rules: any memory level, registry threads at 56/64, "Modo frio"
+    st = {};
+    st.memory_level = 1;
+    st.room_known = true;
+    st.room = 700 * M;
+    CHECK(reason(st) == "memory level 1, room 700 MiB");
+    st.memory_level = 0;
+    st.threads = 66;
+    CHECK(reason(st) == "thread level 2, 66 live RPCS3 threads (levels at 56/64)");
+    st.memory_level = 3;
+    st.room = -50 * M;
+    st.cool = true;
+    CHECK(reason(st) == "memory level 3, room -50 MiB; thread level 2, 66 live RPCS3 threads (levels at 56/64); cool mode");
+    st = {};
+    st.memory_level = 3;
+    CHECK(reason(st) == "memory level 3"); // no cap known
+    st.memory_level = 9;
+    CHECK(reason(st) == "memory level 3");
+
+    // Truncated to fit, always NUL-terminated
+    st = {};
+    st.v038 = false;
+    st.threads = 74;
+    st.cap = 80;
+    char small[10];
+    CHECK(gov::format_serialize_reason(small, sizeof(small), st) == 9 && std::strcmp(small, "thread le") == 0);
+    char one[1] = {'x'};
+    CHECK(gov::format_serialize_reason(one, sizeof(one), st) == 0 && one[0] == '\0');
+    CHECK(gov::format_serialize_reason(nullptr, 16, st) == 0);
+
+    // A cause is named exactly when the slot mode of the same inputs serializes (one per class or one in total)
+    for (const bool v038 : {false, true})
+        for (int level = 0; level <= 3; level++)
+            for (const bool cpu_l1 : {false, true})
+                for (const unsigned threads : {50u, 60u, 66u, 71u, 74u})
+                    for (const bool cool : {false, true})
+                        for (const bool stage : {false, true})
+                        {
+                            gov::serialize_state s{};
+                            s.v038 = v038;
+                            s.memory_level = level;
+                            s.room_known = true;
+                            s.room = 400 * M;
+                            s.cpu_l1 = cpu_l1;
+                            s.threads = threads;
+                            s.cap = 80;
+                            s.cool = cool;
+                            s.cool_stage = stage;
+                            const int heap = level > 2 ? 2 : level;
+                            const S mode = v038 ? mb::slot_mode_v038(heap, gov::classify_threads(threads) >= 2, cool)
+                                                : mb::slot_mode_v039(heap, cpu_l1, gov::classify_thread_load(threads, 80) >= 2, cool, cool && stage);
+                            const bool serialized = mode == S::one_per_class || mode == S::one_in_total;
+                            CHECK((reason(s) != "none now") == serialized);
+                        }
+
+    // Host build: no reason text
+    CHECK(gov::serialize_reason().empty());
+}
+
 void test_admission()
 {
     const mb::s64 M = static_cast<mb::s64>(MiB);
@@ -389,6 +696,150 @@ void test_record()
     CHECK(!mb::boot_fits(false, 1100 * M, mb::record{})); // no record: ~1.2 GiB
     CHECK(mb::boot_fits(false, 1300 * M, mb::record{}));
 }
+
+// 0.40: optional threads after a console refusal below the cap (the refusal load is the cap for them, under either
+// rule set), the group count the SPU LLVM workers ask for, and the rate of the codec failure lines.
+void test_optional_cap_040()
+{
+    namespace gov = utils::ps4::governor;
+
+    // No refusal yet: the cap in force
+    CHECK(gov::optional_cap(80, 0) == 80);
+    // DeS: refused at 78 with the default cap 80 -> optional threads count against 78 (one more may start at 69)
+    CHECK(gov::optional_cap(80, 78) == 78);
+    CHECK(gov::optional_allowed(69, 1, gov::optional_cap(80, 78)) && !gov::optional_allowed(70, 1, gov::optional_cap(80, 78)));
+    // Before: against 80 one could still start at 70 and 71 (only 6 slots below 78 kept for the game)
+    CHECK(gov::optional_allowed(70, 1, 80) && gov::optional_allowed(71, 1, 80) && !gov::optional_allowed(72, 1, 80));
+    // A refusal at or above the cap is not a lower cap; below thread_cap_min it is not a cap at all
+    CHECK(gov::optional_cap(80, 80) == 80);
+    CHECK(gov::optional_cap(80, 85) == 80);
+    CHECK(gov::optional_cap(80, 64) == 64);
+    CHECK(gov::optional_cap(80, 63) == 80);
+    CHECK(gov::optional_cap(80, 20) == 80);
+    // A learned (0.39 rules) or probed cap below the refusal keeps the smaller one
+    CHECK(gov::optional_cap(76, 78) == 76);
+    CHECK(gov::optional_cap(100, 90) == 90);
+    // An out-of-range cap is clamped like the levels clamp it
+    CHECK(gov::optional_cap(10, 63) == 10 && gov::optional_cap(10, 64) == 10);
+    static_assert(gov::optional_cap(80, 78) == 78);
+
+    // Group count: the largest n <= wanted with optional_decision() true, for every load
+    for (u32 cap : {64u, 78u, 80u, 100u})
+    {
+        for (u32 t = 0; t <= cap + 4; t++)
+        {
+            for (u32 wanted = 0; wanted <= 4; wanted++)
+            {
+                const u32 n = gov::optional_allowed_count(true, t, wanted, cap);
+                bool ok = n <= wanted && (n == 0 || gov::optional_decision(true, t, n, cap));
+                ok = ok && (n == wanted || !gov::optional_decision(true, t, n + 1, cap));
+                CHECK(ok);
+                CHECK(gov::optional_allowed_count(false, t, wanted, cap) == wanted);
+            }
+        }
+    }
+    // GT6: two SPUW workers wanted at 70 of 80 -> both; at 71 -> one; at 72 and above -> none (the SPU LLVM thread
+    // compiles inline then)
+    CHECK(gov::optional_allowed_count(true, 70, 2, 80) == 2);
+    CHECK(gov::optional_allowed_count(true, 71, 2, 80) == 1);
+    CHECK(gov::optional_allowed_count(true, 72, 2, 80) == 0);
+    CHECK(gov::optional_allowed_count(true, 200, 2, 80) == 0);
+    // With the refusal cap of 78: one fewer at each load
+    CHECK(gov::optional_allowed_count(true, 69, 2, gov::optional_cap(80, 78)) == 1);
+    // Host stubs: every optional thread may start
+    CHECK(gov::optional_threads_allowed("SPU LLVM worker", 2) == 2 && gov::optional_thread_cap() == gov::thread_cap_default);
+
+    // Codec failure lines: the first 8, then every 100th
+    std::atomic<u32> count{0};
+    u32 lines = 0, last = 0;
+    for (int i = 0; i < 1000; i++)
+    {
+        u32 number = 0;
+        if (gov::media_log_due(count, number))
+        {
+            lines++;
+            last = number;
+        }
+    }
+    CHECK(lines == 8 + 10 && last == 1000 && count.load() == 1000);
+    CHECK(gov::media_log_due(1u) && gov::media_log_due(8u) && !gov::media_log_due(9u) && !gov::media_log_due(99u) && gov::media_log_due(100u) &&
+        !gov::media_log_due(101u) && gov::media_log_due(200u));
+}
+
+// 0.40 opt-in boot compile stage rule (row ppu_boot_workers): up to 4 PPU compile threads, the normal rules back at
+// any level change.
+void test_boot_workers_040()
+{
+    namespace gov = utils::ps4::governor;
+    const mb::s64 M = static_cast<mb::s64>(MiB);
+
+    gov::boot_workers_state s{};
+    s.row_on = true;
+    s.boot_stage = true;
+    s.llvm_threads = 2;
+    s.modules = 211; // The Darkness II first boot
+    s.threads = 25;
+    s.room_known = true;
+    s.room = 1232 * M;
+    CHECK(gov::boot_workers_block(s) == nullptr);
+    CHECK(gov::boot_workers_optional(s, 2) == 2); // 2 LLVM threads + 2 = 4 compile threads
+    CHECK(gov::boot_workers_optional(s, 1) == 1); // never more than the optional permits
+    CHECK(gov::boot_workers_total == 4 && gov::boot_workers_base == 2);
+
+    // Each condition alone keeps the normal workers (0 extra under this rule)
+    const auto blocked = [&](auto change)
+    {
+        gov::boot_workers_state t = s;
+        change(t);
+        return gov::boot_workers_block(t) != nullptr && gov::boot_workers_optional(t, 2) == 0;
+    };
+    CHECK(blocked([](gov::boot_workers_state& t) { t.row_on = false; }));                      // the row is off by default
+    CHECK(blocked([](gov::boot_workers_state& t) { t.boot_stage = false; }));                  // a PRX loaded while the game runs
+    CHECK(blocked([](gov::boot_workers_state& t) { t.llvm_threads = 1; }));                    // the player's or the adapt's 1 thread
+    CHECK(blocked([](gov::boot_workers_state& t) { t.modules = 2; }));
+    CHECK(blocked([](gov::boot_workers_state& t) { t.memory_level = 1; }));
+    CHECK(blocked([](gov::boot_workers_state& t) { t.thread_level = 1; }));
+    CHECK(blocked([](gov::boot_workers_state& t) { t.threads = 49; }));
+    CHECK(blocked([&](gov::boot_workers_state& t) { t.room = 1023 * M; }));
+    CHECK(blocked([](gov::boot_workers_state& t) { t.room_known = false; }));
+    CHECK(blocked([](gov::boot_workers_state& t) { t.adapt_key = true; }));
+    // The edges that still pass: 48 threads, exactly 1 GiB, 3 modules (one optional worker has work)
+    {
+        gov::boot_workers_state t = s;
+        t.threads = 48;
+        t.room = 1024 * M;
+        CHECK(gov::boot_workers_block(t) == nullptr && gov::boot_workers_optional(t, 2) == 2);
+        t.modules = 3;
+        CHECK(gov::boot_workers_optional(t, 2) == 1);
+    }
+    CHECK(std::strcmp(gov::boot_workers_block(gov::boot_workers_state{}), "ppu_boot_workers off") == 0);
+
+    // Admission in that stage: four mid-size modules (140 MiB each) fit at level 0 with 1.2 GiB of room; the normal
+    // budget admits two
+    const mb::u64 mod = 140 * MiB;
+    CHECK(gov::boot_compile_budget == 768 * MiB);
+    CHECK(gov::boot_compile_admit(1232 * M, 0, mod, 0));
+    CHECK(gov::boot_compile_admit(1232 * M, mod, mod, 0));
+    CHECK(gov::boot_compile_admit(1232 * M, 2 * mod, mod, 0));
+    CHECK(gov::boot_compile_admit(1232 * M, 3 * mod, mod, 0) == (1232 * M - static_cast<mb::s64>(4 * mod) >= static_cast<mb::s64>(mb::l2_room)));
+    CHECK(mb::compile_admit(1232 * M, mod, mod, 0) && !mb::compile_admit(1232 * M, 2 * mod, mod, 0));
+    // The in-flight budget still bounds it, and the level 2 room stays free
+    CHECK(!gov::boot_compile_admit(4000 * M, 700 * MiB, 100 * MiB, 0));
+    CHECK(!gov::boot_compile_admit(900 * M, 400 * MiB, 140 * MiB, 0)); // 900 - 540 < 384
+    // Any memory level above 0: exactly the normal rule
+    for (int level = 1; level <= 3; level++)
+    {
+        for (mb::u64 in : {0ull, 100ull, 200ull, 300ull})
+        {
+            for (mb::s64 room : {500ll, 900ll, 1500ll})
+            {
+                CHECK(gov::boot_compile_admit(room * M, in * MiB, 100 * MiB, level) == mb::compile_admit(room * M, in * MiB, 100 * MiB, level));
+            }
+        }
+    }
+    // The first compile always passes
+    CHECK(gov::boot_compile_admit(10 * M, 0, 384 * MiB, 0));
+}
 } // namespace
 
 int main()
@@ -399,6 +850,11 @@ int main()
     test_levels_v039();
     test_slots();
     test_thread_cap();
+    test_rules_040();
+    test_media_pacing_040();
+    test_serialize_reason_040();
+    test_optional_cap_040();
+    test_boot_workers_040();
     test_admission();
     test_record();
     if (g_failures)

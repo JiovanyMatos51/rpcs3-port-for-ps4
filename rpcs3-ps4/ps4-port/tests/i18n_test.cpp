@@ -21,6 +21,15 @@
 // 14 cheats (ps4_i18n_cheats.inc, area "CHT", complete in 4 languages): a problem text that takes the source line starts
 //    with "Linha {0}" / "Line {0}" / "Línea {0}" / "السطر {0}" (cheats::problem_text); group 7 checks the list hint
 //    in the footer help slot and the other texts as message lines
+// 15 launcher texts of discs without a network, the game's background and music, the XMB folders and the ISO kinds
+//    (ps4_i18n_launcher.inc, areas DOFF and FLD complete in 4 languages): group 7 measures each in the slot where the
+//    launcher shows it (row titles, two-line row subtitles, popup items and headings, the footer hint, dialog rows and
+//    buttons, message lines) with the arguments the launcher passes; disc key result lines stay within the byte limit
+//    of ps4_disc_key.hpp; the default folder name leaves room for the " (N)" of a duplicate
+// 16 the 0.40 rows of the thread, renderer, overlay and settings tables: group 7 measures each where it is shown (the
+//    settings top level and pages, their option list and warning dialog, the in-game menu's checkbox label, the XMB's
+//    emulator-error dialog); a toast fits one PS4 notification request, a renderer's fatal reason the 70 bytes the XMB
+//    keeps of it
 // Build and run from the repo root (llvm-mingw, as the other host tests):
 //   clang++ -std=c++20 -O2 -static -Wall -Wextra -I rpcs3 -I 3rdparty/stblib/stb ps4-port/tests/i18n_test.cpp -o i18n_test.exe
 //   i18n_test.exe [--release] [--verbose] [--font <ttf>]
@@ -102,7 +111,7 @@ std::string area_of(std::size_t id)
 }
 
 // Areas whose en/es/ar columns are complete; the others are counted until --release requires them
-const std::set<std::string> g_translated_areas = {"COM", "LANG", "XMB", "DLG", "SET", "POL", "GL", "cfg", "cfg-tooltips", "CHT"};
+const std::set<std::string> g_translated_areas = {"COM", "LANG", "XMB", "DLG", "SET", "POL", "GL", "cfg", "cfg-tooltips", "CHT", "DOFF", "FLD"};
 // Areas that may stay English-only (empty pt-BR, es and ar columns fall back to English), even with --release; none
 // today (the PC tooltips of the settings browser are translated)
 const std::set<std::string> g_english_only_areas = {};
@@ -449,6 +458,227 @@ std::vector<std::uint8_t> read_file(const std::string& path)
     return {std::istreambuf_iterator<char>(in), {}};
 }
 
+std::string px(float v) { return std::to_string(int(v + .5f)) + " px"; }
+
+// A text as its slot shows it: the id it is checked for and the line built with the arguments the caller passes
+struct shown_text
+{
+    str id;
+    std::string shown;
+};
+
+// Texts in their slots with the XMB font, for the language i18n::apply() selected (column 'l'); every id checked is
+// added to 'slotted'
+struct slot_check
+{
+    const utils::ps4::xmb::font& f;
+    int l;
+    std::set<str>& slotted;
+
+    void glyphs(const shown_text& x) const
+    {
+        slotted.insert(x.id);
+        ++g_checks;
+        if (const std::size_t n = f.missing_glyphs(x.shown, l == 3)) row_fail(std::size_t(x.id), l, std::to_string(n) + " glyph(s) drawn as '?'");
+    }
+    // One line of at most 'max' px at 'size' px. drawn = false: another font draws it (only its width is checked)
+    void fits(std::initializer_list<shown_text> texts, float size, float max, std::string_view what, bool drawn = true) const
+    {
+        for (const shown_text& x : texts)
+        {
+            ++g_checks;
+            if (const float w = f.measure(x.shown, size); w > max)
+                row_fail(std::size_t(x.id), l, std::string(what) + " " + px(w) + " > " + px(max) + " at " + px(size));
+            if (drawn) glyphs(x);
+            else slotted.insert(x.id);
+        }
+    }
+    // At most 'most' lines of 'room' px at 'size' px, broken as font::wrap() breaks them
+    void wraps(std::initializer_list<shown_text> texts, float size, float room, std::size_t most, std::string_view what) const
+    {
+        for (const shown_text& x : texts)
+        {
+            ++g_checks;
+            if (const std::size_t n = f.wrap(x.shown, size, room, 99, l == 3).size(); n > most)
+                row_fail(std::size_t(x.id), l, std::string(what) + ": " + std::to_string(n) + " lines of " + px(room) + " at " + px(size) + ", at most " + std::to_string(most));
+            glyphs(x);
+        }
+    }
+};
+
+// 15: ids measured by test_launcher_slots() (every id of its areas needs a slot)
+std::set<str> g_launcher_slotted;
+
+// 15: the launcher's texts in the slots where it shows them, built with the arguments it passes (a typical title, folder
+// name, key file path or count; a longer user text is fitted with "…" by the scene). Geometry of ps4_xmb.hpp and
+// ps4_xmb_dialog.hpp: the selected row's title (27 px) and help line (17 px, two lines) from x 450 to x 1240, popup
+// items (21 px, 470 px of the 490 px action room) and headings (18 px, 480 px), footer hints (18 px, 124 px), dialog rows
+// wrapped to 1040 px (21 px lines, 18 px notes), dialog buttons (20 px, 220 px) and their guide, the message line (20 px,
+// 1160 px). 'l' is the column of the language i18n::apply() selected.
+void test_launcher_slots(const utils::ps4::xmb::font& f, int l)
+{
+    using S = str;
+    const std::string title = "Demon's Souls (BLUS30443)", folder = "Jogos de corrida", key_file = "USB0:/keys/meus-discos.txt";
+    const auto t = [](S id, std::initializer_list<i18n::arg> args = {}) { return shown_text{id, i18n::trf(id, args)}; };
+    const slot_check c{f, l, g_launcher_slotted};
+
+    // The selected row: its title, and its help line in at most two lines. The music row's values fill its title; a new
+    // folder's row shows the default name, with " (2)" when that name exists.
+    c.fits({t(S::DOFF_ROW_SEM_REDE), t(S::LAU_XMED_ROW, {S::COM_LIGADO}), t(S::LAU_XMED_ROW, {S::COM_DESLIGADO}),
+               t(S::LAU_XMED_MUSICA_ROW, {S::LAU_XMED_DESLIGADA}), shown_text{S::LAU_XMED_LIGADA, i18n::trf(S::LAU_XMED_MUSICA_ROW, {S::LAU_XMED_LIGADA})},
+               shown_text{S::LAU_XMED_BAIXA, i18n::trf(S::LAU_XMED_MUSICA_ROW, {S::LAU_XMED_BAIXA})},
+               shown_text{S::LAU_XMED_DESLIGADA, i18n::trf(S::LAU_XMED_MUSICA_ROW, {S::LAU_XMED_DESLIGADA})}, t(S::FLD_VAZIA), t(S::FLD_AUSENTES_TITULO),
+               shown_text{S::FLD_NOVA_PASTA_NOME, std::string(i18n::tr(S::FLD_NOVA_PASTA_NOME)) + " (2)"}},
+        27, 790, "row title");
+    // An ISO row's subtitle names the kind of image after its serial
+    const std::string iso_row = std::string("PS4 \xC2\xB7 ") + i18n::tr(S::LAU_ISO_DE_PS3) + " \xC2\xB7 BLUS30443 \xC2\xB7 ";
+    c.wraps({t(S::DOFF_ROW_SEM_REDE_HELP), t(S::LAU_IMPORTAR_CHAVES_DKEY_HELP), t(S::LAU_XMED_ROW_HELP), t(S::LAU_XMED_MUSICA_HELP),
+                t(S::LAU_XMED_MUSICA_HELP_SEM_FUNDO), t(S::FLD_PASTA), t(S::FLD_PASTA_SUB_0), t(S::FLD_PASTA_SUB_1), t(S::FLD_PASTA_SUB_N, {12u}),
+                shown_text{S::FLD_AUSENTES_SUFIXO, i18n::trf(S::FLD_PASTA_SUB_N, {12u}) + i18n::trf(S::FLD_AUSENTES_SUFIXO, {3u})}, t(S::FLD_VAZIA_HELP),
+                t(S::FLD_AUSENTES_HELP), shown_text{S::LAU_ISO_JOGO_PSN, iso_row + i18n::tr(S::LAU_ISO_JOGO_PSN)},
+                shown_text{S::LAU_ISO_JOGO_PS2, iso_row + i18n::tr(S::LAU_ISO_JOGO_PS2)}, shown_text{S::LAU_ISO_JOGO_PSP, iso_row + i18n::tr(S::LAU_ISO_JOGO_PSP)}},
+        17, 790, 2, "row subtitle");
+    // Triangle's options in the Jogo column (an action list), the popups' headings, Triangle's footer hint there
+    c.fits({t(S::FLD_ABRIR), t(S::FLD_CRIAR), t(S::FLD_RENOMEAR), t(S::FLD_ADICIONAR), t(S::FLD_POSICAO), t(S::FLD_APAGAR), t(S::FLD_ESQUECER, {12u}),
+               t(S::FLD_MOVER), t(S::FLD_TIRAR), t(S::FLD_NOVA_PASTA_ITEM), t(S::LAU_ATUALIZAR_BIBLIOTECA)},
+        21, 470, "popup item");
+    c.fits({t(S::FLD_OPCOES), t(S::FLD_MOVER_TITULO, {title}), t(S::FLD_ADICIONAR_TITULO, {folder})}, 18, 480, "popup heading");
+    c.fits({t(S::FLD_OPCOES)}, 18, 124, "footer hint");
+    // Dialogs: the offline install question, the wrong clock, the lock screen (its reason lines become one note) and its
+    // offline grace, the folder questions
+    c.wraps({t(S::DOFF_Q_SEM_INTERNET), t(S::DOFF_Q_TESTADOS, {3u}), t(S::DKEY_RELOGIO_ERRADO), t(S::FLD_APAGAR_PERGUNTA, {folder}),
+                t(S::FLD_ESQUECER_PERGUNTA, {3u})},
+        21, 1040, 2, "dialog line");
+    c.wraps({t(S::DOFF_Q_NOTA_INTERNET_UMA_VEZ), t(S::DOFF_Q_NOTA_PENDRIVE), t(S::DOFF_Q_NOTA_SEM_CHAVE), t(S::DKEY_CHAVE_ENCONTRADA_EM, {key_file}),
+                t(S::DOFF_LOCK_CONECTE_REDE), t(S::DOFF_LOCK_GRACE, {2u, 7u}), t(S::DOFF_LOCK_GRACE_FIM, {7u}), t(S::FLD_APAGAR_NOTA), t(S::FLD_ESQUECER_NOTA),
+                shown_text{S::DOFF_LOCK_SEM_REDE, std::string(i18n::tr(S::DOFF_LOCK_SEM_REDE)) + " " + i18n::tr(S::DOFF_LOCK_CONECTE_REDE)}},
+        18, 1040, 2, "dialog note");
+    c.fits({t(S::DKEY_PROCURAR_DE_NOVO)}, 20, 220, "button label");
+    {
+        // The install question's guide (X, Triangle, Circle), as draw_dialog lays it out: glyph 26 px, 8 px to the label,
+        // 46 px between two buttons (no single label has a slot of its own there)
+        float total = 2 * 46;
+        for (const S id : {S::LAU_DISC_Q_INSTALAR_SEM_CHAVE, S::DKEY_PROCURAR_DE_NOVO, S::COM_VOLTAR}) total += 26 + 8 + f.measure(i18n::tr(id), 20);
+        ++g_checks;
+        if (total > 1180) row_fail(std::size_t(S::DKEY_PROCURAR_DE_NOVO), l, "the install question's button guide is " + px(total) + " > 1180 px");
+    }
+    // The message line
+    c.fits({t(S::LAU_ISOKEY_SEM_INTERNET_LOCAL), t(S::LAU_XMED_LIGADO_MSG), t(S::LAU_XMED_DESLIGADO_MSG), t(S::LAU_ISO_JOGO_PSN), t(S::LAU_ISO_JOGO_PS2),
+               t(S::LAU_ISO_JOGO_PSP), t(S::DKEY_RELOGIO_ERRADO), t(S::DKEY_CHAVE_GUARDADA_PRENSAGEM), t(S::DKEY_CHAVE_ENCONTRADA_EM, {key_file}),
+               t(S::DKEY_SEM_INTERNET_TESTADOS, {12u}), t(S::FLD_ADICIONAR_DICA), t(S::FLD_POSICAO_DICA), t(S::FLD_DICA_PASTA), t(S::FLD_VAZIA_HELP),
+               t(S::FLD_CRIADA, {folder}), t(S::FLD_RENOMEADA, {folder}), t(S::FLD_APAGADA, {folder, 3u}), t(S::FLD_MOVIDO, {title, folder}),
+               t(S::FLD_TIRADO, {title}), t(S::FLD_MEMBROS, {folder, 3u}), t(S::FLD_NOME_VAZIO), t(S::FLD_NOME_CARACTERES),
+               t(S::FLD_SEM_TECLADO, {S::FLD_NOVA_PASTA_NOME}), t(S::FLD_LIMITE, {200u}), t(S::FLD_SALVAR_FALHOU), t(S::FLD_SO_LEITURA),
+               t(S::FLD_ARQUIVO_DANIFICADO)},
+        20, 1160, "message line");
+}
+
+// 16: the 0.40 rows of the thread, renderer, overlay and settings tables (and the disk cache reason those changes
+// rewrote); test_slots_040() must give each a slot
+constexpr str g_texts_040[] = {str::TOAST_SAVESTATE_SEM_THREAD, str::TOAST_SAVESTATE_STOP_SEM_THREAD, str::VRAM_OPENGL_SEM_MEMORIA_USE_VULKAN,
+    str::TOAST_ESCALA_PROXIMO_INICIO_MSAA, str::OVL_SEM_BUFFER_SUFIXO, str::CFGR_AUDIO_NULL_PS4, str::CFGR_VSYNC_FIFO_PS4, str::CFGR_AUDIO_MONO_PS4,
+    str::CFGR_LIMIT_RESOLUTION_SCALE, str::CFGR_VALUE_CACHE, str::CFGU_VALOR_SALVO_SEM_EFEITO, str::CFGH_AVISO_SEM_BUFFER, str::CFGH_AVISO_OPENGL_ZINK,
+    str::CFGH_NOTA_FRAME_SKIP, str::CFGH_NOTA_POR_EXECUTAVEL, str::SET_NOVIDADES_JOGO, str::SET_NOVIDADES_NENHUMA, str::SET_NOVIDADES_AUDIO_039,
+    str::SET_NOVIDADES_HELP, str::SET_NOVIDADES_CHANGED, str::SET_USAR_VALORES_SALVOS, str::SET_USAR_VALORES_SALVOS_HELP,
+    str::SET_USAR_VALORES_SALVOS_DONE, str::SET_USAR_VALOR_SALVO, str::SET_COMANDOS_GPU_DIVIDIDOS, str::POL_COMANDOS_GPU_DIVIDIDOS,
+    str::POL_AJUSTES_ARQUIVO_SEM_EFEITO};
+std::set<str> g_slotted_040;
+
+// 16: those rows where they are shown, built as their callers build them. Geometry of ps4_xmb.hpp: the settings top
+// level is an XMB list (the selected row's title 27 px in 790 px, its help 17 px in two lines of 790 px, the message
+// line 20 px in 1160 px); a settings page shows the selected line's help in two 17 px lines of 940 px (page_left to
+// page_right), the message in two 20 px lines of 1160 px and the Triangle options at 21 px in 490 px; the warning dialog
+// and the emulator-error dialog wrap their notes to 1040 px at 18 px. The in-game menu's checkbox label is drawn by the
+// overlay font at 16 pt (22 px) in 802 px (940 px of tab content less two 30 px margins and 78 px for the switch,
+// overlay_home_menu_components.h), in English for Arabic like every overlay text.
+void test_slots_040(const utils::ps4::xmb::font& f, int l)
+{
+    using S = str;
+    namespace cat = utils::ps4::cfg_catalog;
+    const slot_check c{f, l, g_slotted_040};
+    const auto t = [](S id, std::initializer_list<i18n::arg> args = {}) { return shown_text{id, i18n::trf(id, args)}; };
+    const auto tr = [](S id) { return std::string(i18n::tr(id)); };
+    const auto item = [](std::string_view key)
+    {
+        const cat::item* it = cat::find(key);
+        CHECK(it != nullptr);
+        return it;
+    };
+    const auto label = [&](std::string_view key) { const cat::item* it = item(key); return it ? tr(it->label) : std::string(key); };
+    const auto help = [&](std::string_view key) { const cat::item* it = item(key); return it ? tr(it->help) : std::string(); };
+    const std::string dot = " \xC2\xB7 ", unavailable = tr(S::COM_INDISPONIVEL_PS4), unused = dot + tr(S::CFGU_VALOR_SALVO_SEM_EFEITO);
+
+    // Top level: 'Novidades neste jogo: <value>' (ps4_settings.hpp game_features_title), 'Usar meus valores salvos (N)'
+    // with the labels it lists (three and a count), its help again with the confirm hint while it waits for the second X
+    // (it is also the message then), the adaptation row after a device loss (safe-mode level, shaders without the
+    // interpreter, split command buffers, boots left, its action)
+    const std::string none = tr(S::SET_NOVIDADES_NENHUMA), audio = tr(S::SET_NOVIDADES_AUDIO_039);
+    const auto features = [](S id, const std::string& value) { return shown_text{id, i18n::trf(S::CFGU_CHANGED, {S::SET_NOVIDADES_JOGO, i18n::raw(value)})}; };
+    const std::string saved = label("Video > Frame limit") + ", " + label("Video > Resolution Scale") + ", " + label("Video > Renderer") + " (+2)";
+    const std::string saved_help = i18n::trf(S::SET_USAR_VALORES_SALVOS_HELP, {i18n::raw(saved)}), confirm = dot + tr(S::CFGU_CONFIRM_AGAIN);
+    const std::string adapt = i18n::trf(S::SET_MODO_SEGURO_NIVEL_MOTIVO, {1u, S::POL_FAIL_GPU}) + ", " + tr(S::SET_GPU_TRAVOU_SHADERS) + ", " +
+        tr(S::SET_COMANDOS_GPU_DIVIDIDOS) + i18n::trf(S::SET_VALE_PROXIMOS_BOOT, {8u}) + tr(S::SET_REMOVE);
+    c.fits({features(S::SET_NOVIDADES_JOGO, none), features(S::SET_NOVIDADES_NENHUMA, none), features(S::SET_NOVIDADES_AUDIO_039, audio),
+               t(S::SET_USAR_VALORES_SALVOS, {12u})},
+        27, 790, "row title");
+    c.wraps({t(S::SET_NOVIDADES_HELP), shown_text{S::SET_USAR_VALORES_SALVOS_HELP, saved_help}, shown_text{S::SET_USAR_VALORES_SALVOS_HELP, saved_help + confirm},
+                shown_text{S::SET_COMANDOS_GPU_DIVIDIDOS, adapt}},
+        17, 790, 2, "row subtitle");
+    c.fits({t(S::SET_NOVIDADES_CHANGED, {"BLUS30443", i18n::raw(audio)}), t(S::SET_NOVIDADES_CHANGED, {"BLUS30443", i18n::raw(none)}),
+               t(S::SET_USAR_VALORES_SALVOS_DONE, {5u})},
+        20, 1160, "message line");
+    // While the row waits for the second X its help is also the message line (select_use_saved), which cuts a wider Latin
+    // line at the screen edge; the row's help above shows it whole, so this is listed (--verbose), not failed
+    if (const float w = f.measure(saved_help + confirm, 20); w > 1160)
+        row_warn(std::size_t(S::SET_USAR_VALORES_SALVOS_HELP), l, "message line while it waits for the second X: " + px(w) + " > 1160 px at 20 px");
+
+    // A settings page's help line: a row's reason after COM_INDISPONIVEL_PS4 (Audio Renderer with a saved Null ends with
+    // the unused-value note), the reason of a greyed or warned value while the list of values is open, a row's help with
+    // its note (ps4_cfg_browser.hpp help_of, choices_of)
+    c.wraps({shown_text{S::CFGR_AUDIO_NULL_PS4, unavailable + tr(S::CFGR_AUDIO_NULL_PS4) + unused},
+                shown_text{S::CFGR_VSYNC_FIFO_PS4, unavailable + tr(S::CFGR_VSYNC_FIFO_PS4)}, t(S::CFGR_AUDIO_MONO_PS4),
+                t(S::CFGR_LIMIT_RESOLUTION_SCALE, {200u}), t(S::CFGH_AVISO_SEM_BUFFER), t(S::CFGH_AVISO_OPENGL_ZINK),
+                shown_text{S::CFGH_NOTA_FRAME_SKIP, help("Video > Enable Frame Skip") + dot + tr(S::CFGH_NOTA_FRAME_SKIP)},
+                shown_text{S::CFGH_NOTA_POR_EXECUTAVEL, help("Audio > Audio Provider") + dot + tr(S::CFGH_NOTA_POR_EXECUTAVEL)},
+                shown_text{S::CFGH_NOTA_POR_EXECUTAVEL, help("Audio > RSXAudio Avport") + dot + tr(S::CFGH_NOTA_POR_EXECUTAVEL)}},
+        17, 940, 2, "settings help");
+    // Every unavailable or hidden row whose files hold a value it cannot use: the note (with Square's action) ends its help
+    for (const cat::item& it : cat::items())
+    {
+        if ((it.kind != cat::klass::unavailable && it.kind != cat::klass::hidden) || (it.flags & cat::flag::no_default)) continue;
+        const std::string row = it.kind == cat::klass::unavailable ? unavailable + (it.reason != S::count_ ? tr(it.reason) : std::string())
+                                                                   : i18n::trf(S::CFGU_HIDDEN_ROW, {it.reason});
+        c.wraps({shown_text{S::CFGU_VALOR_SALVO_SEM_EFEITO, row + unused}}, 17, 940, 2, "settings help of '" + std::string(it.key) + "' with an unused saved value");
+    }
+    // The page's message after a refused value (do_pick, admit_number) or X on the locked VSync row; the warning dialog's
+    // note of a warned value; the Triangle option that takes the saved value back
+    const cat::value_label* mono = cat::find_value("Audio > Audio Channel Layout", "Mono");
+    CHECK(mono != nullptr);
+    const std::string mono_text = !mono ? std::string("Mono") : mono->label != S::count_ ? tr(mono->label) : std::string(mono->text);
+    c.wraps({shown_text{S::CFGR_AUDIO_MONO_PS4, i18n::trf(S::CFGU_VALUE_REFUSED, {i18n::raw(mono_text), i18n::raw(tr(S::CFGR_AUDIO_MONO_PS4))})},
+                shown_text{S::CFGR_VALUE_CACHE, i18n::trf(S::CFGU_VALUE_REFUSED, {"20480", S::CFGR_VALUE_CACHE})},
+                shown_text{S::CFGR_VSYNC_FIFO_PS4, unavailable + tr(S::CFGR_VSYNC_FIFO_PS4)}},
+        20, 1160, 2, "settings message");
+    c.wraps({t(S::CFGH_AVISO_SEM_BUFFER), t(S::CFGH_AVISO_OPENGL_ZINK)}, 18, 1040, 2, "warning dialog note");
+    c.fits({t(S::SET_USAR_VALOR_SALVO, {i18n::raw("OpenGL")}), t(S::SET_USAR_VALOR_SALVO, {i18n::raw("150 %")})}, 21, 490, "settings option");
+
+    // The renderer's fatal reason as a note of the emulator-error dialog (its byte limit: test_limits_040())
+    c.wraps({t(S::VRAM_OPENGL_SEM_MEMORIA_USE_VULKAN)}, 18, 1040, 2, "emulator-error dialog note");
+    // The in-game menu's buffering row (overlay_home_menu_settings.cpp): the upstream label and the suffix
+    const std::string buffering = std::string("Enable Buffering ") + i18n::tr(S::OVL_SEM_BUFFER_SUFIXO, l == 3 ? lang::en : i18n::current());
+    c.fits({shown_text{S::OVL_SEM_BUFFER_SUFIXO, buffering}}, 22, 802, "in-game menu checkbox label", false);
+    // Toasts are drawn by the PS4 system font, in no slot of the XMB (their byte limit: test_limits_040()); one wider than
+    // a message line is listed (--verbose), as group 7 lists the policy toasts
+    const std::string adapt_toast = i18n::trf(S::POL_ADAPT_TOAST, {"BLUS30443",
+        i18n::raw(tr(S::POL_SHADERS_SEM_INTERPRETADOR) + tr(S::POL_LIST_SEPARATOR) + tr(S::POL_COMANDOS_GPU_DIVIDIDOS))});
+    for (const shown_text& x : {t(S::TOAST_SAVESTATE_SEM_THREAD), t(S::TOAST_SAVESTATE_STOP_SEM_THREAD), t(S::TOAST_ESCALA_PROXIMO_INICIO_MSAA),
+             t(S::POL_AJUSTES_ARQUIVO_SEM_EFEITO, {12u}), shown_text{S::POL_COMANDOS_GPU_DIVIDIDOS, adapt_toast}})
+    {
+        g_slotted_040.insert(x.id);
+        if (const float w = f.measure(x.shown, 20); w > 1160) row_warn(std::size_t(x.id), l, "toast wider than a message line (" + px(w) + " at 20 px)");
+    }
+}
+
 // 7: widths in every language with the XMB font: fixed slots fail, long free lines are warnings (fit() cuts them)
 void test_widths(const std::string& latin_path)
 {
@@ -483,7 +713,10 @@ void test_widths(const std::string& latin_path)
              S::SET_CENA_VISTA_PRIMEIRA_VEZ_SEGURA, S::SET_AUDIO_CONTINUO_HELP, S::GL_HELP_GLOBAL, S::LANG_ROW_HELP, S::SET_KEEP_USER_SETTINGS_FLAG_PRESENTE,
              S::SET_CADA_JOGO_INICIA_AJUSTES_RECOMENDADOS, S::SET_JOGOS_USAM_VALORES_SALVOS_LIGA, S::SET_MARCADOR_ANTIGO_SEM_EFEITO_VALORES,
              S::SET_LLVM_VULKAN_720P_SHADERS_ASSINCRONOS, S::SET_VALORES_AUTOMATICOS_PS4_OPCOES_DESTE, S::SET_ABRIR, S::GL_TITLE_GLOBAL, S::GL_TITLE_GAME,
-             S::SET_AUDIO_CONTINUO_AUTOMATICO, S::SET_AUDIO_CONTINUO_DESLIGADO, S::LANG_ROW_TITLE},
+             S::SET_AUDIO_CONTINUO_AUTOMATICO, S::SET_AUDIO_CONTINUO_DESLIGADO, S::LANG_ROW_TITLE,
+             // 0.40: the safe-mode rows (global switch, per-game level) and the PS4 language value
+             S::SET_MODO_SEGURO_LIGADO, S::SET_MODO_SEGURO_DESLIGADO, S::SET_MODO_SEGURO_HELP, S::SET_MODO_SEGURO_JOGO, S::SET_MODO_SEGURO_JOGO_HELP,
+             S::SET_MODO_SEGURO_JOGO_AUTO_HELP, S::SET_MODO_SEGURO_JOGO_USER_HELP, S::SET_MODO_SEGURO_JOGO_EXHAUSTED_HELP, S::GL_PS4_FMT},
             // the row text starts at x 450 and the font stops drawing once a glyph starts past x 1256
             17, 800, "row subtitle"},
         // 13: the settings browser page (footer, the save question's buttons)
@@ -579,8 +812,26 @@ void test_widths(const std::string& latin_path)
                 const std::string shown = f.visual(sample(id), l == 3);
                 for (const char32_t c : arabic::decode(shown)) CHECK(c != U'?' || std::string_view(i18n::tr(id, lang::pt_br)).find('?') != std::string_view::npos);
             }
+        test_launcher_slots(f, l);
+        test_slots_040(f, l);
     }
     i18n::apply(setting::automatic, -1);
+    // 16: every one of those rows has its slot
+    for (const str id : g_texts_040)
+    {
+        ++g_checks;
+        if (!g_slotted_040.contains(id)) row_fail(std::size_t(id), -1, "no width slot in test_slots_040()");
+    }
+    // 15: every text of the launcher areas above has its slot (the folder keyboard's title is the system keyboard's,
+    // checked by test_launcher_limits())
+    for (std::size_t id = 0; id < i18n::id_count; ++id)
+    {
+        const std::string_view name = i18n::detail::names[id];
+        const std::string area = area_of(id);
+        if (area != "DOFF" && area != "FLD" && !name.starts_with("LAU_XMED_") && !name.starts_with("LAU_ISO_JOGO_")) continue;
+        ++g_checks;
+        if (!g_launcher_slotted.contains(str(id)) && str(id) != str::FLD_TECLADO_NOME) row_fail(id, -1, "no width slot in test_launcher_slots()");
+    }
     std::printf("i18n: widths checked with %s + DejaVu Sans Arabic; %d long message line(s) end with an ellipsis, %d long settings text(s)%s\n",
         latin_path.empty() ? "DejaVu Sans" : latin_path.c_str(), long_lines, cfg_long, g_verbose ? "" : " (--verbose lists them)");
 }
@@ -847,6 +1098,27 @@ void test_format()
     CHECK(i18n::trf(lang::pt_br, str::POL_ADAPT_TOAST, {"BLUS30443", str::POL_COMPILACAO_1_THREAD}) ==
         "RPCS3: ajuste automatico para BLUS30443 apos falha anterior: compilacao com 1 thread");
     CHECK(i18n::trf(lang::pt_br, str::COM_SIM, {}) == "Sim");
+    // 0.40: the safe-mode toasts and rows, the Modo online toast without an RPCN account, the PS4 language value
+    CHECK(i18n::trf(lang::pt_br, str::POL_SAFE_MODE_TOAST, {"BLUS30443", str::POL_FAIL_THREADS, 2u}) ==
+        "RPCS3: BLUS30443 falhou da \xC3\xBAltima vez (falta de threads): abrindo no modo seguro, n\xC3\xADvel 2 de 3");
+    CHECK(i18n::trf(lang::en, str::POL_SAFE_MODE_TOAST, {"BLUS30443", str::POL_FAIL_GPU, 1u}) ==
+        "RPCS3: BLUS30443 failed last time (the GPU hung): starting in safe mode, level 1 of 3");
+    CHECK(i18n::trf(lang::es, str::POL_SAFE_MODE_USER_TOAST, {"BLUS30443", 3u}) == "RPCS3: BLUS30443 se inicia en modo seguro, nivel 3 de 3 (elegido por ti)");
+    {
+        const std::string ar = i18n::trf(lang::ar, str::POL_SAFE_MODE_TOAST, {"BLUS30443", str::POL_FAIL_CRASH, 2u});
+        CHECK(ar.find(lrm + "BLUS30443" + lrm) != std::string::npos && ar.find(lrm + "2" + lrm) != std::string::npos);
+        CHECK(ar.find(i18n::tr(str::POL_FAIL_CRASH, lang::ar)) != std::string::npos);
+    }
+    CHECK(i18n::trf(lang::pt_br, str::POL_SAFE_MODE_EXHAUSTED, {"BCUS98232"}) ==
+        "RPCS3: BCUS98232 falhou tamb\xC3\xA9m no modo seguro n\xC3\xADvel 3: envie startup.log e RPCS3.log");
+    CHECK(i18n::trf(lang::pt_br, str::POL_ONLINE_SEM_CONTA, {"BLUS31426"}) ==
+        "RPCS3: Modo online sem conta RPCN: BLUS31426 abre offline \xC2\xB7 PlayStation Network > Entrar");
+    CHECK(i18n::trf(lang::pt_br, str::SET_MODO_SEGURO_JOGO, {raw(i18n::trf(lang::pt_br, str::SET_MODO_SEGURO_NIVEL, {2u}))}) == "Modo seguro deste jogo: N\xC3\xADvel 2");
+    CHECK(i18n::trf(lang::en, str::SET_MODO_SEGURO_JOGO_AUTO_HELP, {str::POL_FAIL_STALL, 8u}) ==
+        "After a failure (stopped making progress) \xC2\xB7 for the next 8 boot(s) \xC2\xB7 X changes it");
+    CHECK(i18n::trf(lang::pt_br, str::SET_MODO_SEGURO_NIVEL_MOTIVO, {1u, str::POL_FAIL_USER}) == "Modo seguro: n\xC3\xADvel 1 (pedido por voc\xC3\xAA)");
+    CHECK(i18n::trf(lang::pt_br, str::GL_PS4_FMT, {str::GL_NAME_17}) == "Idioma do PS4 (Portugu\xC3\xAAs (Brasil))");
+    CHECK(i18n::trf(lang::en, str::GL_PS4_FMT, {str::GL_NAME_17}) == "PS4 language (Portuguese (Brazil))");
     // the current language is used by the short forms
     i18n::apply(setting::en, -1);
     CHECK(i18n::trf(str::SET_CONTROLES_CONECTADOS_4, {2}) == "Connected controllers: 2 of 4");
@@ -965,6 +1237,77 @@ void test_notice()
     CHECK(notice::describe(notice::encode(kind::boot_next, "Folklore")) == "[boot_next] Folklore");
     CHECK(notice::describe("plain") == "plain");
 }
+
+// 15: limits that need no font. ps4_disc_key.hpp clips a result line to line_limit() (110 bytes, 220 in Arabic): every
+// DKEY_ text with a title ID in each placeholder stays within it. A folder name holds 32 code points and a duplicate
+// gets " (N)": the default name leaves room for it. The folder keyboard's title fits the IME's 127 UTF-16 units.
+void test_launcher_limits()
+{
+    static constexpr lang langs[] = {lang::pt_br, lang::en, lang::es, lang::ar};
+    int result_lines = 0;
+    for (std::size_t id = 0; id < i18n::id_count; ++id)
+    {
+        if (!std::string_view(i18n::detail::names[id]).starts_with("DKEY_")) continue;
+        ++result_lines;
+        for (int l = 0; l < 4; ++l)
+        {
+            const std::string line = i18n::trf(langs[l], str(id), {"BLUS30443", "BLUS30443", "BLUS30443"});
+            const std::size_t limit = l == 3 ? 220 : 110;
+            ++g_checks;
+            if (line.size() > limit) row_fail(id, l, "disc key result line of " + std::to_string(line.size()) + " bytes > line_limit() " + std::to_string(limit));
+        }
+    }
+    CHECK(result_lines >= 30);
+    for (int l = 0; l < 4; ++l)
+    {
+        const std::string_view name = i18n::tr(str::FLD_NOVA_PASTA_NOME, langs[l]);
+        const auto points = decode_strict(name);
+        ++g_checks;
+        if (!points || points->size() + 4 > 32 || leading_spaces(name) || trailing_spaces(name))
+            row_fail(std::size_t(str::FLD_NOVA_PASTA_NOME), l, "default folder name: at most 28 code points, no edge spaces");
+        const auto keyboard = decode_strict(i18n::tr(str::FLD_TECLADO_NOME, langs[l]));
+        std::size_t units = 0;
+        if (keyboard)
+            for (const char32_t c : *keyboard) units += c >= 0x10000 ? 2 : 1;
+        ++g_checks;
+        if (!keyboard || units > 127) row_fail(std::size_t(str::FLD_TECLADO_NOME), l, "keyboard title above 127 UTF-16 units");
+    }
+}
+
+// 16: limits that need no font. A toast is one PS4 notification request, whose message holds 1023 bytes (ps4_fatal.cpp
+// notify(), OrbisNotificationRequest::message[1024]; a longer text is cut). A renderer's fatal reason reaches the XMB's
+// emulator-error dialog as the first 70 bytes of its first line (ps4_main.cpp, the notice of a thread fatal): a longer
+// reason loses its end, which says what to do.
+void test_limits_040()
+{
+    static constexpr lang langs[] = {lang::pt_br, lang::en, lang::es, lang::ar};
+    for (int l = 0; l < 4; ++l)
+    {
+        const lang g = langs[l];
+        const std::string parts = std::string(i18n::tr(str::POL_SHADERS_SEM_INTERPRETADOR, g)) + i18n::tr(str::POL_LIST_SEPARATOR, g) +
+            i18n::tr(str::POL_COMANDOS_GPU_DIVIDIDOS, g);
+        const std::pair<str, std::string> toasts[] = {{str::TOAST_SAVESTATE_SEM_THREAD, i18n::tr(str::TOAST_SAVESTATE_SEM_THREAD, g)},
+            {str::TOAST_SAVESTATE_STOP_SEM_THREAD, i18n::tr(str::TOAST_SAVESTATE_STOP_SEM_THREAD, g)},
+            {str::TOAST_ESCALA_PROXIMO_INICIO_MSAA, i18n::tr(str::TOAST_ESCALA_PROXIMO_INICIO_MSAA, g)},
+            {str::POL_AJUSTES_ARQUIVO_SEM_EFEITO, i18n::trf(g, str::POL_AJUSTES_ARQUIVO_SEM_EFEITO, {12u})},
+            {str::POL_COMANDOS_GPU_DIVIDIDOS, i18n::trf(g, str::POL_ADAPT_TOAST, {"BLUS30443", i18n::raw(parts)})}};
+        for (const auto& [id, text] : toasts)
+        {
+            ++g_checks;
+            if (text.size() > 1023) row_fail(std::size_t(id), l, "toast of " + std::to_string(text.size()) + " bytes > the 1023 of a PS4 notification");
+        }
+        const std::string_view reason = i18n::tr(str::VRAM_OPENGL_SEM_MEMORIA_USE_VULKAN, g);
+        ++g_checks;
+        if (reason.size() > 70)
+        {
+            // what the dialog shows: the cut of ps4_fatal_detail::utf8_prefix (UTF-8 boundary, then "...")
+            std::size_t cut = 70;
+            while (cut && (static_cast<unsigned char>(reason[cut]) & 0xc0) == 0x80) --cut;
+            row_fail(std::size_t(str::VRAM_OPENGL_SEM_MEMORIA_USE_VULKAN), l, "fatal reason of " + std::to_string(reason.size()) +
+                " bytes > 70: the emulator-error dialog shows '" + std::string(reason.substr(0, cut)) + "...'");
+        }
+    }
+}
 } // namespace
 
 // 14: problem texts that take the source line keep it first in every language
@@ -1011,6 +1354,8 @@ int main(int argc, char** argv)
     test_notice();
     test_cfg_texts();
     test_cheat_texts();
+    test_launcher_limits();
+    test_limits_040();
     std::printf("i18n_test: %d checks, %d failures, %d warnings%s\n", g_checks, g_failures, g_warnings, g_verbose ? "" : " (--verbose lists them)");
     return g_failures ? 1 : 0;
 }

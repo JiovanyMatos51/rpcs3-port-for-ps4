@@ -1,4 +1,4 @@
-# Building RPCS3 PORT FOR PS4 0.39
+# Building RPCS3 PORT FOR PS4 0.40
 
 The build runs on a **Windows x64** host. It cross-compiles RPCS3 and its libraries for the PS4 with
 the OpenOrbis PS4 Toolchain and llvm-mingw's Clang/LLD, links the native ELF, and turns it into a

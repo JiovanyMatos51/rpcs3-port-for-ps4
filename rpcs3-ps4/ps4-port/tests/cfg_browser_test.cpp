@@ -12,6 +12,10 @@
 //  5 resets: Square = the automatic value, RPCS3 default, the global value, System Name / PSID never reset
 //  6 dependencies: OpenGL and Shader Mode / ZCULL / gl-async.flag, the FSR row, the 3D rows, the per-game-only rows
 //  plus: pages and captions, the warn confirmations, pins_to_save, the home-menu snapshot, the self-check
+//  0.40: Audio Renderer Null as a console limit in every mode (the saved value without effect, Square removes it), the
+//  Resolution Scale range and cap, VSync locked on Vulkan, Enable Buffering off and OpenGL warned, Mono greyed, the
+//  OpenGL shader mode the renderer runs, the help notes, the disk cache bound from the free space, Options > Use my
+//  saved value, and the global layer's own values (legacy_choices) on the real tree
 // Build and run from the repo root (llvm-mingw, as the other host tests):
 //   clang++ -std=c++20 -O1 -static -Wall -Wextra -I ps4-port/tests/cfg-mocks -I ps4-port/tests/policy-mocks -I rpcs3 ps4-port/tests/cfg_browser_test.cpp -o cfg_browser_test.exe
 //   cfg_browser_test.exe [--verbose]
@@ -292,7 +296,7 @@ void test_classes()
     // the runtime section: /host_root/ and the cache switch unavailable, the rest value-limited or redirected
     CHECK(cat::find("VFS > Enable /host_root/")->kind == cat::klass::unavailable);
     CHECK(cat::find("VFS > Limit disk cache size")->kind == cat::klass::unavailable);
-    CHECK(cat::find("VFS > Disk cache maximum size (MB)")->values == "1024..4096");
+    CHECK(cat::find("VFS > Disk cache maximum size (MB)")->values == "1024..10240");
     CHECK(cat::find("Video > Vulkan > VRAM allocation limit (MB)")->values == "256..768");
     CHECK(cat::find("Core > Max LLVM Compile Threads")->values == "1..2");
     CHECK(cat::find("Video > Shader Compiler Threads")->values == "1..2");
@@ -513,17 +517,17 @@ bool sparse_yaml_round_trip_quotes()
 void test_badges()
 {
     reset_files();
-    // the automatic profile (global scope): a saved 34 ms reserve runs as 64
+    // the automatic profile (global scope): a saved 64 ms reserve runs as 34 (0.40: the upstream reserve again)
     {
         fixture f;
-        f.open({}, "Audio:\n  Desired Audio Buffer Duration: 34\n");
-        CHECK(f.value("Audio > Desired Audio Buffer Duration") == "64");
+        f.open({}, "Audio:\n  Desired Audio Buffer Duration: 64\n");
+        CHECK(f.value("Audio > Desired Audio Buffer Duration") == "34");
         const cb::row& r = f.get("Audio > Desired Audio Buffer Duration");
         CHECK(r.mark == cb::badge::automatic && r.badge_text == T(str::CFGU_BADGE_AUTO));
-        CHECK(contains(r.help, "64 ms") && contains(r.help, "34 ms"));
+        CHECK(contains(r.help, "34 ms") && contains(r.help, "64 ms"));
         // Left/Right changes and keeps the player's value (a pin at save)
         f.m.step(f.row("Audio > Desired Audio Buffer Duration"), 1);
-        CHECK(f.value("Audio > Desired Audio Buffer Duration") == "66");
+        CHECK(f.value("Audio > Desired Audio Buffer Duration") == "36");
         CHECK(f.get("Audio > Desired Audio Buffer Duration").mark == cb::badge::mine);
         const auto pins = f.m.pins_to_save();
         CHECK(std::find(pins.begin(), pins.end(), "Audio > Desired Audio Buffer Duration") != pins.end());
@@ -674,7 +678,7 @@ void test_resets()
     // a format-1 per-game file converted: the values that differ from the automatic configuration become pins
     {
         fixture f;
-        f.open(minecraft, {}, "Video:\n  Write Color Buffers: true\n  Strict Rendering Mode: false\nAudio:\n  Master Volume: 90\n  Desired Audio Buffer Duration: 34\n");
+        f.open(minecraft, {}, "Video:\n  Write Color Buffers: true\n  Strict Rendering Mode: false\nAudio:\n  Master Volume: 90\n  Desired Audio Buffer Duration: 64\n");
         const auto differ = f.m.differing_from_automatic();
         const auto has = [&](std::string_view key) { return std::find(differ.begin(), differ.end(), key) != differ.end(); };
         CHECK(has("Video > Write Color Buffers") && has("Audio > Master Volume") && has("Audio > Desired Audio Buffer Duration"));
@@ -683,7 +687,7 @@ void test_resets()
         f.m.pin_keys({"Video > Write Color Buffers", "Audio > Master Volume"});
         CHECK(f.value("Video > Write Color Buffers") == "true");
         CHECK(f.value("Audio > Master Volume") == "90");
-        CHECK(f.value("Audio > Desired Audio Buffer Duration") == "64");
+        CHECK(f.value("Audio > Desired Audio Buffer Duration") == "34");
         const auto pins = f.m.pins_to_save();
         CHECK(pins.size() == 2);
         // Voltar para automático: the pins go, the profile applies again
@@ -703,12 +707,20 @@ void test_dependencies()
     reset_files();
     fixture f;
     f.open(minecraft);
-    // OpenGL: Shader Mode legacy without gl-async.flag, the relaxed ZCULL pair
-    f.m.pick(f.row("Video > Renderer"), 1); // Null, OpenGL, Vulkan
+    // OpenGL: Shader Mode legacy without gl-async.flag; 0.40: the strict ZCULL pair (the relaxed one is opt-in), and
+    // OpenGL is a warned value (Zink: slower, no video memory budget)
+    {
+        const std::string asked = f.m.pick(f.row("Video > Renderer"), 1); // Null, OpenGL, Vulkan
+        CHECK(f.m.confirmation() && contains(asked, T(str::CFGH_AVISO_OPENGL_ZINK)) && f.value("Video > Renderer") == "Vulkan");
+        f.m.cancel_confirmation();
+        for (const cb::choice& c : f.m.choices(f.row("Video > Renderer")))
+            if (c.spelling == "OpenGL") CHECK(c.allowed && c.warn && c.reason == T(str::CFGH_AVISO_OPENGL_ZINK));
+    }
+    f.confirmed("Video > Renderer", [&](std::size_t i) { return f.m.pick(i, 1); });
     CHECK(f.value("Video > Renderer") == "OpenGL");
     CHECK(f.value("Video > Shader Mode") == "Legacy Recompiler (single-threaded)");
-    CHECK(f.value("Video > Relaxed ZCULL Sync") == "true" && f.value("Video > Accurate ZCULL stats") == "false");
-    CHECK(f.get("Video > Relaxed ZCULL Sync").value == T(str::CFGU_ZCULL_RELAXED));
+    CHECK(f.value("Video > Relaxed ZCULL Sync") == "false" && f.value("Video > Accurate ZCULL stats") == "true");
+    CHECK(f.get("Video > Relaxed ZCULL Sync").value == T(str::CFGU_ZCULL_PRECISE));
     {
         const auto list = f.m.choices(f.row("Video > Shader Mode"));
         bool async_greyed = false;
@@ -869,6 +881,191 @@ void test_languages()
 }
 } // namespace
 
+// ---------------------------------------------------------------- 0.40 rows that tell the truth
+
+// Audio Renderer 'Null' is a console limit in every mode (only that value; the PS4 backend never muted): the row shows
+// the value that runs, the saved value without effect, and Square removes it from the file.
+void test_audio_renderer_limit()
+{
+    for (const int mode : {0, 1, 2}) // automatic, automatic configuration off, user-tuned game
+    {
+        reset_files();
+        if (mode == 1) CHECK(set_auto_config_enabled(false));
+        if (mode == 2) CHECK(set_user_tuned(minecraft, true));
+        // per game the value comes from the game's own (format-1) YAML: the row starts from the global value there
+        fixture f;
+        if (mode == 2) f.open(minecraft, {}, "Audio:\n  Renderer: Null\n");
+        else f.open({}, "Audio:\n  Renderer: Null\n");
+        CHECK(f.value("Audio > Renderer") == "Cubeb");
+        CHECK(f.m.last_preview().console_changes >= 1);
+        const cb::row& r = f.get("Audio > Renderer");
+        CHECK(r.locked && r.mark == cb::badge::ps4 && contains(r.help, T(str::CFGU_VALOR_SALVO_SEM_EFEITO)));
+        CHECK(contains(r.help, T(str::COM_INDISPONIVEL_PS4)) && contains(r.help, T(str::CFGR_AUDIO_NULL_PS4)));
+        // Square: the saved value goes back to the default the row starts from, so the next save writes it
+        CHECK(f.m.has_unused_saved(f.row("Audio > Renderer")));
+        f.m.remove_unused_saved(f.row("Audio > Renderer"));
+        CHECK(!f.m.has_unused_saved(f.row("Audio > Renderer")) && !contains(f.get("Audio > Renderer").help, T(str::CFGU_VALOR_SALVO_SEM_EFEITO)));
+        CHECK(contains(f.m.save_dump(), "Renderer: Cubeb"));
+        CHECK(f.m.pins_to_save().empty() || std::find(f.m.pins_to_save().begin(), f.m.pins_to_save().end(), "Audio > Renderer") == f.m.pins_to_save().end());
+    }
+    // the boot: the console-limit line names the value; Cubeb in the file changes nothing
+    reset_files();
+    {
+        cfg_root c;
+        CHECK(c.from_string("Audio:\n  Renderer: Null\n"));
+        std::vector<std::string> lines;
+        const policy_result r = apply_boot_policy_preview(c, minecraft, [&](const cfg::_base& setting, const std::string& old, std::string_view why, change_kind kind)
+        {
+            if (kind == change_kind::console && setting.get_name() == "Renderer" && cb::key_of(setting) == "Audio > Renderer")
+                lines.push_back(old + "->" + setting.to_string() + ": " + std::string(why));
+        });
+        CHECK(lines.size() == 1 && lines[0].starts_with("Null->Cubeb: the PS4 has one sound output"));
+        CHECK(std::any_of(r.notes.begin(), r.notes.end(), [](const std::string& n) { return n.starts_with("console limit: 'Renderer' = 'Cubeb' (was 'Null')"); }));
+        CHECK(unsafe_value_for(c.audio.renderer) && !unsafe_value_for(c.video.renderer));
+    }
+    {
+        cfg_root c;
+        std::size_t changed = 0;
+        apply_boot_policy_preview(c, minecraft, [&](const cfg::_base& setting, const std::string&, std::string_view, change_kind)
+        {
+            changed += cb::key_of(setting) == "Audio > Renderer";
+        });
+        CHECK(changed == 0 && c.audio.renderer.to_string() == "Cubeb");
+    }
+}
+
+void test_rows_040()
+{
+    reset_files();
+    // Resolution Scale: 101..200 warned, above 200 not offered; a saved 775 runs at 200 (console limit)
+    CHECK(cat::find("Video > Resolution Scale")->values == "25..100|~101..200|#201..800");
+    {
+        fixture f;
+        pin_set pins;
+        pins.global = {"Video > Resolution Scale"};
+        f.open({}, "Video:\n  Resolution Scale: 775\n", {}, pins);
+        CHECK(f.value("Video > Resolution Scale") == "200");
+        const cb::row& r = f.get("Video > Resolution Scale");
+        CHECK(r.mark == cb::badge::ps4 && r.help == i18n::trf(str::CFGR_LIMIT_RESOLUTION_SCALE, {200u}));
+        // the stepper (automatic configuration off: the saved value runs) stops at 200
+        CHECK(set_auto_config_enabled(false));
+        fixture g;
+        g.open({}, "Video:\n  Resolution Scale: 150\n");
+        CHECK(g.value("Video > Resolution Scale") == "150");
+        g.confirmed("Video > Resolution Scale", [&](std::size_t i) { return g.m.step(i, 1); });
+        g.confirmed("Video > Resolution Scale", [&](std::size_t i) { return g.m.step(i, 1); });
+        CHECK(g.value("Video > Resolution Scale") == "200");
+        g.confirmed("Video > Resolution Scale", [&](std::size_t i) { return g.m.step(i, 1); });
+        CHECK(g.value("Video > Resolution Scale") == "200");
+        CHECK(contains(g.m.set_text(g.row("Video > Resolution Scale"), "650"), "650"));
+        CHECK(g.value("Video > Resolution Scale") == "200");
+        reset_files();
+    }
+    // VSync: on Vulkan the surface always presents with FIFO (locked with the reason); on OpenGL it stays editable
+    {
+        fixture f;
+        f.open(minecraft);
+        const cb::row& r = f.get("Video > VSync Mode");
+        CHECK(r.locked && r.mark == cb::badge::ps4 && contains(r.help, T(str::CFGR_VSYNC_FIFO_PS4)));
+        CHECK(contains(f.m.step(f.row("Video > VSync Mode"), 1), T(str::CFGR_VSYNC_FIFO_PS4)));
+        CHECK(f.value("Video > VSync Mode") == "Disabled");
+        fixture g;
+        CHECK(set_user_tuned(minecraft, true));
+        g.open(minecraft, {}, "Video:\n  Renderer: OpenGL\n");
+        CHECK(!g.get("Video > VSync Mode").locked);
+        CHECK(set_user_tuned(minecraft, false));
+    }
+    // Enable Buffering off: a warned value (asks once); Mono greyed (the PS4 output is stereo only)
+    {
+        fixture f;
+        CHECK(set_auto_config_enabled(false));
+        f.open({});
+        const std::string asked = f.m.step(f.row("Audio > Enable Buffering"), 1);
+        CHECK(f.m.confirmation() && contains(asked, T(str::CFGH_AVISO_SEM_BUFFER)) && f.value("Audio > Enable Buffering") == "true");
+        f.m.confirm();
+        f.m.step(f.row("Audio > Enable Buffering"), 1);
+        CHECK(f.value("Audio > Enable Buffering") == "false");
+        f.m.step(f.row("Audio > Enable Buffering"), 1);
+        CHECK(f.value("Audio > Enable Buffering") == "true");
+        bool mono_greyed = false, stereo_allowed = false;
+        for (const cb::choice& c : f.m.choices(f.row("Audio > Audio Channel Layout")))
+        {
+            if (c.spelling == "Mono") mono_greyed = !c.allowed && c.reason == T(str::CFGR_AUDIO_MONO_PS4);
+            if (c.spelling == "Stereo") stereo_allowed = c.allowed && !c.warn;
+        }
+        CHECK(mono_greyed && stereo_allowed);
+        CHECK(contains(f.pick("Audio > Audio Channel Layout", "Mono"), T(str::CFGR_AUDIO_MONO_PS4)));
+        CHECK(f.value("Audio > Audio Channel Layout") == "Automatic");
+        reset_files();
+    }
+    // OpenGL Shader Mode without gl-async.flag shows the legacy recompiler the renderer runs, with the reason
+    {
+        CHECK(set_auto_config_enabled(false));
+        fixture f;
+        f.open({}, "Video:\n  Renderer: OpenGL\n  Shader Mode: Shader Interpreter only\n");
+        CHECK(f.value("Video > Shader Mode") == "Legacy Recompiler (single-threaded)");
+        const cb::row& r = f.get("Video > Shader Mode");
+        CHECK(r.mark == cb::badge::ps4 && r.help == T(str::CFGR_VALUE_GL_ASYNC));
+        reset_files();
+    }
+    // Help notes: Frame Skip, Audio Provider, RSXAudio Avport
+    {
+        fixture f;
+        f.open({});
+        CHECK(contains(f.get("Video > Enable Frame Skip").help, T(str::CFGH_NOTA_FRAME_SKIP)));
+        CHECK(contains(f.get("Audio > Audio Provider").help, T(str::CFGH_NOTA_POR_EXECUTAVEL)));
+        CHECK(contains(f.get("Audio > RSXAudio Avport").help, T(str::CFGH_NOTA_POR_EXECUTAVEL)));
+        CHECK(!contains(f.get("Video > Frame limit").help, T(str::CFGH_NOTA_FRAME_SKIP)));
+    }
+    // Disk cache: the boot's bound follows the free space of /data (unknown on the host: 4096 MB)
+    {
+        fixture f;
+        runtime_inputs in;
+        in.data_free_mb = 80000;
+        f.open({}, "VFS:\n  Disk cache maximum size (MB): 10240\n", {}, {}, in);
+        CHECK(f.value("VFS > Disk cache maximum size (MB)") == "8000");
+        CHECK(f.get("VFS > Disk cache maximum size (MB)").help == i18n::trf(str::SET_BOOT_MANTEM_LIMITE_CACHE_ENTRE, {1024, 8000}));
+    }
+}
+
+// Options > Use my saved value: the files' value as this scope's pin (the automatic value ran instead)
+void test_use_saved()
+{
+    reset_files();
+    fixture f;
+    f.open({}, "Video:\n  Frame limit: 30\n");
+    CHECK(f.value("Video > Frame limit") == "Auto");
+    CHECK(f.m.saved_differs(f.row("Video > Frame limit")) && f.m.saved_text(f.row("Video > Frame limit")) == "30");
+    CHECK(!f.m.saved_differs(f.row("Video > Resolution")));
+    CHECK(!f.m.saved_differs(f.row("Video > Multithreaded RSX"))); // locked
+    const std::string message = f.m.use_saved(f.row("Video > Frame limit"));
+    CHECK(contains(message, "30") && f.value("Video > Frame limit") == "30");
+    CHECK(f.get("Video > Frame limit").pinned && f.get("Video > Frame limit").mark == cb::badge::mine);
+    const auto pins = f.m.pins_to_save();
+    CHECK(std::find(pins.begin(), pins.end(), "Video > Frame limit") != pins.end());
+    CHECK(!f.m.saved_differs(f.row("Video > Frame limit")));
+    // a warned saved value asks first (OpenGL)
+    fixture g;
+    g.open({}, "Video:\n  Renderer: OpenGL\n");
+    CHECK(g.value("Video > Renderer") == "Vulkan");
+    g.confirmed("Video > Renderer", [&](std::size_t i) { return g.m.use_saved(i); });
+    CHECK(g.value("Video > Renderer") == "OpenGL" && g.get("Video > Renderer").pinned);
+}
+
+// The global layer's own values (util/ps4_policy.hpp legacy_choices) on the real tree
+void test_legacy_choices_tree()
+{
+    reset_files();
+    const std::string yaml = "Video:\n  Renderer: OpenGL\n  Frame limit: 30\n  Multithreaded RSX: true\nAudio:\n  Renderer: Null\n"
+                             "Core:\n  Max LLVM Compile Threads: 0\nMiscellaneous:\n  Show trophy popups: false\n";
+    cfg_root saved, automatic;
+    CHECK(saved.from_string(yaml) && automatic.from_string(yaml));
+    std::vector<std::string> keys = legacy_choices(saved, automatic, read_runtime_inputs({}), yaml);
+    std::sort(keys.begin(), keys.end());
+    // Show trophy popups runs as saved (no step replaces it); Null and Multithreaded RSX are console limits on both sides
+    CHECK((keys == std::vector<std::string>{"Video > Frame limit", "Video > Renderer"}));
+}
+
 int main(int argc, char** argv)
 {
     for (int i = 1; i < argc; ++i)
@@ -881,6 +1078,10 @@ int main(int argc, char** argv)
     test_dependencies();
     test_pages();
     test_languages();
+    test_audio_renderer_limit();
+    test_rows_040();
+    test_use_saved();
+    test_legacy_choices_tree();
     std::printf("cfg_browser_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

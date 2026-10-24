@@ -1097,6 +1097,20 @@ void VKGSRender::emit_geometry(u32 sub_index)
 
 	// Faults are allowed during vertex upload. Ensure consistent CB state after uploads.
 	// Queries are spawned and closed outside render pass scope for consistency reasons.
+#ifdef RPCS3_PS4
+	if ((m_current_command_buffer->flags & vk::command_buffer::cb_load_occluson_task) && vk::ps4_query_pool_unavailable())
+	{
+		// No occlusion query pool for this session (its creation failed after a memory reclaim): the active query
+		// records nothing and answers visible, instead of a hard sync per draw for a slot that never comes.
+		if (m_active_query_info)
+		{
+			m_active_query_info->result = 1;
+		}
+
+		m_current_command_buffer->flags &= ~vk::command_buffer::cb_load_occluson_task;
+	}
+	else
+#endif
 	if (m_current_command_buffer->flags & vk::command_buffer::cb_load_occluson_task)
 	{
 		u32 occlusion_id = m_occlusion_query_manager->allocate_query(*m_current_command_buffer);
@@ -1128,6 +1142,31 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		}
 
 		// Begin query
+#ifdef RPCS3_PS4
+		if (occlusion_id == umax)
+		{
+			// Still no slot: the query pool could not be created just now (allocate_new_pool, which also makes every later
+			// query answer visible), or every slot is held. This draw records nothing and the query answers visible; a
+			// query begun on no slot would index past the slot table and use a pool that does not exist.
+			if (m_active_query_info)
+			{
+				m_active_query_info->result = 1;
+			}
+
+			m_current_command_buffer->flags &= ~vk::command_buffer::cb_load_occluson_task;
+		}
+		else
+		{
+			m_occlusion_query_manager->begin_query(*m_current_command_buffer, occlusion_id);
+
+			auto& data = m_occlusion_map[m_active_query_info->driver_handle];
+			data.indices.push_back(occlusion_id);
+			data.set_sync_command_buffer(m_current_command_buffer);
+
+			m_current_command_buffer->flags &= ~vk::command_buffer::cb_load_occluson_task;
+			m_current_command_buffer->flags |= (vk::command_buffer::cb_has_occlusion_task | vk::command_buffer::cb_has_open_query);
+		}
+#else
 		m_occlusion_query_manager->begin_query(*m_current_command_buffer, occlusion_id);
 
 		auto& data = m_occlusion_map[m_active_query_info->driver_handle];
@@ -1136,6 +1175,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 
 		m_current_command_buffer->flags &= ~vk::command_buffer::cb_load_occluson_task;
 		m_current_command_buffer->flags |= (vk::command_buffer::cb_has_occlusion_task | vk::command_buffer::cb_has_open_query);
+#endif
 	}
 
 	VkDescriptorBufferViewEx persistent_buffer = m_persistent_attribute_storage ? *m_persistent_attribute_storage : *null_buffer_view;
@@ -1449,6 +1489,8 @@ void VKGSRender::end()
 			rsx::ps4_frame_skips++;
 			// 0.38: also pipelines and shader modules the driver refused (not ready until relinked).
 			vk::g_ps4_vk_draw_counters.skipped_not_ready++;
+			// The active occlusion query misses this draw's samples: an empty count must not read as occluded.
+			zcull_ctrl->ps4_on_skipped_draw();
 		}
 #endif
 		// Program is not ready, skip drawing this
@@ -1464,6 +1506,7 @@ void VKGSRender::end()
 	{
 		// 0.37: drawn with the shader interpreter while its pipeline compiles (10 s 'Vulkan backend' line).
 		vk::g_ps4_vk_draw_counters.interpreter_draws++;
+		vk::g_ps4_interpreter_draws_total++;
 	}
 #endif
 
@@ -1575,4 +1618,14 @@ void VKGSRender::end()
 	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
 
 	rsx::thread::end();
+
+#ifdef RPCS3_PS4
+	// After a device loss of this game: submit every cb_split_draws draws (a mid-frame flush, as readbacks do), so a
+	// heavy frame never builds one oversized submission.
+	if (m_ps4_cb_split_draws && utils::ps4::rsx_programs::cb_split_due(++m_ps4_cb_draws, m_ps4_cb_split_draws, cond_render_ctrl.hw_cond_active))
+	{
+		vk::g_ps4_vk_draw_counters.cb_splits++;
+		flush_command_queue();
+	}
+#endif
 }

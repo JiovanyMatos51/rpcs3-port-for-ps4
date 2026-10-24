@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -2832,6 +2833,14 @@ inline std::pair<u32, u32> file_counts(const parsed_file& pf)
     bad += pf.ignored_count;
     return {good, bad};
 }
+
+// A failed stat() of a file to read: "not there" (nothing to report) for ENOENT / ENOTDIR, and for EIO when the file's
+// folder does not exist either (the console answers EIO for a path under a missing folder, e.g. the cheats folder
+// before anything was saved). Any other error, or EIO inside an existing folder, is a read error.
+constexpr bool stat_failure_is_missing(int error, bool folder_exists) noexcept
+{
+    return error == ENOENT || error == ENOTDIR || (error == EIO && !folder_exists);
+}
 } // namespace utils::ps4::cheats
 
 #ifdef RPCS3_PS4
@@ -2868,7 +2877,15 @@ inline bool read_file(const std::string& path, std::size_t limit, std::string& o
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0)
     {
-        missing = errno == ENOENT || errno == ENOTDIR;
+        const int error = errno;
+        bool folder_exists = true;
+        if (error == EIO)
+        {
+            const std::size_t slash = path.find_last_of('/');
+            struct stat dir{};
+            folder_exists = slash != std::string::npos && ::stat(path.substr(0, slash + 1).c_str(), &dir) == 0 && S_ISDIR(dir.st_mode);
+        }
+        missing = stat_failure_is_missing(error, folder_exists);
         return false;
     }
     const fs::file file(path);

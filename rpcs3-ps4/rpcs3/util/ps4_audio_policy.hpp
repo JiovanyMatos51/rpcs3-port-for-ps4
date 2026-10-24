@@ -1,7 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 // cellAudio decisions on the PS4 (cellAudio.cpp, buffering on): when to wait for a game's audio block, when to give a
 // period up, and the tempo that keeps the output continuous while the game produces audio slower than real time.
@@ -9,6 +11,31 @@
 // Host test: ps4-port/tests/audio_policy_test.cpp.
 namespace utils::ps4::audio_policy
 {
+// The wait rules of one cellAudio boot. hr_rule, policy and continuity are the switches of the HR waits, the lateness
+// policy (decide()) and automatic continuity (util/ps4_safe_mode.hpp rows, off by default); poll_2ms is
+// audio-poll-2ms.flag; hr_timer: the HR timer passed its boot probe. With the three switches off this is the 0.38
+// behaviour: tick waits with ~1 ms polls (100 us asked; 1000/500 us with poll_2ms), the upstream lateness checks and
+// the upstream time stretching controller.
+struct boot_rules
+{
+    bool hr = false;                         // period waits and block polls on the HR timer
+    std::uint64_t untouched_poll_us = 100;   // poll for a block nothing was written into yet
+    std::uint64_t in_progress_poll_us = 100; // poll for a block still being written
+    bool policy = false;                     // decide() instead of the upstream checks
+    bool continuity = false;                 // rate-matched tempo and automatic engage instead of the upstream controller
+};
+
+constexpr boot_rules rules_for(bool hr_rule, bool poll_2ms, bool hr_timer, bool policy, bool continuity) noexcept
+{
+    boot_rules r;
+    r.hr = hr_rule && !poll_2ms && hr_timer;
+    r.untouched_poll_us = r.hr ? 250 : poll_2ms ? 1000 : 100;
+    r.in_progress_poll_us = r.hr ? 500 : poll_2ms ? 500 : 100;
+    r.policy = policy;
+    r.continuity = continuity;
+    return r;
+}
+
 // A port that wrote nothing for this long (or since it started) is idle: its untouched blocks are silence, not late.
 inline constexpr std::uint64_t idle_after_us = 100'000;
 // Periods in a row a port must have been written in before a late block of it holds up the ports that are ready.
@@ -194,4 +221,52 @@ struct continuity_trigger
         return held_us >= hold_us;
     }
 };
+
+// Unbuffered cellAudio (Enable Buffering off, or the Null renderer, which turns buffering off): period n ends at
+// start + n * period. Upstream never moves 'start' after the boot wait or a pause, so the first periods after either
+// fire the whole gap as MIX events back to back (a 61 s boot wait: ~11,500 periods), and the unbuffered output ring
+// drops them. How far the period clock is behind 'now_us' (0 when it is not):
+constexpr std::uint64_t unbuffered_behind_us(std::uint64_t counter, std::uint64_t start_us, std::uint64_t now_us, std::uint64_t period_us) noexcept
+{
+    const std::uint64_t period_end = counter * period_us + start_us;
+    return now_us > period_end ? now_us - period_end : 0;
+}
+
+// More than this many periods (~43 ms) behind is a boot wait, a pause or a host stall, not a late period.
+inline constexpr std::uint64_t unbuffered_rebase_periods = 8;
+
+constexpr bool unbuffered_rebase_due(std::uint64_t behind_us, std::uint64_t period_us) noexcept
+{
+    return behind_us > unbuffered_rebase_periods * period_us;
+}
+
+constexpr bool unbuffered_rebase_due(std::uint64_t counter, std::uint64_t start_us, std::uint64_t now_us, std::uint64_t period_us) noexcept
+{
+    return unbuffered_rebase_due(unbuffered_behind_us(counter, start_us, now_us, period_us), period_us);
+}
+
+// The start that makes the next period (counter) due at 'now_us'.
+constexpr std::uint64_t unbuffered_rebased_start(std::uint64_t counter, std::uint64_t now_us, std::uint64_t period_us) noexcept
+{
+    const std::uint64_t elapsed = counter * period_us;
+    return now_us > elapsed ? now_us - elapsed : 0;
+}
+
+// The end of the AudioOut 10 s line: " fill_silent=N assist=off". fill_silent counts silence cellAudio enqueued for
+// ports the game wrote within the last 100 ms (a gap inside its audio: the upstream skip-then-silence burst), the
+// measure an audio assist would act on; assist: wait/cont = the 0.39 rules it runs, watch = armed, off = no assist (the
+// only state in this version). Kept last so the older fields keep their positions for log tools. Always
+// NUL-terminated; returns the length written (truncated to fit).
+inline std::size_t format_out_tail(char* out, std::size_t size, std::uint64_t fill_silent, std::uint8_t assist_mode = 0, bool assist_armed = false) noexcept
+{
+    if (!out || !size) return 0;
+    const char* const assist = assist_mode == 2 ? "cont" : assist_mode == 1 ? "wait" : assist_armed ? "watch" : "off";
+    const int n = std::snprintf(out, size, " fill_silent=%llu assist=%s", static_cast<unsigned long long>(fill_silent), assist);
+    if (n < 0)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+    return static_cast<std::size_t>(n) < size ? static_cast<std::size_t>(n) : size - 1;
+}
 }

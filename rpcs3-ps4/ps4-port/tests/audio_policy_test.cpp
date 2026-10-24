@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <string_view>
 
 namespace ap = utils::ps4::audio_policy;
 
@@ -472,10 +473,124 @@ void test_closed_loop()
         CHECK(r.tempo_min >= ap::tempo_min);
     }
 }
+
+// Boot rules from the switches: every switch off is the 0.38 cellAudio (tick waits, 100/100 us polls or 1000/500 with
+// audio-poll-2ms.flag, upstream checks and controller), whatever the HR timer probe said.
+void test_boot_rules()
+{
+    for (const bool timer : {false, true})
+    {
+        const ap::boot_rules off = ap::rules_for(false, false, timer, false, false);
+        CHECK(!off.hr && off.untouched_poll_us == 100 && off.in_progress_poll_us == 100);
+        CHECK(!off.policy && !off.continuity);
+
+        const ap::boot_rules off_2ms = ap::rules_for(false, true, timer, false, false);
+        CHECK(!off_2ms.hr && off_2ms.untouched_poll_us == 1000 && off_2ms.in_progress_poll_us == 500);
+    }
+
+    // HR waits on: 250/500 us on the HR timer; tick polls when the probe failed; audio-poll-2ms.flag still wins.
+    const ap::boot_rules on = ap::rules_for(true, false, true, false, false);
+    CHECK(on.hr && on.untouched_poll_us == 250 && on.in_progress_poll_us == 500);
+    const ap::boot_rules no_timer = ap::rules_for(true, false, false, false, false);
+    CHECK(!no_timer.hr && no_timer.untouched_poll_us == 100 && no_timer.in_progress_poll_us == 100);
+    const ap::boot_rules killed = ap::rules_for(true, true, true, false, false);
+    CHECK(!killed.hr && killed.untouched_poll_us == 1000 && killed.in_progress_poll_us == 500);
+
+    // The policy and continuity switches pass through on their own.
+    const ap::boot_rules policy = ap::rules_for(false, false, true, true, false);
+    CHECK(policy.policy && !policy.continuity && !policy.hr && policy.untouched_poll_us == 100);
+    const ap::boot_rules cont = ap::rules_for(false, false, true, false, true);
+    CHECK(!cont.policy && cont.continuity && !cont.hr);
+
+    static_assert(!ap::rules_for(false, false, true, false, false).hr, "the HR waits are opt-in");
+}
+
+// Unbuffered cellAudio period clock: rebased when more than 8 periods behind (boot wait, pause, stall), never for a
+// late period.
+void test_unbuffered_rebase()
+{
+    constexpr std::uint64_t start = 54'600'000; // the clock starts before the boot wait
+    CHECK(ap::unbuffered_behind_us(0, start, start, block_us) == 0);
+    CHECK(ap::unbuffered_behind_us(10, start, start, block_us) == 0); // ahead of time: not behind
+    CHECK(ap::unbuffered_behind_us(10, start, start + 10 * block_us + 7, block_us) == 7);
+
+    // A 61.4 s boot wait (0.39: 13,378 periods with 11,501 drops in the first window) rebases
+    CHECK(ap::unbuffered_rebase_due(0, start, start + 61'400'000, block_us));
+    // A 7 s PS-button pause rebases
+    CHECK(ap::unbuffered_rebase_due(5'000, start, start + 5'000 * block_us + 7'000'000, block_us));
+    // 2 periods behind (a late wake-up) does not; exactly 8 does not; 8 and 1 us does
+    CHECK(!ap::unbuffered_rebase_due(5'000, start, start + 5'000 * block_us + 2 * block_us, block_us));
+    CHECK(!ap::unbuffered_rebase_due(8 * block_us, block_us));
+    CHECK(ap::unbuffered_rebase_due(8 * block_us + 1, block_us));
+    CHECK(!ap::unbuffered_rebase_due(0, block_us));
+
+    // After the rebase the next period is due now (behind 0, not ahead)
+    const std::uint64_t now = start + 61'400'000;
+    const std::uint64_t rebased = ap::unbuffered_rebased_start(1234, now, block_us);
+    CHECK(ap::unbuffered_behind_us(1234, rebased, now, block_us) == 0);
+    CHECK(1234 * block_us + rebased == now);
+    CHECK(ap::unbuffered_rebased_start(5, 1'000, block_us) == 0); // never below zero
+    static_assert(ap::unbuffered_rebase_periods == 8);
+
+    // The unbuffered loop of cellAudio after a 61.4 s wait: periods fired within the next 100 ms
+    const auto burst = [](bool rebase)
+    {
+        std::uint64_t counter = 0, s = start, t = start + 61'400'000;
+        const std::uint64_t until = t + 100'000;
+        std::uint32_t fired = 0;
+        while (t < until)
+        {
+            if (rebase && ap::unbuffered_rebase_due(counter, s, t, block_us))
+            {
+                s = ap::unbuffered_rebased_start(counter, t, block_us);
+            }
+            const std::uint64_t period_end = counter * block_us + s;
+            const std::int64_t time_left = static_cast<std::int64_t>(period_end - t);
+            if (time_left > 100)
+            {
+                t += static_cast<std::uint64_t>(time_left); // the period wait
+                continue;
+            }
+            fired++;       // mix and send the MIX event
+            counter++;
+            t += 20;       // the mix itself
+        }
+        return fired;
+    };
+    CHECK(burst(false) > 4'000); // upstream: thousands of MIX events back to back
+    const std::uint32_t paced = burst(true);
+    CHECK(paced >= 18 && paced <= 20); // ~100 ms / 5.33 ms
+}
+
+void test_out_tail()
+{
+    char out[64];
+    CHECK(ap::format_out_tail(out, sizeof(out), 0) == std::string_view(" fill_silent=0 assist=off").size());
+    CHECK(std::string_view(out) == " fill_silent=0 assist=off");
+    ap::format_out_tail(out, sizeof(out), 1234);
+    CHECK(std::string_view(out) == " fill_silent=1234 assist=off");
+    ap::format_out_tail(out, sizeof(out), 5, 0, true);
+    CHECK(std::string_view(out) == " fill_silent=5 assist=watch");
+    ap::format_out_tail(out, sizeof(out), 5, 1, true);
+    CHECK(std::string_view(out) == " fill_silent=5 assist=wait");
+    ap::format_out_tail(out, sizeof(out), 5, 2, false);
+    CHECK(std::string_view(out) == " fill_silent=5 assist=cont");
+    ap::format_out_tail(out, sizeof(out), UINT64_MAX);
+    CHECK(std::string_view(out) == " fill_silent=18446744073709551615 assist=off");
+
+    // Truncated to fit and always terminated
+    char small[8];
+    CHECK(ap::format_out_tail(small, sizeof(small), 99) == 7);
+    CHECK(std::string_view(small) == " fill_s");
+    char one[1] = {'x'};
+    CHECK(ap::format_out_tail(one, 1, 99) == 0 && one[0] == '\0');
+    CHECK(ap::format_out_tail(nullptr, 10, 99) == 0);
+}
 }
 
 int main()
 {
+    test_boot_rules();
     test_decide();
     test_late_bucket();
     test_port_stops();
@@ -483,6 +598,8 @@ int main()
     test_tempo();
     test_trigger();
     test_closed_loop();
+    test_unbuffered_rebase();
+    test_out_tail();
 
     if (g_failures)
     {

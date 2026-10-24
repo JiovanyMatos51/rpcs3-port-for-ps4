@@ -7,6 +7,8 @@
 #ifdef RPCS3_PS4
 
 #include "util/ps4_audio_conceal.hpp"
+#include "util/ps4_audio_policy.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 #include <orbis/AudioOut.h>
 #include <orbis/libkernel.h>
@@ -33,10 +35,16 @@ namespace
 	// the first failures are logged, then one in 100.
 	std::atomic<u32> s_ps4_open_failures{0};
 	std::atomic<u32> s_ps4_output_failures{0};
+	// Refused output thread creates (parked lifetime): all of them, and those since the last thread that started
+	std::atomic<u32> s_ps4_thread_failures{0};
+	std::atomic<u32> s_ps4_thread_failures_open{0};
+	std::atomic<u32> s_ps4_thread_recoveries{0};
 
 	// The backend is reopened on every recovery or setting change; its startup.log lines are written once.
 	std::atomic<bool> s_ps4_conceal_reported{false};
 	std::atomic<bool> s_ps4_priority_reported{false};
+	// The output thread lifetime last written to startup.log: 0 none yet, 1 parked, 2 one per play
+	std::atomic<u32> s_ps4_lifetime_reported{0};
 
 	bool ps4_log_failure(std::atomic<u32>& count, u32& number)
 	{
@@ -48,6 +56,7 @@ namespace
 PS4AudioBackend::~PS4AudioBackend()
 {
 	Close();
+	stop_thread();
 }
 
 bool PS4AudioBackend::Open(std::string_view dev_id, AudioFreq freq, AudioSampleSize sample_size, AudioChannelCnt ch_cnt, audio_channel_layout layout)
@@ -110,6 +119,28 @@ bool PS4AudioBackend::Open(std::string_view dev_id, AudioFreq freq, AudioSampleS
 	m_conceal = !fs::is_file("/data/rpcs3/audio-no-conceal.flag");
 	m_high_priority = fs::is_file("/data/rpcs3/audio-high-priority.flag");
 
+	// 0.40: the output thread starts with the port (cellAudio opens it at boot, while the game holds few threads) and
+	// parks between streams, so neither a resume nor a live audio setting change (cellAudio reopens the port of this
+	// backend) has to create a thread at the console's cap, where 0.39 lost the game's sound until a later resume.
+	if (!m_thread_valid)
+	{
+		m_parked_thread = utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::audio_out_parked);
+	}
+
+	if (const u32 lifetime = m_parked_thread ? 1 : 2; s_ps4_lifetime_reported.exchange(lifetime) != lifetime)
+	{
+		ps4_startup_checkpoint(m_parked_thread
+			? "AudioOut: output thread kept parked between pauses (audio-thread-per-play.flag: one thread per play)"
+			: "AudioOut: one output thread per play (audio-thread-per-play.flag)");
+	}
+
+	if (m_parked_thread && !start_thread())
+	{
+		// The port is open, but nothing would play it: reported failed, so cellAudio closes this backend and opens a new
+		// one (a new try) on its recovery pass, at most every 2 s while it keeps failing.
+		m_failed = true;
+	}
+
 	if (!s_ps4_conceal_reported.exchange(true))
 	{
 		ps4_startup_checkpoint(m_conceal
@@ -121,6 +152,8 @@ bool PS4AudioBackend::Open(std::string_view dev_id, AudioFreq freq, AudioSampleS
 
 void PS4AudioBackend::Close()
 {
+	// A parked output thread stays (parked by Pause): cellAudio opens the port of this backend again after a setting
+	// change. The destructor ends it.
 	Pause();
 	if (m_handle >= 0)
 	{
@@ -129,10 +162,84 @@ void PS4AudioBackend::Close()
 	}
 }
 
+bool PS4AudioBackend::start_thread()
+{
+	if (m_thread_valid)
+	{
+		return true;
+	}
+	m_gate.rearm();
+	const int error = pthread_create(&m_thread, nullptr, [](void* self) -> void*
+	{
+		static_cast<PS4AudioBackend*>(self)->output_loop();
+		return nullptr;
+	}, this);
+	m_thread_valid = error == 0;
+	if (!m_thread_valid)
+	{
+		s_ps4_thread_failures_open.fetch_add(1, std::memory_order_relaxed);
+		if (u32 number = 0; ps4_log_failure(s_ps4_thread_failures, number))
+		{
+			ps4_audio_log.error("PS4: audio output thread could not be created (error 0x%x, failure %u); the port is reported failed and cellAudio opens it again", static_cast<u32>(error), number);
+			if (number == 1)
+			{
+				ps4_startup_checkpoint("AudioOut: output thread refused (thread cap); cellAudio reopens the port, at most every 2 s, until a slot is free");
+			}
+		}
+	}
+	else if (const u32 refused = s_ps4_thread_failures_open.exchange(0, std::memory_order_relaxed))
+	{
+		if (u32 number = 0; ps4_log_failure(s_ps4_thread_recoveries, number))
+		{
+			// This TU is -fno-exceptions: a fixed buffer instead of a heap string.
+			char line[128];
+			std::snprintf(line, sizeof(line), "AudioOut: output thread started after %u refused tries", refused);
+			ps4_audio_log.notice("%s", line);
+			ps4_startup_checkpoint(line);
+		}
+	}
+	return m_thread_valid;
+}
+
+void PS4AudioBackend::stop_thread()
+{
+	if (!m_thread_valid)
+	{
+		return;
+	}
+	if (m_parked_thread)
+	{
+		m_gate.stop();
+	}
+	pthread_join(m_thread, nullptr);
+	m_thread_valid = false;
+}
+
 void PS4AudioBackend::Play()
 {
 	if (m_handle < 0 || m_running)
 	{
+		return;
+	}
+	if (m_parked_thread)
+	{
+		// The thread started by Open(), or a new try after a refusal there. 0.39 stayed silent here for the rest of the
+		// game: cellAudio's ring kept 'playing' and never asked again, and the port still looked operational.
+		const bool had_thread = m_thread_valid;
+		if (!start_thread())
+		{
+			m_failed = true;
+			return;
+		}
+		if (!had_thread)
+		{
+			// Without a thread the port can only have been reported failed by the refused create in Open() (a failed
+			// output keeps its parked thread): it plays now
+			m_failed = false;
+		}
+		m_running = true;
+		m_playing = true;
+		m_gate.play();
 		return;
 	}
 	if (m_thread_valid)
@@ -162,7 +269,13 @@ void PS4AudioBackend::Play()
 void PS4AudioBackend::Pause()
 {
 	m_running = false;
-	if (m_thread_valid)
+	if (m_parked_thread)
+	{
+		// The stream checks the gate before each 5.33 ms block and drains the block in flight: parked within about two
+		// blocks, and no write callback runs after this returns (cellAudio flushes the ring next), as with the join.
+		m_gate.pause();
+	}
+	else if (m_thread_valid)
 	{
 		pthread_join(m_thread, nullptr);
 		m_thread_valid = false;
@@ -203,15 +316,34 @@ void PS4AudioBackend::output_loop()
 		priority.emplace(+1);
 	}
 
+	if (!m_parked_thread)
+	{
+		// audio-thread-per-play.flag: one stream, then the thread ends (Pause joins it)
+		static_cast<void>(stream(false));
+		return;
+	}
+
+	// One stream per Play(), parked in between; a failed output parks the thread until the next Play() or the end
+	while (m_gate.wait_play())
+	{
+		if (stream(true) < 0)
+		{
+			m_gate.halt();
+		}
+	}
+}
+
+int PS4AudioBackend::stream(bool parked)
+{
 	const u32 bytes = 256 * 2 * get_sample_size();
 	const bool conceal = m_conceal;
 	const bool s16 = m_sample_size == AudioSampleSize::S16;
 	utils::ps4::audio_conceal::conceal_state conceal_state;
 	u64 blocks = 0, underruns = 0, concealed = 0, lock_misses = 0, total_blocks = 0;
 	auto report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-	// Start a fresh cellAudio attribution window with this port.
+	// Start a fresh cellAudio attribution window with this stream: a window never spans a pause.
 	static_cast<void>(ps4_cell_audio_take_window());
-	const int result = utils::ps4::audio_stream(bytes, [&] { return m_running.load(); }, [&](u8* buffer, u32 length)
+	const int result = utils::ps4::audio_stream(bytes, [&] { return parked ? m_gate.playing() : m_running.load(); }, [&](u8* buffer, u32 length)
 	{
 		std::memset(buffer, 0, length);
 		u32 complete = 0;
@@ -275,9 +407,13 @@ void PS4AudioBackend::output_loop()
 				static_cast<unsigned long long>(cell.late_hist[2]), static_cast<unsigned long long>(cell.late_hist[3]),
 				static_cast<unsigned long long>(cell.late_hist[4]), static_cast<unsigned long long>(cell.idle_ports), static_cast<const char*>(rate),
 				cell.tempo_periods ? static_cast<double>(cell.tempo_milli_sum) / static_cast<double>(cell.tempo_periods) / 1000.0 : 1.0);
-			ps4_audio_log.notice("AudioOut: blocks=%llu underruns=%llu concealed=%llu callback_lock_misses=%llu; cellAudio: periods=%llu game_late=%llu host_late=%llu (max %llu us) in_progress_waits=%llu silent=%llu untouched_waits=%llu wait_ms=%llu drops=%llu ring_min_ms=%s%s%s",
+			// What was lost and how much was concealed: silence inside the game's audio, and the audio assist state
+			char tail[64];
+			utils::ps4::audio_policy::format_out_tail(tail, sizeof(tail), cell.fill_silent);
+			ps4_audio_log.notice("AudioOut: blocks=%llu underruns=%llu concealed=%llu callback_lock_misses=%llu; cellAudio: periods=%llu game_late=%llu host_late=%llu (max %llu us) in_progress_waits=%llu silent=%llu untouched_waits=%llu wait_ms=%llu drops=%llu ring_min_ms=%s%s%s%s",
 				blocks, underruns, concealed, lock_misses, cell.periods, cell.game_late, cell.host_late, cell.max_wake_late_us, cell.in_progress_waits, cell.silent,
-				cell.untouched_waits, cell.wait_us / 1000, cell.drops, static_cast<const char*>(ring_min), static_cast<const char*>(extra), static_cast<const char*>(policy));
+				cell.untouched_waits, cell.wait_us / 1000, cell.drops, static_cast<const char*>(ring_min), static_cast<const char*>(extra), static_cast<const char*>(policy),
+				static_cast<const char*>(tail));
 			blocks = underruns = concealed = lock_misses = 0;
 			report = now + std::chrono::seconds(10);
 		}
@@ -300,6 +436,7 @@ void PS4AudioBackend::output_loop()
 		std::lock_guard lock(m_state_cb_mutex);
 		if (m_state_callback) m_state_callback(AudioStateEvent::UNSPECIFIED_ERROR);
 	}
+	return result;
 }
 
 #endif

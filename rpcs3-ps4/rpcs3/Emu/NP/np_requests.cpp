@@ -85,6 +85,11 @@ namespace
 		{
 			reason = "thread budget critical";
 		}
+		else if (!utils::ps4::governor::optional_thread_allowed("NP Trans Worker", 1))
+		{
+			// The count the console's cap applies to, whatever the governor rules: the last slots belong to the game
+			reason = "thread budget: the last slots of the cap are kept for the game";
+		}
 		else if (ps4_np_workers.fetch_add(1, std::memory_order_relaxed) >= ps4_np_worker_cap)
 		{
 			ps4_np_workers.fetch_sub(1, std::memory_order_relaxed);

@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include "util/ps4_disc_probe.hpp"
 #include "util/ps4_i18n.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 // rpcs3/ps4_fatal.cpp: appends one line to startup.log; a PS4 system notification
 void ps4_fatal_note(const char* prefix, const char* detail) noexcept;
@@ -1582,6 +1583,138 @@ static bool iso_form_hierarchy(fs::file& file, iso_fs_node& node, bool use_ucs2_
 	return true;
 }
 
+#ifdef RPCS3_PS4
+namespace
+{
+	// What the probe below decided for each image file it looked at (the most recent ones): the XMB names the kind of
+	// a refused image, and each outcome is logged once per image instead of at every library scan
+	struct iso_ps4_probe_result
+	{
+		std::string path;
+		utils::ps4::disc_probe::iso_refusal refusal = utils::ps4::disc_probe::iso_refusal::none;
+	};
+
+	std::mutex s_iso_probe_mutex;
+	std::vector<iso_ps4_probe_result> s_iso_probe_results;
+	constexpr usz s_iso_probe_keep = 32;
+
+	// The image is no longer one the probe looks at (replaced by a copy the exact rule reads, or the probe is off)
+	void iso_ps4_forget_probe(const std::string& path)
+	{
+		std::lock_guard lock(s_iso_probe_mutex);
+
+		for (usz i = 0; i < s_iso_probe_results.size(); i++)
+		{
+			if (s_iso_probe_results[i].path == path)
+			{
+				s_iso_probe_results.erase(s_iso_probe_results.begin() + i);
+				return;
+			}
+		}
+	}
+
+	// True when this outcome of the image is new (first time, or another outcome than the last one)
+	bool iso_ps4_store_probe(const std::string& path, utils::ps4::disc_probe::iso_refusal refusal)
+	{
+		std::lock_guard lock(s_iso_probe_mutex);
+
+		for (usz i = 0; i < s_iso_probe_results.size(); i++)
+		{
+			if (s_iso_probe_results[i].path == path)
+			{
+				const bool changed = s_iso_probe_results[i].refusal != refusal;
+				s_iso_probe_results[i].refusal = refusal;
+				return changed;
+			}
+		}
+
+		if (s_iso_probe_results.size() >= s_iso_probe_keep)
+		{
+			s_iso_probe_results.erase(s_iso_probe_results.begin());
+		}
+
+		s_iso_probe_results.push_back({path, refusal});
+		return true;
+	}
+}
+
+// Why the image at 'path' was refused by the header-less probe of its last iso_archive in this process: none when it
+// was read, never looked at, or refused for another reason (the caller then keeps its own message). Any thread.
+utils::ps4::disc_probe::iso_refusal iso_ps4_refusal(std::string_view path)
+{
+	std::lock_guard lock(s_iso_probe_mutex);
+
+	for (const iso_ps4_probe_result& r : s_iso_probe_results)
+	{
+		if (r.path == path)
+		{
+			return r.refusal;
+		}
+	}
+
+	return utils::ps4::disc_probe::iso_refusal::none;
+}
+
+// An image file without a PS3 disc header (sector 0 holds no region table) and without an exact PS3_GAME/PARAM.SFO at
+// its root, which the loader refused until now: PS3_GAME/PARAM.SFO is looked up without case, at the root and one
+// wrapper folder down (an ISO made from the folder that holds the game). A game found there becomes the root of the
+// tree, so the loader reads it like a game folder at the root; anything else is refused with what the root holds.
+// /data/rpcs3/iso-probe-strict.flag keeps the exact rule. 'exact': the tree has PS3_GAME/PARAM.SFO at its root.
+static void iso_ps4_probe_header_less(const fs::file& file, const std::string& path, iso_fs_node& root, bool exact)
+{
+	namespace dp = utils::ps4::disc_probe;
+
+	// A drive always reads a real disc, which has its header
+	if (path.starts_with("/dev/"))
+	{
+		return;
+	}
+
+	u8 head[4]{};
+
+	if (exact || file.read_at(0, head, sizeof(head)) != sizeof(head) || (head[0] | head[1] | head[2] | head[3]) != 0 ||
+		!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::iso_probe_wide))
+	{
+		iso_ps4_forget_probe(path);
+		return;
+	}
+
+	// The listing is taken before the tree may be re-rooted
+	const std::string listing = dp::iso_tree::root_listing(root);
+	const dp::iso_tree::header_less_layout layout = dp::iso_tree::probe_header_less(root, true);
+
+	if (!iso_ps4_store_probe(path, layout.refusal))
+	{
+		return;
+	}
+
+	if (layout.refusal == dp::iso_refusal::none)
+	{
+		std::string renamed;
+
+		for (const std::string& r : layout.renamed)
+		{
+			renamed += renamed.empty() ? "; disc case restored: " : ", ";
+			renamed += r;
+		}
+
+		const std::string where = layout.wrapper.empty() ? std::string("PS3_GAME/PARAM.SFO") : dp::iso_tree::name_text(layout.wrapper) + "/PS3_GAME/PARAM.SFO";
+		const std::string line = fmt::format("no PS3 disc header; PARAM.SFO found at '%s': reading %s as an unencrypted image%s (iso-probe-strict.flag keeps the refusal): '%s'",
+			where, layout.wrapper.empty() ? "the image" : "that folder as the root of the image", renamed, path);
+		iso_log.warning("init: %s", line);
+		ps4_fatal_note("ISO: ", line.c_str());
+		return;
+	}
+
+	const std::string why = layout.candidates > 1 ? fmt::format("%u top folders hold PS3_GAME/PARAM.SFO", layout.candidates)
+		: layout.wrapper.empty() ? std::string(dp::refusal_name(layout.refusal))
+		: fmt::format("%s in '%s'", dp::refusal_name(layout.refusal), dp::iso_tree::name_text(layout.wrapper));
+	const std::string line = fmt::format("no PS3 disc header and no PS3_GAME/PARAM.SFO: %s; refused (%s): '%s'", why, listing, path);
+	iso_log.error("init: %s", line);
+	ps4_fatal_note("ISO: ", line.c_str());
+}
+#endif
+
 u64 iso_fs_metadata::size() const
 {
 	u64 total_size = 0;
@@ -1679,6 +1812,11 @@ iso_archive::iso_archive(const std::string& path)
 		invalidate();
 		return;
 	}
+
+#ifdef RPCS3_PS4
+	// Only an image the exact rule refuses is looked at again (see iso_ps4_probe_header_less)
+	iso_ps4_probe_header_less(iso_file, m_path, m_root, is_file("PS3_GAME/PARAM.SFO"));
+#endif
 
 	// Only when the archive object is fully set, we can finally initialize the decryption object needing the archive object
 	m_dec = std::make_shared<iso_file_decryption>();

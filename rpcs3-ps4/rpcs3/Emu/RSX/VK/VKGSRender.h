@@ -47,6 +47,11 @@ namespace vk
 	// vkutils/sync.cpp (0.39): stops the game after a confirmed GPU hang (no-hang-stop.flag: no-op). Any thread.
 	void ps4_request_gpu_hang_stop(const char* why) noexcept;
 
+	// VKGSRender.cpp: the GPU liveness scan, from an RSX-thread wait on the GPU that has lasted a second or more
+	// (occlusion query results, timed event waits), so a submission the GPU never finishes is confirmed while the RSX
+	// thread is blocked on it. No-op on other threads; the scan itself runs at most once a second.
+	void ps4_gpu_liveness_in_wait() noexcept;
+
 	// VKPipelineCompiler.cpp (0.34): asynchronous pipeline jobs queued or compiling right now.
 	u32 ps4_pipelines_pending() noexcept;
 
@@ -113,9 +118,19 @@ namespace vk
 		u64 interpreter_draws = 0; // draws whose pipeline was still compiling, drawn with the shader interpreter
 		u64 skipped_not_ready = 0;   // 0.38: draws skipped without a program (compiling, or refused by the driver)
 		u64 skipped_descriptors = 0; // 0.38: draws skipped because a descriptor set was refused for lack of memory
+		u64 submits = 0;             // primary command buffers submitted (close_and_submit_command_buffer)
+		u64 cb_splits = 0;           // ... of which ended by the command buffer split after a device loss
 	};
 
 	extern ps4_vk_draw_counters_t g_ps4_vk_draw_counters;
+
+	// Draws made with the shader interpreter since the process started (never reset; the pipeline burst line takes
+	// differences). RSX thread only.
+	extern u64 g_ps4_interpreter_draws_total;
+
+	// VKQueryPool.cpp: the occlusion query pool could not be created after a memory reclaim and one retry; the
+	// renderer runs without occlusion queries and every one answers visible. Any thread.
+	bool ps4_query_pool_unavailable() noexcept;
 #endif
 }
 
@@ -290,7 +305,20 @@ private:
 		u32 worst_skips = 0;
 		u32 worst_draws = 0;
 		u32 notes = 0;                // startup.log lines written by this renderer
+		// RPCS3.log burst line: draws skipped in the burst, and the interpreter links, their time and the interpreter
+		// draws counted since the last empty queue.
+		u64 skipped_total = 0;
+		u64 links_at_start = 0;
+		u64 link_us_at_start = 0;
+		u64 interp_draws_at_start = 0;
+		u32 log_notes = 0;            // RPCS3.log lines written by this renderer
 	} m_ps4_burst;
+
+	// Command buffer split after a device loss of this game (cb_split_after_loss and the title's cb_split adapt key,
+	// read at renderer creation): a submit after this many draws (0 = off), and the draws recorded since the last
+	// submit. RSX thread only.
+	u32 m_ps4_cb_split_draws = 0;
+	u32 m_ps4_cb_draws = 0;
 
 	// 0.36: the managed rings (the interpreter blocks only when created), checked before every draw so that a ring
 	// within its guard reclaims space (queued frames, then a hard sync) instead of growing. RSX thread only.
@@ -300,7 +328,8 @@ private:
 	u32 m_ps4_ring_hard_syncs = 0;
 
 	// 0.39: adaptive ring growth (util/ps4_vram_policy.hpp ring rules), in m_ps4_rings order: reclaim rate, largest
-	// size and the earliest retry after a refused growth. rings-no-grow.flag clears m_ps4_ring_growth. RSX thread only.
+	// size and the earliest retry after a refused growth. m_ps4_ring_growth = feature ring_growth (off by default). RSX
+	// thread only.
 	bool m_ps4_ring_growth = false;
 	std::array<utils::ps4::vram::ring_rate, 13> m_ps4_ring_rate{};
 	std::array<u32, 13> m_ps4_ring_max_mib{};
@@ -326,6 +355,7 @@ private:
 	u64 m_ps4_next_liveness_scan_us = 0;
 	bool m_ps4_unfinished_logged = false;
 	u64 m_ps4_foreground_since_us = 0; // 0.39: start of the current foreground stretch seen by the scan (0 = background)
+	u32 m_ps4_liveness_epoch = 0;      // ps4_focus_epoch() at the last scan: a change (process away) starts the table over
 
 	// 0.36: texture-cache claims of pages ZCULL still protects for deferred reports (any thread).
 	atomic_t<u32> m_ps4_zcull_pages_claimed{ 0 };
@@ -519,6 +549,9 @@ public:
 	// submission the garbage collector tracks (a buffer disposed after recording into it is freed once it completed),
 	// while upload-staging-off.flag is absent.
 	bool ps4_is_current_primary_cb(const vk::command_buffer& cmd) const;
+
+	// vk::ps4_gpu_liveness_in_wait: the liveness scan (rate-limited) from a long GPU wait of the RSX thread.
+	void ps4_liveness_scan_in_wait() { ps4_check_gpu_liveness(); }
 #endif
 
 	// Handle pool creation failure due to fragmentation

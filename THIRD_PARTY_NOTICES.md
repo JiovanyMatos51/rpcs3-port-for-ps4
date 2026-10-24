@@ -2,9 +2,14 @@
 
 RPCS3 PORT FOR PS4 is licensed under the GNU General Public License, version 2 ([`LICENSE`](LICENSE)).
 It is built from, and its PKG contains, the components below. Each component keeps its own license;
-this file is a guide to them, not a license. Paths are relative to this folder.
+this file is a guide to them, not a license.
 
-"In this release" means the component's source is part of this folder. Components marked
+Paths are relative to the folder of the source release (the folder that holds `rpcs3-ps4/`,
+`orbis-compat/` and `licenses/`). The PKG carries this file and `LICENSE` at the root of the
+application folder (`/app0/`) and the license texts of the components in its own `licenses/` folder;
+the section [License texts in the PKG](#license-texts-in-the-pkg) lists them.
+
+"In this release" means the component's source is part of the source release. Components marked
 "downloaded" are fetched by the build scripts at the pinned version; their license texts are copied
 in [`licenses/`](licenses).
 
@@ -13,7 +18,8 @@ in [`licenses/`](licenses).
 | Component | Version / pin | Source | License | License text |
 | --- | --- | --- | --- | --- |
 | [RPCS3](https://github.com/RPCS3/rpcs3): emulation core, renderers, recompilers, interface icons (`bin/Icons/ui`) | upstream `9d52b338058bda2d5a9d7cd5e4fbc8148e55a385`, with the port's changes | in this release: `rpcs3-ps4/` | GPL-2.0 | `LICENSE`, `rpcs3-ps4/LICENSE` |
-| RPCS3 PORT FOR PS4 (Roberix Studio & Mifi Studios) | 0.39 | in this release: `rpcs3-ps4/ps4-port/`, `rpcs3-ps4/rpcs3/**/ps4_*`, the port's changes in RPCS3 and orbis-compat | GPL-2.0 | `LICENSE` |
+| RPCS3 PORT FOR PS4 (Roberix Studio & Mifi Studios) | 0.40 | in this release: `rpcs3-ps4/ps4-port/`, `rpcs3-ps4/rpcs3/**/ps4_*`, the port's changes in RPCS3 and orbis-compat | GPL-2.0 | `LICENSE` |
+| Application icon (`ps4-port/assets/icon0.png`, installed as `sce_sys/icon0.png`) | 0.40 | in this release: `rpcs3-ps4/ps4-port/assets/icon0.png` | the studio logo of the port's authors (Roberix Studio & Mifi Studios), supplied by them; it replaces the RPCS3 logo, which earlier versions used as the application icon. Same license as the rest of `rpcs3-ps4/ps4-port/` (row above) | `LICENSE` |
 | [LLVM](https://llvm.org) (PPU/SPU recompilers, in-process JIT) | llvm-project `ca7933e47d3a3451d81e72ac174dcb5aa28b59d1` (RPCS3's submodule pin) | downloaded by `ps4-port/fetch-llvm.py` | Apache-2.0 WITH LLVM-exception | `licenses/LLVM-LICENSE.TXT` (also in the PKG as `licenses/LLVM.txt`) |
 | [Mesa](https://mesa3d.org): RADV (Vulkan), EGL, Gallium/Zink (OpenGL) | 26.3.0-devel `4c934ebf9cda976704e9b32cb24d2c41e6ab25f5`, bundle `orbis-mesa-4c934ebf9cda` of [orbis-ports/mesa-ps4](https://github.com/orbis-ports/mesa-ps4) | downloaded (prebuilt bundle, see `BUILDING.md`) | MIT | `licenses/Mesa-MIT.txt` |
 | Khronos headers (Vulkan, EGL, GLES, KHR) from the Mesa bundle | as shipped in the bundle | downloaded | Apache-2.0 (Vulkan headers: Apache-2.0 OR MIT) | `licenses/Khronos-Apache-2.0.txt` |
@@ -23,6 +29,7 @@ in [`licenses/`](licenses).
 | [wolfSSL](https://www.wolfssl.com) (TLS for RPCN and curl) | 5.9.4-stable `3c5eead44904` | in this release: `rpcs3-ps4/3rdparty/wolfssl/wolfssl` | GPL-3.0, with wolfSSL's exception that lets RPCS3 use it under GPL-2.0 | `rpcs3-ps4/3rdparty/wolfssl/wolfssl/COPYING`, `rpcs3-ps4/3rdparty/wolfssl/wolfssl/LICENSING` |
 | [curl](https://curl.se) (HTTP) | 8.22.0 `01346829096c` | in this release: `rpcs3-ps4/3rdparty/curl/curl` | curl (MIT-style) | `rpcs3-ps4/3rdparty/curl/curl/COPYING` |
 | Mozilla root certificates (`ps4-port/assets/certs/cacert.pem`, installed as `/app0/certs/cacert.pem`) | data of 2024-07-02, 148 roots; identical to wolfSSL's `wolfcrypt/src/port/Espressif/esp_crt_bundle/cacrt_all.pem` | in this release | MPL-2.0 (https://mozilla.org/MPL/2.0/) | header of the file |
+| RPCS3 per-game configuration database (`config_database.dat`, installed as `/app0/config_database.dat` when the PKG is built with `package-native.ps1 -ConfigDatabase`) | the snapshot given to `-ConfigDatabase`, unchanged; its `timestamp` is the `config_database` field of the PKG's `build-manifest.json` (`none` when the PKG does not carry the file, `bundled, no timestamp` when the file has no `timestamp`) | not in this release: data the RPCS3 project publishes on its server (`https://api.rpcs3.net/config/?api=v1`), which the PC RPCS3 saves as `GuiConfigs/config_database.dat`; bundled by the port's authors | none stated by its publisher. It is RPCS3 project data: the GPL-2.0 of this port does not cover it, and this port grants no license for it | none published |
 | [miniupnpc](https://miniupnp.tuxfamily.org) (UPnP) | 2.3.2 (miniupnp `d66872e34d9f`) | in this release: `rpcs3-ps4/3rdparty/miniupnp/miniupnp` | BSD-3-Clause | `rpcs3-ps4/3rdparty/miniupnp/miniupnp/LICENSE` |
 | [Protocol Buffers](https://protobuf.dev) (RPCN protocol) | 33.4 `edaa823d8b36` | in this release: `rpcs3-ps4/3rdparty/protobuf/protobuf` | BSD-3-Clause | `rpcs3-ps4/3rdparty/protobuf/protobuf/LICENSE` |
 | [Abseil](https://abseil.io) (Protobuf dependency) | 20250512.1 `76bb24329e8bf5f39704eb10d21b9a80befa7c81` | downloaded by `ps4-port/prepare-abseil.ps1` | Apache-2.0 | `licenses/Abseil-LICENSE.txt` |
@@ -56,6 +63,61 @@ come with the toolchain and are not part of this source release.
 
 The host tools used only to build (llvm-mingw, CMake, Ninja, Python, Git for Windows and its MSYS
 runtime, GNU Make from MSYS2) are not linked into the console executable or shipped in the PKG.
+
+## License texts in the PKG
+
+`package-native.ps1` copies these texts into the PKG from the files the build used (`3rdparty/`,
+`ps4-port/deps/`, the orbis-compat and orbis-porting-kit checkouts, the OpenOrbis toolchain and the
+font files). It stops when one of them is missing or when this list and the PKG's `licenses/` folder
+differ. The third column names where the same license text is in the source release.
+
+| File in the PKG | Component | Same text in the source release |
+| --- | --- | --- |
+| `LICENSE` | RPCS3, RPCS3 PORT FOR PS4, PINE IPC server header | `LICENSE`, `rpcs3-ps4/LICENSE` |
+| `THIRD_PARTY_NOTICES.md` | this file | `THIRD_PARTY_NOTICES.md` |
+| `certs/cacert.pem` | Mozilla root certificates (license in the file header) | `rpcs3-ps4/ps4-port/assets/certs/cacert.pem` |
+| `licenses/LLVM.txt` | LLVM | `licenses/LLVM-LICENSE.TXT` |
+| `licenses/LLVM-libcxx-LICENSE.TXT` | LLVM libc++ of the toolchain | `licenses/LLVM-libcxx-LICENSE.TXT` |
+| `licenses/LLVM-libcxxabi-LICENSE.TXT` | LLVM libc++abi of the toolchain | `licenses/LLVM-libcxxabi-LICENSE.TXT` |
+| `licenses/LLVM-libunwind-LICENSE.TXT` | LLVM libunwind of the toolchain | `licenses/LLVM-libunwind-LICENSE.TXT` |
+| `licenses/LLVM-compiler-rt-LICENSE.TXT` | LLVM compiler-rt builtins of the toolchain | `licenses/LLVM-compiler-rt-LICENSE.TXT` |
+| `licenses/musl-MIT.txt` | OpenOrbis musl C library | `licenses/musl-MIT.txt` |
+| `licenses/OpenOrbis-PS4-Toolchain-LICENSE.txt` | OpenOrbis PS4 Toolchain | `licenses/OpenOrbis-PS4-Toolchain-LICENSE.txt` |
+| `licenses/Mesa-MIT.txt` | Mesa | `licenses/Mesa-MIT.txt` |
+| `licenses/Khronos-Apache-2.0.txt` | Khronos headers of the Mesa bundle | `licenses/Khronos-Apache-2.0.txt` |
+| `licenses/Khronos-GL-headers.txt` | Khronos OpenGL headers | the notices at the top of `rpcs3-ps4/3rdparty/GL/glext.h` and `rpcs3-ps4/3rdparty/GL/KHR/khrplatform.h` |
+| `licenses/zlib-Zlib.txt` | zlib (`libz.a` of the Mesa bundle) | `licenses/zlib-Zlib.txt` |
+| `licenses/zlib-LICENSE.txt` | zlib headers | `rpcs3-ps4/3rdparty/zlib/zlib/LICENSE` |
+| `licenses/FFmpeg-LICENSE.md` | FFmpeg | `licenses/FFmpeg-LICENSE.md` |
+| `licenses/FFmpeg-COPYING.LGPLv2.1` | FFmpeg | `licenses/FFmpeg-COPYING.LGPLv2.1` |
+| `licenses/FFmpeg-core-copyright.txt` | FFmpeg headers of `ffmpeg-core` | `rpcs3-ps4/3rdparty/ffmpeg/copyright` |
+| `licenses/wolfSSL-COPYING.txt` | wolfSSL | `rpcs3-ps4/3rdparty/wolfssl/wolfssl/COPYING` |
+| `licenses/wolfSSL-LICENSING.txt` | wolfSSL (the exception for GPL-2.0 projects) | `rpcs3-ps4/3rdparty/wolfssl/wolfssl/LICENSING` |
+| `licenses/curl-COPYING.txt` | curl | `rpcs3-ps4/3rdparty/curl/curl/COPYING` |
+| `licenses/miniupnpc-LICENSE.txt` | miniupnpc | `rpcs3-ps4/3rdparty/miniupnp/miniupnp/LICENSE` |
+| `licenses/protobuf-LICENSE.txt` | Protocol Buffers | `rpcs3-ps4/3rdparty/protobuf/protobuf/LICENSE` |
+| `licenses/Abseil-LICENSE.txt` | Abseil | `licenses/Abseil-LICENSE.txt` |
+| `licenses/zstd-LICENSE.txt` | Zstandard (BSD-3-Clause) | `rpcs3-ps4/3rdparty/zstd/zstd/LICENSE` |
+| `licenses/zstd-COPYING.txt` | Zstandard (GPL-2.0) | `rpcs3-ps4/3rdparty/zstd/zstd/COPYING` |
+| `licenses/libpng-LICENSE.txt` | libpng | `rpcs3-ps4/3rdparty/libpng/libpng/LICENSE` |
+| `licenses/AsmJit-LICENSE.md` | AsmJit | `rpcs3-ps4/3rdparty/asmjit/asmjit/LICENSE.md` |
+| `licenses/yaml-cpp-LICENSE.txt` | yaml-cpp | `rpcs3-ps4/3rdparty/yaml-cpp/yaml-cpp/LICENSE` |
+| `licenses/pugixml-LICENSE.md` | pugixml | `rpcs3-ps4/3rdparty/pugixml/LICENSE.md` |
+| `licenses/SoundTouch-COPYING.txt` | SoundTouch | `rpcs3-ps4/3rdparty/SoundTouch/soundtouch/COPYING.TXT` |
+| `licenses/Fusion-LICENSE.md` | Fusion | `rpcs3-ps4/3rdparty/fusion/fusion/LICENSE.md` |
+| `licenses/glslang-LICENSE.txt` | glslang | `rpcs3-ps4/3rdparty/glslang/glslang/LICENSE.txt` |
+| `licenses/VulkanMemoryAllocator-LICENSE.txt` | Vulkan Memory Allocator | `rpcs3-ps4/3rdparty/GPUOpen/VulkanMemoryAllocator/LICENSE.txt` |
+| `licenses/stb-LICENSE.txt` | stb | `rpcs3-ps4/3rdparty/stblib/stb/LICENSE` |
+| `licenses/libusb-COPYING.txt` | libusb headers | `rpcs3-ps4/3rdparty/libusb/libusb/COPYING` |
+| `licenses/RtMidi-LICENSE.txt` | RtMidi C API header | `rpcs3-ps4/3rdparty/rtmidi/rtmidi/LICENSE` |
+| `licenses/OpenAL-Soft-COPYING.txt` | OpenAL Soft headers | `rpcs3-ps4/3rdparty/OpenAL/openal-soft/COPYING` |
+| `licenses/bcdec-LICENSE.txt` | bcdec | the notice at the top of `rpcs3-ps4/3rdparty/bcdec/bcdec.hpp` |
+| `licenses/unordered_dense-LICENSE.txt` | unordered_dense | the notice at the top of `rpcs3-ps4/3rdparty/unordered_dense/include/unordered_dense.h` |
+| `licenses/PINE-NOTICE.txt` | PINE IPC server header (its license text is `LICENSE`, GPL-2.0) | the notice at the top of `rpcs3-ps4/3rdparty/pine/pine_server.h` |
+| `licenses/orbis-compat-LICENSE.txt` | orbis-compat | `orbis-compat/LICENSE` |
+| `licenses/orbis-compat-BSD-3-Clause-FreeBSD.txt` | orbis-compat `include/sys/ioccom.h` | `orbis-compat/licenses/BSD-3-Clause-FreeBSD.txt` |
+| `licenses/orbis-porting-kit-LICENSE.txt` | orbis-porting-kit | `licenses/orbis-porting-kit-LICENSE.txt` |
+| `licenses/DejaVu-Fonts-LICENSE.txt` | DejaVu fonts | the copyright and license records stored in `rpcs3-ps4/bin/fonts/DejaVuSans.ttf` and `DejaVuSansMono.ttf`; `licenses/DejaVu-Fonts-LICENSE.txt` holds those of `DejaVuSans.ttf` |
 
 ## In `rpcs3-ps4/3rdparty/` but not used by the console build
 

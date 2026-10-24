@@ -334,23 +334,24 @@ namespace rpcn
 #ifdef RPCS3_PS4
 	namespace
 	{
-		// 0.31: proactive thread budget. The console refuses threads at about 80 live stacks, so RPCN stays offline
-		// when the rest of the process is already at the governor's critical level. 'own' is the number of RPCN
-		// threads already counted (connecting does not add any), so the check measures everything except RPCN.
+		// 0.31: proactive thread budget. The console refuses threads at about 80, so RPCN stays offline when its
+		// threads would take one of the last slots of the cap, which belong to the game. The count is the one the
+		// console's cap applies to (orbis live + exited not joined, every RPCS3, Mesa and guest thread): the registry
+		// count used before is ~14 lower, so RPCN started at the cap's edge (Demon's Souls 0.39). Independent of the
+		// governor rules in force. 'own' is the number of RPCN threads already counted: a first start adds three
+		// (Reader, Writer, Client), a connect adds none.
 		bool ps4_thread_budget_refused(const char* where, u32 own)
 		{
 			utils::ps4::governor::thread_pressure(); // logs level changes to startup.log
 
-			const u32 live = ::ps4_thread_registry::get_counters().live;
-			const u32 others = live > own ? live - own : 0;
-
-			if (utils::ps4::governor::classify_threads(others) < 2)
+			if (utils::ps4::governor::optional_thread_allowed(own ? "RPCN connect" : "RPCN start", own ? 0u : 3u))
 			{
 				return false;
 			}
 
-			const std::string line = fmt::format("RPCN: sem recursos de thread (%s: %u live RPCS3 threads, %u of them RPCN, limit %u); RPCN stays offline",
-				where, live, own, utils::ps4::governor::thread_high);
+			const ps4_thread_load load = ::ps4_thread_load_now();
+			const std::string line = fmt::format("RPCN: sem recursos de thread (%s: %u of cap %u threads, %u of them RPCN; the last %u slots are kept for the game); RPCN stays offline",
+				where, load.total, utils::ps4::governor::thread_cap(), own, utils::ps4::governor::thread_l2_margin);
 			rpcn_log.error("%s", line);
 			ps4_startup_checkpoint(line.c_str());
 

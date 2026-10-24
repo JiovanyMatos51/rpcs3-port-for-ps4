@@ -20,11 +20,16 @@
 //   disc, are a removal; the disc seen again afterwards is its return (watch events). A check that fails without an
 //   answer about the drive (FTP server off, time-out, 550) never counts. The record is a usage rule of this port, not
 //   copy protection: deleting it unlocks the game.
+// - Without a network GoldHEN's FTP server does not listen, so the drive cannot be checked at all: the screens say so
+//   (the network is missing, not the FTP setting). With the offline grace (feature row disc_lock_grace, off unless the
+//   player turns it on) such a game opens when a disc of it unlocked it at most grace_days ago and the console clock
+//   can be trusted (classify_offline). The last sighting is <registry_dir><TITLE_ID>.seen, one line of unix seconds,
+//   written at most once an hour (seen_book); the records themselves keep their format.
 //
-// Pure part (host-tested): record text, registry, binding, classification, the X screen (gate) and its texts, the
-// removal watch of a running game.
-// PS4 part (RPCS3_PS4): the registry folder, the token of a boot the XMB has just verified and the watch on the drive
-// service. Log lines start with "disc lock:".
+// Pure part (host-tested): record text, registry, binding, classification, the offline grace and its sightings, the X
+// screen (gate) and its texts, the removal watch of a running game.
+// PS4 part (RPCS3_PS4): the registry folder, the sightings, the token of a boot the XMB has just verified and the watch
+// on the drive service. Log lines start with "disc lock:"; decisions also go to RPCS3.log (disc_stream::log_mirror).
 
 #include "ps4_disc_stream.hpp"
 #include "ps4_i18n.hpp"
@@ -50,6 +55,12 @@ inline constexpr bool accept_other_pressing = true;       // a disc with the sam
 
 // The message line of a selected locked game, in the interface language
 inline const char* row_hint() noexcept { return i18n::tr(i18n::str::DLOCK_PRECISA_DISCO_LEITOR_PS4_R1); }
+
+// The same for the drive's last status: without a network the drive cannot be seen at all, and the line says so
+inline const char* row_hint(const ds::disc_status& s) noexcept
+{
+    return ds::no_network(s) ? i18n::tr(i18n::str::DOFF_LOCK_SEM_REDE) : row_hint();
+}
 
 // Start of the plain XMB notice after a game closed because its disc left the drive (the launcher shows removed_text())
 inline constexpr char removed_notice[] = "O disco foi removido.";
@@ -405,7 +416,7 @@ inline std::string describe(match m, const record& r, const ds::disc_status& s)
     {
     case match::unknown: return "drive not checked yet";
     case match::stale: return "the last drive check is too old";
-    case match::no_server: return "FTP server off";
+    case match::no_server: return ds::no_network(s) ? "drive not visible: no network" : "FTP server off";
     case match::no_disc: return "no disc in the drive";
     case match::not_ps3: return "a disc that is not a PS3 game";
     case match::other_disc: return "another PS3 disc: " + (disc_id(s).empty() ? std::string("?") : disc_id(s));
@@ -453,6 +464,154 @@ inline std::int64_t forced_check_ms(bool visible, bool selected_locked, match m,
     return m == match::other_disc || m == match::not_ps3 ? 10000 : 0;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The drive without a network, and the offline grace
+
+inline constexpr char seen_suffix[] = ".seen";       // <registry_dir><TITLE_ID>.seen: the last sighting of the game's disc
+inline constexpr std::int64_t grace_days = 7;        // a disc seen at most this long ago opens its game offline
+inline constexpr std::int64_t seen_rewrite_s = 3600; // a sighting is written again at most once an hour
+inline constexpr std::size_t seen_limit = 64;        // bytes of a .seen file read
+
+inline std::string seen_file_name(std::string_view title_id)
+{
+    return std::string(title_id) + seen_suffix;
+}
+
+inline std::string seen_text(std::int64_t unix_seconds)
+{
+    return std::to_string(unix_seconds) + "\n";
+}
+
+// The time of a .seen file: decimal unix seconds, blanks and a line end around them; -1 for anything else
+inline std::int64_t parse_seen(std::string_view text)
+{
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ' || text.back() == '\t')) text.remove_suffix(1);
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
+    std::uint64_t value = 0;
+    if (text.size() > 12 || !detail::number(text, 10, value)) return -1;
+    return static_cast<std::int64_t>(value);
+}
+
+// The drive could not be checked because the console has no network: no FTP server answered while it had no IP
+// address (also a check too old, or none counted yet, whose last answer was that). An FTP server switched off on a
+// console with a network is not this case: the player can turn it on.
+inline bool unseen_offline(match m, const ds::disc_status& s) noexcept
+{
+    const bool no_server = m == match::no_server || ((m == match::unknown || m == match::stale) && s.state == ds::disc_state::no_server);
+    return no_server && ds::no_network(s);
+}
+
+enum class offline_verdict
+{
+    locked,        // no grace: the drive was checked, the grace is off, no sighting is on record or the clock is not trusted
+    grace,         // the game opens
+    grace_expired, // its disc was last seen more than the grace ago
+};
+
+struct offline_decision
+{
+    offline_verdict verdict = offline_verdict::locked;
+    bool offline = false;  // the drive could not be checked for want of a network (unseen_offline)
+    std::int64_t days = 0; // grace, grace_expired: whole days since the last sighting
+    std::string why;       // for the log; "" when the drive was checked
+};
+
+// The offline grace of a bound game whose drive status gave 'm'. 'seen_unix': the last sighting of its disc (-1 none);
+// 'now_unix': the console clock (-1 unknown); 'build_date': "YYYY-MM-DD" of this build (a clock before it is wrong);
+// 'grace_on': the feature row. Only a sighting at most 'days' old under a clock that is plausible and not earlier than
+// the sighting opens the game: a clock moved back or reset gives no grace.
+inline offline_decision classify_offline(match m, const ds::disc_status& s, std::int64_t seen_unix, std::int64_t now_unix, std::string_view build_date, bool grace_on,
+    std::int64_t days = grace_days)
+{
+    offline_decision out;
+    if (!unseen_offline(m, s)) return out;
+    out.offline = true;
+    if (!grace_on) out.why = "offline grace off";
+    else if (seen_unix < 0) out.why = "no sighting of its disc on record";
+    else if (now_unix < 0 || !ds::clock_plausible(now_unix, build_date)) out.why = "console clock " + ds::detail::utc_text(now_unix) + " cannot be trusted";
+    else if (now_unix < seen_unix) out.why = "the console clock is earlier than the last sighting (" + ds::detail::utc_text(seen_unix) + ")";
+    else
+    {
+        out.days = (now_unix - seen_unix) / 86400;
+        out.verdict = now_unix - seen_unix <= days * 86400 ? offline_verdict::grace : offline_verdict::grace_expired;
+        out.why = "disc seen " + std::to_string(out.days) + " day(s) ago, grace " + std::to_string(days) + " days" +
+            (out.verdict == offline_verdict::grace_expired ? ": expired" : "");
+    }
+    return out;
+}
+
+// "BLES01876 'FIFA 14': unlocked offline (drive not visible: no network; disc seen 2 day(s) ago, grace 7 days)"
+inline std::string offline_log_line(const record& r, const offline_decision& d)
+{
+    const std::string name = r.title_id + (r.title.empty() ? std::string{} : " '" + r.title + "'");
+    if (!d.offline) return name + ": the drive was checked (no offline grace)";
+    return name + (d.verdict == offline_verdict::grace ? ": unlocked offline (" : ": locked (") + "drive not visible: no network; " + d.why + ")";
+}
+
+// The screen text of an offline grace: "... visto há 2 dia(s): o jogo abre (até 7 dias sem conferir)"; "" otherwise
+inline std::string grace_text(const offline_decision& d, std::int64_t days = grace_days)
+{
+    if (d.verdict != offline_verdict::grace) return {};
+    return i18n::trf(i18n::str::DOFF_LOCK_GRACE, {d.days, days});
+}
+
+// When a disc of each game last unlocked it (<dir><TITLE_ID>.seen): read once per title and kept; written when none is
+// on record, when the one on record is seen_rewrite_s old or more (or later than now: a clock set right again), and
+// only under a plausible clock. A refused write is not tried again within the hour either. Not thread-safe.
+class seen_book
+{
+public:
+    using read_text_fn = std::function<std::optional<std::string>(const std::string& path)>;
+    using write_text_fn = std::function<bool(const std::string& path, const std::string& text)>;
+
+    seen_book(read_text_fn read, write_text_fn write, std::string dir = registry_dir)
+        : m_read(std::move(read)), m_write(std::move(write)), m_dir(std::move(dir))
+    {
+    }
+
+    // The last sighting of a disc of 'title_id' (unix seconds), -1 when none is on record
+    std::int64_t seen(std::string_view title_id)
+    {
+        const std::string id = ds::canonical_title_id(title_id);
+        if (id.empty()) return -1;
+        if (const auto it = m_known.find(id); it != m_known.end()) return it->second;
+        std::int64_t value = -1;
+        if (m_read)
+            if (const std::optional<std::string> text = m_read(m_dir + seen_file_name(id))) value = parse_seen(*text);
+        m_known.emplace(id, value);
+        return value;
+    }
+
+    // A disc of 'title_id' unlocked its game at 'now_unix'. True when the sighting was written.
+    bool note(std::string_view title_id, std::int64_t now_unix, std::string_view build_date)
+    {
+        const std::string id = ds::canonical_title_id(title_id);
+        if (id.empty() || !m_write || now_unix < 0 || !ds::clock_plausible(now_unix, build_date)) return false;
+        const std::int64_t stored = seen(id);
+        if (stored >= 0 && now_unix >= stored && now_unix - stored < seen_rewrite_s) return false;
+        if (const auto it = m_refused.find(id); it != m_refused.end() && now_unix >= it->second && now_unix - it->second < seen_rewrite_s) return false;
+        if (!m_write(m_dir + seen_file_name(id), seen_text(now_unix)))
+        {
+            m_refused[id] = now_unix;
+            return false;
+        }
+        m_refused.erase(id);
+        m_known[id] = now_unix;
+        ++m_writes;
+        return true;
+    }
+
+    unsigned writes() const { return m_writes; }
+
+private:
+    read_text_fn m_read;
+    write_text_fn m_write;
+    std::string m_dir;
+    std::map<std::string, std::int64_t, std::less<>> m_known;   // title id -> sighting on record (-1 none)
+    std::map<std::string, std::int64_t, std::less<>> m_refused; // title id -> time of a write that failed
+    unsigned m_writes = 0;
+};
+
 // One line of the full-screen disc screen (pixels from the top, like the install question)
 struct screen_line
 {
@@ -480,6 +639,14 @@ struct gate_config
     std::int64_t screen_check_ms = 2000; // the missing and recognized screens ask for a check this often
     std::int64_t max_age_ms = max_status_age_ms;
     bool other_pressing = accept_other_pressing;
+    // The offline grace (classify_offline): the feature row, the last sighting of the game's disc (-1 none), the console
+    // clock when X was pressed (unix seconds, -1 unknown) and this build's date. The grace text stays up this long before
+    // the boot.
+    bool offline_grace = false;
+    std::int64_t seen_unix = -1;
+    std::int64_t clock_unix = -1;
+    std::string build_date;
+    std::int64_t grace_notice_ms = 2000;
 };
 
 // X on a locked game. The adapter feeds the drive's last status and the pressed buttons; it asks the drive for a
@@ -507,6 +674,7 @@ public:
             m_match = classify(m_record, s, now_ms, m_cfg.max_age_ms);
             m_status = s;
             m_counted = true;
+            m_offline = classify_offline(m_match, s, m_cfg.seen_unix, m_cfg.clock_unix, m_cfg.build_date, m_cfg.offline_grace);
         }
         const bool open = m_counted && unlocks(m_match, m_cfg.other_pressing);
         if (circle)
@@ -524,10 +692,22 @@ public:
                     " ms): booting");
                 m_step = step::boot;
             }
+            else if (m_counted && m_offline.verdict == offline_verdict::grace)
+            {
+                // The drive cannot be seen without a network and a disc of the game unlocked it lately: the grace text,
+                // then the boot
+                if (!m_grace_shown)
+                {
+                    m_grace_shown = true;
+                    m_grace_at = now_ms;
+                    log("'" + m_subject + "': " + offline_log_line(m_record, m_offline));
+                }
+                if (now_ms - m_grace_at >= m_cfg.grace_notice_ms) m_step = step::boot;
+            }
             else if (m_counted)
             {
                 log("'" + m_subject + "' not booted: " + reason() + " (state " + ds::to_string(m_status.state) +
-                    (m_status.detail.empty() ? std::string{} : ", " + m_status.detail) + ")");
+                    (m_status.detail.empty() ? std::string{} : ", " + m_status.detail) + ")" + (m_offline.offline ? "; " + m_offline.why : std::string{}));
                 enter(step::missing);
             }
             else if (now_ms - m_pressed >= m_cfg.give_up_ms && !drive_busy)
@@ -575,6 +755,14 @@ public:
     bool want_check() const { return m_want; }
     match last_match() const { return m_counted ? m_match : match::unknown; }
     const record& game() const { return m_record; }
+    // The offline grace of the last counted check (verdict locked and offline false while the drive answers)
+    const offline_decision& offline() const { return m_offline; }
+
+    // While the grace text is up before an offline boot: that text (interface language); "" otherwise
+    std::string grace_note() const
+    {
+        return m_grace_shown && (m_step == step::verifying || m_step == step::boot) ? grace_text(m_offline) : std::string{};
+    }
 
     // A line for startup.log (without the "disc lock: " prefix) when the last update had one, else ""
     std::string take_log() { return std::exchange(m_log, {}); }
@@ -597,7 +785,9 @@ public:
         case step::back:
             out.push_back({80, i18n::tr(str::COM_VERIFICANDO_DISCO), colour_accent});
             out.push_back({140, name});
-            add(i18n::tr(m_now - m_pressed >= m_cfg.slow_ms ? str::COM_LEITOR_ESTA_DEMORANDO_RESPONDER_AGUARDE : str::COM_PROCURANDO_DISCO_DESTE_JOGO_LEITOR));
+            if (const std::string note = grace_note(); !note.empty())
+                for (std::string& line : detail::wrap(note, 70)) add(std::move(line), colour_good);
+            else add(i18n::tr(m_now - m_pressed >= m_cfg.slow_ms ? str::COM_LEITOR_ESTA_DEMORANDO_RESPONDER_AGUARDE : str::COM_PROCURANDO_DISCO_DESTE_JOGO_LEITOR));
             y += 20;
             add(i18n::tr(str::DLOCK_CIRCULO_VOLTAR), colour_accent);
             break;
@@ -647,6 +837,14 @@ public:
         }
         case match::not_ps3: add(i18n::tr(str::DLOCK_DISCO_LEITOR_NAO_DISCO)); break;
         case match::no_server:
+            // Without an IP address GoldHEN's FTP server does not listen: the network is missing, not the FTP setting
+            if (ds::no_network(m_status))
+            {
+                add(i18n::tr(str::DOFF_LOCK_SEM_REDE));
+                if (m_offline.verdict == offline_verdict::grace_expired) add(i18n::trf(str::DOFF_LOCK_GRACE_FIM, {grace_days}));
+                else add(i18n::tr(str::DOFF_LOCK_CONECTE_REDE));
+                break;
+            }
             add(i18n::tr(str::DLOCK_APP_NAO_CONSEGUE_VER_LEITOR));
             add(i18n::tr(str::DLOCK_LIGUE_FTP_CONFIGURACOES_GOLDHEN_SERVER));
             add(i18n::tr(str::DLOCK_APP_LE_DISCO_ELE));
@@ -669,7 +867,9 @@ private:
     step m_step = step::verifying;
     match m_match = match::unknown;
     ds::disc_status m_status;
-    bool m_counted = false, m_want = false, m_busy_logged = false;
+    offline_decision m_offline;
+    std::int64_t m_grace_at = 0;
+    bool m_counted = false, m_want = false, m_busy_logged = false, m_grace_shown = false;
     std::string m_log;
 
     std::string reason() const { return describe(last_match(), m_record, m_status); }
@@ -857,7 +1057,7 @@ private:
     {
         const std::string detail = s.detail.empty() ? std::string{} : ": " + s.detail;
         if (v == sighting::missing) return describe(classify(m_record, s, s.checked_ms), m_record, s) + detail;
-        if (s.state == ds::disc_state::no_server) return "FTP server off" + detail;
+        if (s.state == ds::disc_state::no_server) return (ds::no_network(s) ? "no network" : "FTP server off") + detail;
         if (s.state == ds::disc_state::unknown) return "the drive was not read";
         return "no answer about the drive" + detail;
     }
@@ -926,16 +1126,30 @@ private:
 #endif
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif
+
+#include <ctime>
+
+#include "util/ps4_build_version.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 namespace utils::ps4::disc_lock::sys
 {
 inline void note(const std::string& line)
 {
     ps4_startup_checkpoint(("disc lock: " + line).c_str());
+}
+
+// A decision about a game's disc (booted, refused, unlocked offline, removed during the game): startup.log and
+// RPCS3.log, the log testers send most
+inline void decision(const std::string& line)
+{
+    note(line);
+    ds::mirror("disc lock: " + line);
 }
 
 inline bool list_folder(const std::string& dir, std::vector<std::string>& names, int& error)
@@ -1047,6 +1261,86 @@ inline std::optional<record> record_for_path(const std::string& path, std::uint6
     return std::nullopt;
 }
 
+// A small file of the registry folder replaced at once (written as "<path>.tmp", then renamed over it); the folder is
+// made 0777 when it is missing. Only below registry_dir.
+inline bool write_small(const std::string& path, const std::string& text)
+{
+    if (!path.starts_with(registry_dir) || path.find("/../") != std::string::npos) return false;
+    const std::string temp = path + ".tmp";
+    int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0 && errno == ENOENT)
+    {
+        const std::string folder(registry_dir, sizeof(registry_dir) - 2);
+        ::mkdir(folder.c_str(), 0777);
+        fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    }
+    if (fd < 0) return false;
+    bool ok = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+    ok = ::close(fd) == 0 && ok;
+    if (ok && ::rename(temp.c_str(), path.c_str()) == 0) return true;
+    ::unlink(temp.c_str());
+    return false;
+}
+
+struct seen_state
+{
+    std::mutex mutex;
+    seen_book book{[](const std::string& path) -> std::optional<std::string>
+                   {
+                       int error = 0;
+                       return read_file(path, seen_limit, error);
+                   },
+        write_small};
+};
+
+inline seen_state& sightings()
+{
+    static seen_state* const s = new seen_state(); // never destroyed: read on the way out of the XMB
+    return *s;
+}
+
+inline std::int64_t clock_now()
+{
+    return static_cast<std::int64_t>(std::time(nullptr));
+}
+
+// A disc of 'title_id' unlocked its game at 'now_unix' (the XMB's padlock rows, X, the check before BootGame): kept as
+// its last sighting, written at most once an hour. Cheap enough for every frame (a map lookup) after the first read.
+inline void note_seen(const std::string& title_id, std::int64_t now_unix = clock_now())
+{
+    seen_state& s = sightings();
+    std::lock_guard lock(s.mutex);
+    if (s.book.note(title_id, now_unix, ps4_build_date)) note(title_id + ": disc seen, kept in " + registry_dir + seen_file_name(title_id));
+}
+
+// The last sighting of a disc of 'title_id' (unix seconds), -1 when none is on record
+inline std::int64_t last_seen(const std::string& title_id)
+{
+    seen_state& s = sightings();
+    std::lock_guard lock(s.mutex);
+    return s.book.seen(title_id);
+}
+
+// The offline grace now for a game whose drive status gave 'm' (the feature row disc_lock_grace, its last sighting,
+// the console clock, this build's date)
+inline offline_decision decide_offline(const record& r, match m, const ds::disc_status& s)
+{
+    if (!unseen_offline(m, s)) return {};
+    const bool on = utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::disc_lock_grace);
+    return classify_offline(m, s, last_seen(r.title_id), clock_now(), ps4_build_date, on);
+}
+
+// The X screen's settings for a record: the defaults and the offline grace of this console now
+inline gate_config gate_settings(const record& r)
+{
+    gate_config cfg;
+    cfg.offline_grace = utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::disc_lock_grace);
+    cfg.seen_unix = last_seen(r.title_id);
+    cfg.clock_unix = clock_now();
+    cfg.build_date = ps4_build_date;
+    return cfg;
+}
+
 struct token_state
 {
     std::mutex mutex;
@@ -1095,14 +1389,14 @@ public:
         m_watch.emplace(std::move(*r), now);
         m_next = now;
         const watch_config& cfg = m_watch->config();
-        note("watching the drive while '" + path + "' runs (" + game_name(m_watch->game()) + "): a check every " + std::to_string(cfg.check_ms / 1000) +
+        decision("watching the drive while '" + path + "' runs (" + game_name(m_watch->game()) + "): a check every " + std::to_string(cfg.check_ms / 1000) +
             " s; " + std::to_string(cfg.confirm_misses) + " checks without its disc over " + std::to_string(cfg.confirm_ms / 1000) + " s are a removal");
     }
 
     void stop(const char* why)
     {
         if (!m_watch) return;
-        note("watch of " + m_watch->game().title_id + " ended (" + why + "; " + m_watch->summary() + ")");
+        decision("watch of " + m_watch->game().title_id + " ended (" + why + "; " + m_watch->summary() + ")");
         m_watch.reset();
     }
 
@@ -1126,7 +1420,8 @@ public:
         ds::service& drive = ds::service::instance();
         const watch_event event = m_watch->step(drive.poll(start_worker), now);
         if (m_watch->want_check()) drive.request_check();
-        for (const std::string& line : m_watch->take_log()) note(line);
+        // Bounded by the watch itself (16 lines per step, misses and unanswered checks rate-limited)
+        for (const std::string& line : m_watch->take_log()) decision(line);
         return event;
     }
 

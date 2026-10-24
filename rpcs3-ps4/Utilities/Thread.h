@@ -511,21 +511,30 @@ namespace stx
 }
 
 #ifdef RPCS3_PS4
-// 0.39: a Context declaring `static constexpr bool ps4_lazy = true` (service threads most games never use) is built
-// stand-by by the default-name constructor and started on its first use (thread_base::ps4_start_lazy, also from
-// push()), which keeps slots of the console's per-process thread cap for the game. Off with
-// /data/rpcs3/keep-service-threads.flag (every thread starts at construction, as before).
+// 0.39: a Context declaring `static constexpr bool ps4_lazy = true` (service threads most games never use) can be built
+// stand-by and started on its first use (thread_base::ps4_start_lazy, also from push()), which keeps slots of the
+// console's per-process thread cap for the game. 0.40: opt-in (row lazy_services of util/ps4_safe_mode.hpp,
+// lazy-service-threads.flag); by default every such thread starts at boot, as in 0.38.
 template <typename Context>
 concept ps4_lazy_context = requires { requires Context::ps4_lazy; };
 
-// Read once (Thread.cpp); false with keep-service-threads.flag.
-bool ps4_lazy_threads_enabled() noexcept;
+// 0.40: lazy service threads for this boot (row lazy_services; keep-service-threads.flag forces them off).
+bool ps4_lazy_fxo_threads_enabled() noexcept;
 
 // 0.39: default-named contexts whose body returns at once on the console (Camera and Microphone with the Null handler,
-// CPU Profiler with every profiler off, PPU Syscall Usage): true = build them stand-by and never start them (0.38
-// started them, and each finished thread stayed unjoined until the stop). Decided in Thread.cpp from the name and the
-// configuration (the same conditions as those bodies); false with keep-service-threads.flag.
+// CPU Profiler with every profiler off, PPU Syscall Usage, GemUpdateThread without a real Move handler, RsxAudio Backend
+// without the rsxaudio provider; 0.40: NP Handler Thread while PSN is not RPCN): true = build them stand-by and never
+// start them (0.38 started them, and each finished thread stayed unjoined until the stop, holding a slot of the
+// console's thread cap). Decided in Thread.cpp from the name and the configuration (the same conditions as those
+// bodies); logs one line per thread it keeps stand-by. False with keep-service-threads.flag (row idle_services_skip).
 bool ps4_service_idle(std::string_view name) noexcept;
+
+// 0.40: np_handler::operator() ("NP Handler Thread") returns at once unless the PSN status is RPCN. Its object is still
+// built (the network modules use it); only the thread is kept stand-by. The reason ps4_service_idle() logs, or nullptr.
+constexpr const char* ps4_np_handler_idle(bool psn_is_rpcn) noexcept
+{
+	return psn_is_rpcn ? nullptr : "PSN not RPCN";
+}
 
 // 0.39: wake counter of a lazy thread whose work is always announced by notify_one() on this counter (and which only
 // works while woken through it): Owner::ps4_lazy_start() (static) starts the owner's named_thread first. Otherwise an
@@ -625,22 +634,24 @@ public:
 		, thread(trampoline, std::string(Context::thread_name))
 	{
 #ifdef RPCS3_PS4
-		if constexpr (ps4_lazy_context<Context>)
-		{
-			if (ps4_lazy_threads_enabled())
-			{
-				// 0.39: stand-by (as the launch_retainer constructor) until its first use
-				m_sync |= static_cast<u32>(thread_state::finished);
-				thread::m_ps4_lazy = 1;
-				return;
-			}
-		}
-		else if constexpr (std::is_constructible_v<std::string_view, decltype(Context::thread_name)>)
+		// The same choice, in the same order, as the launch_retainer constructor below
+		if constexpr (std::is_constructible_v<std::string_view, decltype(Context::thread_name)>)
 		{
 			// Service threads have a fixed name; PPU/SPU contexts name each instance and are never idle services
 			if (ps4_service_idle(std::string_view(Context::thread_name)))
 			{
 				// 0.39: stand-by for good (its body would return at once)
+				m_sync |= static_cast<u32>(thread_state::finished);
+				thread::m_ps4_lazy = 1;
+				return;
+			}
+		}
+
+		if constexpr (ps4_lazy_context<Context>)
+		{
+			if (ps4_lazy_fxo_threads_enabled())
+			{
+				// 0.39: stand-by (as the launch_retainer constructor) until its first use
 				m_sync |= static_cast<u32>(thread_state::finished);
 				thread::m_ps4_lazy = 1;
 				return;
@@ -658,6 +669,33 @@ public:
 	{
 		// Create a stand-by thread context
 		m_sync |= static_cast<u32>(thread_state::finished);
+#ifdef RPCS3_PS4
+		// g_fxo builds its service threads with this constructor and starts them with '= thread_state::created' (the
+		// launch loop of fixed_typemap.hpp), so the stand-by choice of the default-name constructor is made here too.
+		// Only for the plain build without arguments: PPU/SPU/HLE threads (built with their parameters) and objects
+		// restored from a savestate are not affected, and PPU/SPU contexts name each instance (their thread_name is
+		// not a fixed string).
+		if constexpr (sizeof...(Args) == 0)
+		{
+			if constexpr (std::is_constructible_v<std::string_view, decltype(Context::thread_name)>)
+			{
+				if (ps4_service_idle(std::string_view(Context::thread_name)))
+				{
+					// Never started: its body would return at once in this configuration
+					thread::m_ps4_lazy = 1;
+				}
+			}
+
+			if constexpr (ps4_lazy_context<Context>)
+			{
+				if (thread::m_ps4_lazy.load() == 0 && ps4_lazy_fxo_threads_enabled())
+				{
+					// lazy-service-threads.flag (opt-in): started on its first use
+					thread::m_ps4_lazy = 1;
+				}
+			}
+		}
+#endif
 	}
 
 	// Normal forwarding constructor
@@ -823,11 +861,16 @@ public:
 	{
 		if (s == thread_state::created)
 		{
+#ifdef RPCS3_PS4
+			// A stand-by service (idle, or lazy with lazy-service-threads.flag) stays stand-by: ps4_start_lazy() and
+			// push() start it on its first use. One that such a use already started is running and needs nothing.
+			if (thread::m_ps4_lazy.load() != 0 || thread::m_thread.load() != 0)
+			{
+				return *this;
+			}
+#endif
 			// Run thread
 			ensure(operator thread_state() == thread_state::finished);
-#ifdef RPCS3_PS4
-			thread::m_ps4_lazy = 0;
-#endif
 			thread::start();
 			return *this;
 		}
@@ -1216,6 +1259,27 @@ ps4_thread_load ps4_thread_load_now() noexcept;
 // 0.39: true once a thread create was refused by the console in this process (test refusals excluded); 'out' = the
 // load right after that first refusal.
 bool ps4_thread_first_refusal(ps4_thread_load& out) noexcept;
+
+// 0.40: thread census for startup.log: who holds the slots the console's cap counts: guest threads (PPU/SPU), the other
+// threads of the emulator registry, threads outside the registry (Mesa, audio, libraries) and threads that exited and
+// were not joined yet, with their names. Writes one NUL-terminated line into 'out' (truncated to fit) and returns its
+// length (0 when size is 0). Allocation-free, lock-free (registry pins and relaxed loads) and formatted without stdio,
+// so the fatal record of a crash signal can print it; any thread.
+std::size_t ps4_thread_census_line(char* out, std::size_t size) noexcept;
+
+// 0.40: true once after ps4_census_request() was called (the flag is cleared). The frontend's 1 s pass polls it and
+// prints the census, so the creating or refusing thread never formats or writes the line itself.
+bool ps4_census_due() noexcept;
+void ps4_census_request() noexcept; // thread level changes, refused creates; any thread, signal-safe
+
+// 0.40: a guest thread create that ends in CELL_EAGAIN because the console refused its host thread, or a refused
+// must-succeed start ('what' names the kind, 'name' the thread): the running title's next boots use the lighter thread
+// budget (adapt key threads=low) and its safe-mode level steps up (fail=threads, util/ps4_safe_mode.hpp). The notes are
+// allocation-free and lock-free (adapt::note: once per key and session); one startup.log line per session through
+// ps4_startup_checkpoint (not for signal handlers). The first call of a session writes the adapt file, so a create that
+// returns to the game calls it without a lock that other creates need; a refused must-succeed start calls it just
+// before its fatal.
+void ps4_note_guest_thread_refused(const char* what, std::string_view name) noexcept;
 
 // 0.39: first word of the system software version ("13.02"), "" when libkernel does not export the query. Read once.
 const char* ps4_firmware_key() noexcept;

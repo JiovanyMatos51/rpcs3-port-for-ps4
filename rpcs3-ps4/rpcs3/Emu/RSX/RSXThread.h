@@ -461,6 +461,16 @@ namespace rsx
 		// Set by a dead FIFO with /data/rpcs3/dead-fifo-stop.flag: the game stop was requested and run_FIFO fetches
 		// nothing more (RSX thread).
 		bool m_ps4_fifo_dead = false;
+
+		// The "Frame skip is not compatible" error was logged for this boot (RSX thread).
+		bool m_ps4_frame_skip_told = false;
+
+		// Flip-time Resolution Scale sync (VKPresent.cpp, GLPresent.cpp): true when the configured scale differs from
+		// the running one but must not be applied now, because MSAA is on (a live change with MSAA surfaces crashed
+		// the RSX). The setting keeps the new value for Salvar and the next boot; one line and one toast per boot.
+		// RSX thread.
+		bool ps4_scale_change_deferred(const surface_scaling_config_t& wanted);
+		bool m_ps4_scale_deferred_told = false;
 #endif
 
 		/**
@@ -600,16 +610,11 @@ namespace rsx
 	// 0x48-0x5f, the last ZCULL queue summary and the report ring (ps4_report_ring_text).
 	std::string ps4_label_ring_text();
 
-	// True by default: the RSX thread reads and writes semaphore labels through the unprotected (sudo) view, so a label
-	// access never faults on a page ZCULL keeps without access for deferred reports (16 KiB pages hold the labels and
-	// the first report slots). False with /data/rpcs3/rsx-label-direct.flag (guest view, read at RSX start).
+	// True with the rsx_label_sudo feature (rsx-label-sudo.flag or features.txt; read at RSX start): the RSX thread reads
+	// and writes semaphore labels through the unprotected (sudo) view, so a label access never faults on a page ZCULL
+	// keeps without access for deferred reports (16 KiB pages hold the labels and the first report slots). False by
+	// default: the label sites run the 0.38 guest-view expressions unchanged.
 	bool ps4_rsx_label_sudo() noexcept;
-
-	template <typename T>
-	inline to_be_t<T>* ps4_label_ptr(u32 addr) noexcept
-	{
-		return ps4_rsx_label_sudo() ? vm::get_super_ptr<T>(addr) : vm::_ptr<T>(addr);
-	}
 
 	// sys_rsx.cpp: the last 8 guest sys_rsx_* calls with their arguments (display flip/queue/event attribute packages
 	// only counted) and the SDK version the process reports. Safe from any thread.
@@ -618,6 +623,14 @@ namespace rsx
 	// FIFO error and Dead FIFO records: get/put, whether the IO offset at get is mapped, the IO map (mapped MiB, IO 0,
 	// first 4 entries), the context's system mode and ps4_sys_rsx_ring_text(). RSX thread.
 	std::string ps4_fifo_state_text();
+
+	// The FIFO puller read a PUT value (RSXFIFO.cpp, at each command cache refill): a change is kept in a 16-entry
+	// ring with the GET it was read at and the time. Two loads and a compare otherwise. RSX thread.
+	void ps4_note_put(u32 put, u32 get) noexcept;
+
+	// The first FIFO desync and the Dead FIFO of a boot: the PUT ring (oldest first) and the 64 command words around
+	// GET as the guest memory holds them now, in a few log lines ('what' names the event). RSX thread.
+	void ps4_dump_fifo_desync(const char* what, u32 get);
 
 	// Last 32 ZCULL report operations (NV4097 GET_REPORT and CLEAR_REPORT_VALUE) with their queue state and the
 	// time each queued report reached memory. Written by the RSX thread only (plain stores, no lock).

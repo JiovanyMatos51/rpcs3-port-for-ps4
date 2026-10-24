@@ -11,7 +11,11 @@
 #include "Emu/Cell/timers.hpp"
 #include "ps4_fatal.h"
 #include "ps4_launcher.h"
+#include "vkutils/memory.h"
 #include "util/ps4_gpu_health.hpp"
+
+#include <atomic>
+#include <new>
 #endif
 
 namespace vk
@@ -32,6 +36,15 @@ namespace vk
 			ps4_startup_checkpoint(fmt::format("PS4 GPU: occlusion query %u unavailable after 2 s; it counts as visible "
 				"(later ones are counted as 'occlusion query timeouts' in the PS4 VRAM line)", index).c_str());
 		}
+
+		// The occlusion query pool could not be created after a memory reclaim and one retry: no pool for the rest of
+		// this renderer, every occlusion query answers visible (VKDraw.cpp). One manager per renderer, RSX thread.
+		std::atomic<bool> s_ps4_no_query_pool{false};
+	}
+
+	bool ps4_query_pool_unavailable() noexcept
+	{
+		return s_ps4_no_query_pool.load(std::memory_order_relaxed);
 	}
 #endif
 
@@ -88,6 +101,11 @@ namespace vk
 		{
 			m_available_slots.push_back(i);
 		}
+
+#ifdef RPCS3_PS4
+		// A new renderer tries again
+		s_ps4_no_query_pool.store(false, std::memory_order_relaxed);
+#endif
 	}
 
 	query_pool_manager::~query_pool_manager()
@@ -102,6 +120,66 @@ namespace vk
 	void query_pool_manager::allocate_new_pool(vk::command_buffer& cmd)
 	{
 		ensure(!m_current_query_pool);
+#ifdef RPCS3_PS4
+		if (s_ps4_no_query_pool.load(std::memory_order_relaxed))
+		{
+			return;
+		}
+
+		{
+			std::lock_guard lock(m_query_pool_cache_lock);
+
+			if (m_query_pool_cache.size() > 0)
+			{
+				m_current_query_pool = std::move(m_query_pool_cache.front());
+				m_query_pool_cache.pop_front();
+			}
+		}
+
+		if (!m_current_query_pool)
+		{
+			// Created outside the cache lock: the reclaim below may release pools into the cache.
+			const u32 count = ::size32(query_slot_status);
+			m_current_query_pool = std::make_unique<query_pool>(*owner, query_type, count);
+
+			if (!m_current_query_pool->ps4_created())
+			{
+				const VkResult first = m_current_query_pool->m_ps4_result;
+				m_current_query_pool.reset();
+
+				// The reclaim of a failed required allocation: on the RSX thread the deep reclaim (two hard syncs that
+				// keep this command buffer), elsewhere a deferred trim; host memory through the heap's new_handler.
+				if (first == VK_ERROR_OUT_OF_HOST_MEMORY)
+				{
+					if (const std::new_handler handler = std::get_new_handler())
+					{
+						handler();
+					}
+				}
+				else if (!vk::ps4_vram_deep_reclaim("occlusion query pool creation"))
+				{
+					vk::ps4_vram_relieve_deferred(rsx::problem_severity::fatal);
+				}
+
+				m_current_query_pool = std::make_unique<query_pool>(*owner, query_type, count);
+
+				if (!m_current_query_pool->ps4_created())
+				{
+					const VkResult second = m_current_query_pool->m_ps4_result;
+					m_current_query_pool.reset();
+					s_ps4_no_query_pool.store(true, std::memory_order_relaxed);
+
+					const std::string line = fmt::format("PS4 GPU: query pool creation failed after reclaim (VkResult %d, then %d); occlusion queries answer visible for this session",
+						static_cast<int>(first), static_cast<int>(second));
+					rsx_log.error("%s", line);
+					ps4_startup_checkpoint(line.c_str());
+					return;
+				}
+
+				rsx_log.warning("PS4 GPU: query pool created after a memory reclaim (the first creation returned VkResult %d)", static_cast<int>(first));
+			}
+		}
+#else
 		{
 			std::lock_guard lock(m_query_pool_cache_lock); // If we're creating a new pool, we probably have items in the cache.
 
@@ -116,6 +194,7 @@ namespace vk
 				m_current_query_pool = std::make_unique<query_pool>(*owner, query_type, count);
 			}
 		}
+#endif
 
 		// From spec: "After query pool creation, each query must be reset before it is used."
 		vkCmdResetQueryPool(cmd, *m_current_query_pool.get(), 0, m_current_query_pool->size());
@@ -223,6 +302,13 @@ namespace vk
 				}
 				ps4_last_us = now;
 
+				// A wait of a second or more: the liveness scan runs from here too (a hung submission is confirmed
+				// while the RSX thread waits on it).
+				if (now - ps4_start_us >= 1'000'000)
+				{
+					vk::ps4_gpu_liveness_in_wait();
+				}
+
 				if (now - ps4_start_us >= 2'000'000)
 				{
 					ps4_note_query_unavailable(index, spins);
@@ -270,6 +356,12 @@ namespace vk
 
 	u32 query_pool_manager::allocate_query(vk::command_buffer& cmd)
 	{
+#ifdef RPCS3_PS4
+		if (s_ps4_no_query_pool.load(std::memory_order_relaxed))
+		{
+			return ~0u;
+		}
+#endif
 		if (!m_pool_lifetime_counter)
 		{
 			// Pool is exhaused, create a new one
@@ -284,6 +376,13 @@ namespace vk
 			}
 
 			reallocate_pool(cmd);
+#ifdef RPCS3_PS4
+			if (!m_current_query_pool)
+			{
+				// The new pool could not be created (allocate_new_pool): no slot without a pool
+				return ~0u;
+			}
+#endif
 		}
 
 		if (!m_available_slots.empty())

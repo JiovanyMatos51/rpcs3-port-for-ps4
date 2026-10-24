@@ -572,6 +572,178 @@ void test_gate()
     }
 }
 
+// The drive without a network (GoldHEN's FTP server does not listen without an IP address) and the offline grace of
+// the feature row disc_lock_grace (off unless the player turns it on): when it opens a game, every way it does not, its
+// screens and log lines, and the sightings it reads (<registry_dir><TITLE_ID>.seen, written at most once an hour)
+void test_offline_grace()
+{
+    const dl::record r = fifa();
+    const char* build = "2026-10-23";
+    const std::int64_t day = 86400;
+    const std::int64_t now = 1'792'713'600 + 12 * 3600; // 2026-10-23 12:00 UTC
+    const std::int64_t t = 5'000'000;
+    ds::disc_status offline = drive(ds::disc_state::no_server, t + 20);
+    offline.net_link = 1;
+    ds::disc_status ftp_off = offline;
+    ftp_off.net_link = ds::netctl_ip_obtained;
+    const auto decide = [&](const ds::disc_status& s, std::int64_t seen, std::int64_t clock, bool on)
+    {
+        return dl::classify_offline(dl::classify(r, s, t + 100), s, seen, clock, build, on);
+    };
+
+    // Seen 3 days ago, no network: opens, 3 days
+    dl::offline_decision d = decide(offline, now - 3 * day, now, true);
+    CHECK(d.verdict == dl::offline_verdict::grace && d.offline && d.days == 3);
+    CHECK(dl::offline_log_line(r, d) == "BLES01876 'FIFA 14': unlocked offline (drive not visible: no network; disc seen 3 day(s) ago, grace 7 days)");
+    CHECK(dl::grace_text(d) == "O leitor não pôde ser conferido, mas o disco deste jogo foi visto há 3 dia(s): o jogo abre (até 7 dias sem conferir).");
+    // A drive that answers never opens it: no disc, not a PS3 disc, another disc
+    for (const ds::disc_status& s : {drive(ds::disc_state::no_disc, t + 20), drive(ds::disc_state::not_ps3, t + 20), disc("BLUS30443", "Demon's Souls", 1, 2, t + 20)})
+    {
+        d = decide(s, now - 3 * day, now, true);
+        CHECK(d.verdict == dl::offline_verdict::locked && !d.offline && d.why.empty() && dl::grace_text(d).empty());
+    }
+    // The FTP server switched off on a console with a network, or the network state unknown: no grace
+    CHECK(decide(ftp_off, now - day, now, true).verdict == dl::offline_verdict::locked && !decide(ftp_off, now - day, now, true).offline);
+    CHECK(decide(drive(ds::disc_state::no_server, t + 20), now - day, now, true).verdict == dl::offline_verdict::locked);
+    // Up to 7 days exactly; 8 days: expired
+    CHECK(decide(offline, now - 7 * day, now, true).verdict == dl::offline_verdict::grace);
+    d = decide(offline, now - 8 * day, now, true);
+    CHECK(d.verdict == dl::offline_verdict::grace_expired && d.days == 8 && dl::grace_text(d).empty());
+    CHECK(dl::offline_log_line(r, d) == "BLES01876 'FIFA 14': locked (drive not visible: no network; disc seen 8 day(s) ago, grace 7 days: expired)");
+    // A clock earlier than the sighting (moved back or reset), before the build, unknown: no grace
+    d = decide(offline, now + 3600, now, true);
+    CHECK(d.verdict == dl::offline_verdict::locked && d.offline && d.why.find("earlier than the last sighting") != std::string::npos);
+    d = decide(offline, 1'420'000'000, 1'420'070'400, true);
+    CHECK(d.verdict == dl::offline_verdict::locked && d.why == "console clock 2015-01-01 cannot be trusted");
+    CHECK(decide(offline, now - day, -1, true).verdict == dl::offline_verdict::locked);
+    // No sighting on record; the grace off (the default, the strict lock of 0.39)
+    d = decide(offline, -1, now, true);
+    CHECK(d.verdict == dl::offline_verdict::locked && d.why == "no sighting of its disc on record");
+    d = decide(offline, now - day, now, false);
+    CHECK(d.verdict == dl::offline_verdict::locked && d.offline && dl::offline_log_line(r, d) == "BLES01876 'FIFA 14': locked (drive not visible: no network; offline grace off)");
+    // A status too old (or none counted) whose last answer was "no FTP server" without a network counts too
+    CHECK(dl::classify(r, offline, t + 300'000) == dl::match::stale && dl::unseen_offline(dl::match::stale, offline));
+    CHECK(dl::classify_offline(dl::match::stale, offline, now - day, now, build, true).verdict == dl::offline_verdict::grace);
+    CHECK(!dl::unseen_offline(dl::match::stale, drive(ds::disc_state::no_disc, t)) && !dl::unseen_offline(dl::match::exact, offline));
+    // Log lines of the rows and the in-game watch name the cause
+    CHECK(dl::row_log_line(r, dl::match::no_server, offline) == "BLES01876 'FIFA 14': locked (drive not visible: no network)");
+    CHECK(dl::row_log_line(r, dl::match::no_server, ftp_off) == "BLES01876 'FIFA 14': locked (FTP server off)");
+    CHECK(std::string_view(dl::row_hint(offline)) == "Sem rede: o FTP do GoldHEN não está respondendo, então o app não vê o leitor.");
+    CHECK(std::string_view(dl::row_hint(ftp_off)) == dl::row_hint() && std::string_view(dl::row_hint(fifa_disc(t))) == dl::row_hint());
+    CHECK(std::string_view(dl::row_hint(offline)).size() <= 116);
+
+    // X with the grace on: the grace text on the "Verificando" screen, the boot 2 s later
+    {
+        dl::gate_config cfg;
+        cfg.offline_grace = true;
+        cfg.seen_unix = now - 2 * day;
+        cfg.clock_unix = now;
+        cfg.build_date = build;
+        dl::gate g(r, "f.iso", t, cfg);
+        CHECK(g.update(offline, t + 100, false, false) == dl::step::verifying);
+        CHECK(g.take_log() == "'f.iso': BLES01876 'FIFA 14': unlocked offline (drive not visible: no network; disc seen 2 day(s) ago, grace 7 days)");
+        CHECK(g.offline().verdict == dl::offline_verdict::grace && g.grace_note().find("visto há 2 dia(s)") != std::string::npos);
+        CHECK(has_line(g, "Verificando o disco...") && has_line(g, "há 2 dia(s): o jogo abre") && !has_line(g, "Procurando o disco"));
+        CHECK(g.update(offline, t + 2099, false, false) == dl::step::verifying && g.take_log().empty());
+        CHECK(g.update(offline, t + 2100, false, false) == dl::step::boot);
+        // The network back meanwhile with the drive answering "no disc": the normal rule
+        dl::gate h(r, "f.iso", t, cfg);
+        CHECK(h.update(offline, t + 100, false, false) == dl::step::verifying);
+        CHECK(h.update(drive(ds::disc_state::no_disc, t + 600), t + 700, false, false) == dl::step::missing && h.grace_note().empty());
+        // Expired: the missing screen says so
+        cfg.seen_unix = now - 8 * day;
+        dl::gate e(r, "f.iso", t, cfg);
+        CHECK(e.update(offline, t + 100, false, false) == dl::step::missing);
+        CHECK(has_line(e, "Sem rede: o FTP do GoldHEN") && has_line(e, "não é conferido há mais de 7") && !has_line(e, "Server Settings"));
+        CHECK(e.take_log() == "'f.iso' not booted: drive not visible: no network (state no FTP server); disc seen 8 day(s) ago, grace 7 days: expired");
+    }
+    // The grace off (default): the missing screen says the network is missing, not the FTP setting
+    {
+        dl::gate g(r, "f.iso", t);
+        CHECK(g.update(offline, t + 100, false, false) == dl::step::missing);
+        CHECK(has_line(g, "Sem rede: o FTP do GoldHEN") && has_line(g, "Conecte o PS4 a qualquer rede") && !has_line(g, "Server Settings"));
+        CHECK(g.take_log() == "'f.iso' not booted: drive not visible: no network (state no FTP server); offline grace off");
+        // The FTP server off with a network: the 0.39 texts
+        dl::gate f(r, "f.iso", t);
+        CHECK(f.update(ftp_off, t + 100, false, false) == dl::step::missing && has_line(f, "Configurações > GoldHEN > Server Settings") && !has_line(f, "Sem rede"));
+    }
+    // Every offline screen fits, in every language
+    for (const std::uint8_t language : {0, 1, 2, 3})
+    {
+        utils::ps4::i18n::detail::g_lang.store(language);
+        for (const std::int64_t seen : {now - 2 * day, now - 9 * day, std::int64_t{-1}})
+        {
+            dl::gate_config cfg;
+            cfg.offline_grace = true;
+            cfg.seen_unix = seen;
+            cfg.clock_unix = now;
+            cfg.build_date = build;
+            dl::gate g(r, "x.iso", t, cfg);
+            g.update(offline, t + 100, false, false);
+            CHECK(!g.reason_lines().empty() || g.current() == dl::step::verifying);
+            // The lines these screens add are wrapped at 70 bytes; every line stays on the screen
+            std::vector<std::string> added = g.reason_lines();
+            for (std::string& line : dl::detail::wrap(g.grace_note(), 70)) added.push_back(std::move(line));
+            for (const std::string& line : added) CHECK(line.size() <= 70 && valid_utf8(line));
+            for (const auto& line : g.lines())
+            {
+                if (!valid_utf8(line.text) || line.y > 690) std::fprintf(stderr, "offline screen line (lang %d, %d, %zu bytes): %s\n", language, line.y, line.text.size(), line.text.c_str());
+                CHECK(valid_utf8(line.text) && line.text.find('\n') == std::string::npos && line.y > 0 && line.y <= 690);
+            }
+        }
+    }
+    utils::ps4::i18n::detail::g_lang.store(0);
+
+    // The sightings: written once, again only after an hour; never under an implausible clock; a refused write not
+    // tried again within the hour; read once per title
+    std::map<std::string, std::string> files;
+    int writes = 0;
+    bool refuse = false;
+    const auto reader = [&](const std::string& path) -> std::optional<std::string>
+    {
+        const auto it = files.find(path);
+        if (it == files.end()) return std::nullopt;
+        return it->second;
+    };
+    const auto writer = [&](const std::string& path, const std::string& text)
+    {
+        ++writes;
+        if (refuse) return false;
+        files[path] = text;
+        return true;
+    };
+    const std::string seen_path = std::string(dl::registry_dir) + "BLES01876.seen";
+    dl::seen_book book(reader, writer);
+    CHECK(book.seen("BLES01876") == -1);
+    CHECK(book.note("BLES01876", now, build) && writes == 1 && files[seen_path] == std::to_string(now) + "\n");
+    CHECK(!book.note("BLES01876", now + 3599, build) && writes == 1);
+    CHECK(book.note("BLES01876", now + 3600, build) && writes == 2 && book.seen("BLES01876") == now + 3600);
+    CHECK(book.note("bles-01876", now - 100, build) && writes == 3 && book.seen("BLES01876") == now - 100); // the clock set right again
+    CHECK(!book.note("BLES01876", 1'420'070'400, build) && !book.note("BLES01876", -1, build) && writes == 3);
+    CHECK(book.writes() == 3);
+    dl::seen_book again(reader, writer);
+    CHECK(again.seen("BLES01876") == now - 100);
+    refuse = true;
+    CHECK(!again.note("BLUS30443", now, build) && writes == 4);
+    CHECK(!again.note("BLUS30443", now + 60, build) && writes == 4);
+    refuse = false;
+    CHECK(again.note("BLUS30443", now + 3600, build) && writes == 5 && again.seen("BLUS30443") == now + 3600);
+    CHECK(!again.note("../../x", now, build) && again.seen("../x") == -1 && writes == 5);
+    files[std::string(dl::registry_dir) + "BLJM60000.seen"] = "garbage";
+    CHECK(again.seen("BLJM60000") == -1);
+    CHECK(dl::parse_seen(" 1792713600\r\n") == 1'792'713'600 && dl::parse_seen("-5") == -1 && dl::parse_seen("") == -1 && dl::parse_seen("1234567890123") == -1);
+    CHECK(dl::seen_text(12) == "12\n" && dl::seen_file_name("BLES01876") == "BLES01876.seen");
+    // The registry reads only the records: the sightings and their temporary files are not records
+    const dl::list_fn list = [](const std::string&, std::vector<std::string>& names, int&)
+    {
+        names = {"BLES01876.txt", "BLES01876.seen", "BLES01876.seen.tmp", "BLUS30443.seen"};
+        return true;
+    };
+    const dl::read_fn read = [](const std::string&, std::size_t, int&) -> std::optional<std::string> { return dl::to_text(fifa()); };
+    const dl::registry reg = dl::load(list, read);
+    CHECK(reg.by_id.size() == 1 && reg.by_id.contains("BLES01876") && reg.unbound.empty());
+}
+
 void test_texts()
 {
     const std::int64_t t = 1'000'000;
@@ -1267,6 +1439,7 @@ int main()
     test_registry();
     test_classify();
     test_gate();
+    test_offline_grace();
     test_texts();
     test_token_and_cadence();
     test_padlock();

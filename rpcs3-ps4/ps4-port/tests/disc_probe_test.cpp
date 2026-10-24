@@ -509,12 +509,312 @@ void test_disc_image()
     assert(!di::iso_disc_sfb_missing("DG", true, std::string_view(".SFB\0\0\x01\0", 8)) && !di::iso_disc_sfb_missing("HG", false, {}) && !di::iso_disc_sfb_missing("", false, {}));
 }
 
+// A tree shaped like the ISO loader's (Loader/ISO.h iso_fs_node), with the "." and ".." entries a folder record holds
+struct tnode
+{
+    struct
+    {
+        std::string name;
+        bool is_directory = false;
+    } metadata;
+    std::vector<std::unique_ptr<tnode>> children;
+};
+
+tnode* add(tnode& parent, std::string name, bool directory)
+{
+    parent.children.push_back(std::make_unique<tnode>());
+    tnode* node = parent.children.back().get();
+    node->metadata.name = std::move(name);
+    node->metadata.is_directory = directory;
+    if (directory)
+    {
+        add(*node, ".", false)->metadata.is_directory = true;
+        add(*node, "..", false)->metadata.is_directory = true;
+    }
+    return node;
+}
+
+tnode* add_path(tnode& root, std::string_view path, bool directory)
+{
+    tnode* at = &root;
+    while (true)
+    {
+        const std::size_t slash = path.find('/');
+        const std::string part(path.substr(0, slash));
+        const bool last = slash == std::string_view::npos;
+        tnode* next = nullptr;
+        for (const auto& c : at->children)
+            if (c->metadata.name == part) next = c.get();
+        if (!next) next = add(*at, part, last ? directory : true);
+        if (last) return next;
+        at = next;
+        path.remove_prefix(slash + 1);
+    }
+}
+
+tnode image_root()
+{
+    tnode root;
+    root.metadata.name = ".";
+    root.metadata.is_directory = true;
+    add(root, ".", false)->metadata.is_directory = true;
+    add(root, "..", false)->metadata.is_directory = true;
+    return root;
+}
+
+bool has(const tnode& root, std::string_view path)
+{
+    const tnode* at = &root;
+    while (!path.empty())
+    {
+        const std::size_t slash = path.find('/');
+        const std::string_view part = path.substr(0, slash);
+        const tnode* next = nullptr;
+        for (const auto& c : at->children)
+            if (c->metadata.name == part) next = c.get();
+        if (!next) return false;
+        at = next;
+        path = slash == std::string_view::npos ? std::string_view{} : path.substr(slash + 1);
+    }
+    return true;
+}
+
+// Images without a PS3 disc header: the wide probe (PS3_GAME without case, one wrapper folder, PSN / PS2 / PSP), the
+// re-root, the system names and the refusal listing
+void test_header_less()
+{
+    namespace tree = probe_ns::iso_tree;
+    using probe_ns::iso_refusal;
+
+    static_assert(probe_ns::same_name("PS3_GAME", "ps3_game") && !probe_ns::same_name("PS3_GAME", "PS3_GAMES"));
+
+    // A game folder at the root (the 0.39 case; the loader does not call the probe for it): nothing changes
+    {
+        tnode root = image_root();
+        add_path(root, "PS3_GAME/PARAM.SFO", false);
+        add_path(root, "PS3_GAME/USRDIR/EBOOT.BIN", false);
+        const auto layout = tree::probe_header_less(root, true);
+        assert(layout.refusal == iso_refusal::none && layout.wrapper.empty() && layout.renamed.empty() && layout.candidates == 0);
+        assert(root.metadata.name == "." && has(root, "PS3_GAME/USRDIR/EBOOT.BIN"));
+    }
+
+    // One wrapper folder (an ISO made from the folder holding the game): found, and with apply it becomes the root
+    {
+        tnode root = image_root();
+        add_path(root, "README.TXT", false);
+        add_path(root, "Heavenly Sword [BCUS98132]/PS3_DISC.SFB", false);
+        add_path(root, "Heavenly Sword [BCUS98132]/PS3_GAME/PARAM.SFO", false);
+        add_path(root, "Heavenly Sword [BCUS98132]/PS3_GAME/USRDIR/EBOOT.BIN", false);
+        const auto look = tree::probe_header_less(root, false);
+        assert(look.refusal == iso_refusal::none && look.wrapper == "Heavenly Sword [BCUS98132]" && look.candidates == 1);
+        assert(root.metadata.name == "." && has(root, "README.TXT")); // not applied: the tree is untouched
+        const auto applied = tree::probe_header_less(root, true);
+        assert(applied.refusal == iso_refusal::none && applied.wrapper == "Heavenly Sword [BCUS98132]" && applied.renamed.empty());
+        assert(root.metadata.name == "Heavenly Sword [BCUS98132]" && root.metadata.is_directory);
+        assert(has(root, "PS3_DISC.SFB") && has(root, "PS3_GAME/PARAM.SFO") && has(root, "PS3_GAME/USRDIR/EBOOT.BIN"));
+        assert(!has(root, "README.TXT") && has(root, ".") && has(root, ".."));
+        // the re-rooted tree is a plain game root now
+        assert(tree::holds_ps3_game(root) && tree::child(root, "PS3_GAME", true)->metadata.name == "PS3_GAME");
+    }
+
+    // Lower-case names (Joliet names of a tool): found without case, the system names get their disc case back,
+    // the game's own files keep theirs
+    {
+        tnode root = image_root();
+        add_path(root, "ps3_disc.sfb", false);
+        add_path(root, "ps3_game/param.sfo", false);
+        add_path(root, "ps3_game/icon0.png", false);
+        add_path(root, "ps3_game/usrdir/eboot.bin", false);
+        add_path(root, "ps3_game/usrdir/data/level1.dat", false);
+        add_path(root, "ps3_game/licdir/lic.dat", false);
+        const auto layout = tree::probe_header_less(root, true);
+        assert(layout.refusal == iso_refusal::none && layout.wrapper.empty());
+        assert(has(root, "PS3_DISC.SFB") && has(root, "PS3_GAME/PARAM.SFO") && has(root, "PS3_GAME/ICON0.PNG"));
+        assert(has(root, "PS3_GAME/USRDIR/EBOOT.BIN") && has(root, "PS3_GAME/LICDIR/LIC.DAT"));
+        assert(has(root, "PS3_GAME/USRDIR/data/level1.dat") && !has(root, "PS3_GAME/USRDIR/DATA"));
+        assert(layout.renamed.size() == 8); // PS3_GAME, PS3_DISC.SFB, PARAM.SFO, USRDIR, LICDIR, ICON0.PNG, EBOOT.BIN, LIC.DAT
+        assert(layout.renamed[0] == "ps3_game -> PS3_GAME" && layout.renamed[1] == "ps3_disc.sfb -> PS3_DISC.SFB");
+        // a second pass has nothing left to rename
+        assert(tree::probe_header_less(root, true).renamed.empty());
+    }
+
+    // Two variants of one system name: neither is renamed (which one the disc had is not known); an exact name wins
+    {
+        tnode root = image_root();
+        add_path(root, "PS3_GAME/PARAM.SFO", false);
+        add_path(root, "PS3_GAME/usrdir/EBOOT.BIN", false);
+        add_path(root, "PS3_GAME/Usrdir/EBOOT.BIN", false);
+        add_path(root, "PS3_GAME/ICON0.PNG", false);
+        add_path(root, "PS3_GAME/icon0.png", false);
+        const auto layout = tree::probe_header_less(root, true);
+        assert(layout.refusal == iso_refusal::none && layout.renamed.empty());
+        assert(has(root, "PS3_GAME/usrdir") && has(root, "PS3_GAME/Usrdir") && has(root, "PS3_GAME/icon0.png"));
+        // a file never stands in for a folder (or the reverse)
+        tnode kinds = image_root();
+        add_path(kinds, "PS3_GAME/PARAM.SFO", false);
+        add_path(kinds, "PS3_GAME/usrdir", false);
+        assert(tree::probe_header_less(kinds, true).renamed.empty() && has(kinds, "PS3_GAME/usrdir"));
+    }
+
+    // Two wrapper folders that both hold a game: refused, the tree untouched
+    {
+        tnode root = image_root();
+        add_path(root, "Game A/PS3_GAME/PARAM.SFO", false);
+        add_path(root, "Game B/PS3_GAME/PARAM.SFO", false);
+        const auto layout = tree::probe_header_less(root, true);
+        assert(layout.refusal == iso_refusal::unknown && layout.candidates == 2 && root.metadata.name == ".");
+        assert(has(root, "Game A") && has(root, "Game B"));
+    }
+
+    // PS3_GAME without PARAM.SFO, or PS3_GAME as a file: not a game
+    {
+        tnode root = image_root();
+        add_path(root, "PS3_GAME/USRDIR/EBOOT.BIN", false);
+        assert(tree::probe_header_less(root, true).refusal == iso_refusal::unknown);
+        tnode file = image_root();
+        add_path(file, "PS3_GAME", false);
+        assert(tree::probe_header_less(file, true).refusal == iso_refusal::unknown);
+    }
+
+    // The game deeper than the wrapper limit is not looked for
+    {
+        tnode root = image_root();
+        for (std::size_t i = 0; i < tree::max_wrappers; ++i) add_path(root, "empty" + std::to_string(100 + i) + "/x.bin", false);
+        add_path(root, "zz/PS3_GAME/PARAM.SFO", false);
+        assert(tree::probe_header_less(root, true).refusal == iso_refusal::unknown && root.metadata.name == ".");
+        tnode near = image_root();
+        for (std::size_t i = 0; i + 1 < tree::max_wrappers; ++i) add_path(near, "empty" + std::to_string(100 + i) + "/x.bin", false);
+        add_path(near, "zz/PS3_GAME/PARAM.SFO", false);
+        assert(tree::probe_header_less(near, true).refusal == iso_refusal::none && near.metadata.name == "zz");
+    }
+
+    // PSN layout (Fat Princess as an ISO), at the root and in the only top folder
+    {
+        tnode root = image_root();
+        add_path(root, "PARAM.SFO", false);
+        add_path(root, "ICON0.PNG", false);
+        add_path(root, "USRDIR/EBOOT.BIN", false);
+        const auto layout = tree::probe_header_less(root, true);
+        assert(layout.refusal == iso_refusal::psn_layout && layout.wrapper.empty() && root.metadata.name == ".");
+        tnode wrapped = image_root();
+        add_path(wrapped, "NPUA80139/param.sfo", false);
+        add_path(wrapped, "NPUA80139/usrdir/EBOOT.BIN", false);
+        const auto inner = tree::probe_header_less(wrapped, true);
+        assert(inner.refusal == iso_refusal::psn_layout && inner.wrapper == "NPUA80139" && wrapped.metadata.name == ".");
+        // two top folders: the PSN check only looks into a single one
+        add_path(wrapped, "other/x.bin", false);
+        assert(tree::probe_header_less(wrapped, true).refusal == iso_refusal::unknown);
+    }
+
+    // PS2 and PSP discs
+    {
+        tnode ps2 = image_root();
+        add_path(ps2, "SYSTEM.CNF", false);
+        add_path(ps2, "SCUS_973.28", false);
+        assert(tree::probe_header_less(ps2, true).refusal == iso_refusal::ps2);
+        tnode ps2_lower = image_root();
+        add_path(ps2_lower, "system.cnf", false);
+        assert(tree::probe_header_less(ps2_lower, true).refusal == iso_refusal::ps2);
+        tnode psp = image_root();
+        add_path(psp, "UMD_DATA.BIN", false);
+        add_path(psp, "PSP_GAME/PARAM.SFO", false);
+        assert(tree::probe_header_less(psp, true).refusal == iso_refusal::psp);
+        tnode psp_folder = image_root();
+        add_path(psp_folder, "PSP_GAME/SYSDIR/EBOOT.BIN", false);
+        assert(tree::probe_header_less(psp_folder, true).refusal == iso_refusal::psp);
+        tnode empty = image_root();
+        assert(tree::probe_header_less(empty, true).refusal == iso_refusal::unknown);
+    }
+
+    // The refusal listing: at most 16 names per folder, folders with '/', the single top folder, printable names
+    {
+        tnode root = image_root();
+        assert(tree::root_listing(root) == "root 0 names");
+        add_path(root, "README.TXT", false);
+        assert(tree::root_listing(root) == "root 1 name: README.TXT");
+        add_path(root, "Dante's Inferno/PS3_GAME/USRDIR/EBOOT.BIN", false);
+        add_path(root, "Dante's Inferno/PS3_DISC.SFB", false);
+        assert(tree::root_listing(root) == "root 2 names: README.TXT, Dante's Inferno/; top folder 'Dante's Inferno/' 2 names: PS3_GAME/, PS3_DISC.SFB");
+        tnode many = image_root();
+        for (int i = 0; i < 20; ++i) add_path(many, "F" + std::to_string(10 + i), i % 2 == 0);
+        add_path(many, std::string("bad\x01name\xC3\xA9"), false);
+        add_path(many, std::string(100, 'L'), false);
+        const std::string listing = tree::root_listing(many);
+        assert(listing.starts_with("root 22 names: F10/, F11, F12/") && listing.ends_with("F25, ...") && listing.find("; top folder") == std::string::npos);
+        assert(listing.find("F26") == std::string::npos);
+        tnode odd = image_root();
+        add_path(odd, std::string("bad\x01name\xC3\xA9"), false);
+        add_path(odd, std::string(100, 'L'), false);
+        assert(tree::root_listing(odd) == "root 2 names: bad?name??, " + std::string(64, 'L') + "...");
+    }
+
+    // Texts
+    assert(probe_ns::refusal_text(iso_refusal::none) == nullptr && probe_ns::refusal_text(iso_refusal::unknown) == nullptr);
+    namespace i18n = utils::ps4::i18n;
+    assert(std::string_view(probe_ns::refusal_text(iso_refusal::psn_layout)) == i18n::tr(i18n::str::LAU_ISO_JOGO_PSN));
+    assert(std::string_view(probe_ns::refusal_text(iso_refusal::ps2)) == i18n::tr(i18n::str::LAU_ISO_JOGO_PS2));
+    assert(std::string_view(probe_ns::refusal_text(iso_refusal::psp)) == i18n::tr(i18n::str::LAU_ISO_JOGO_PSP));
+    for (const iso_refusal r : {iso_refusal::none, iso_refusal::psn_layout, iso_refusal::ps2, iso_refusal::psp, iso_refusal::unknown})
+        assert(probe_ns::refusal_name(r) && *probe_ns::refusal_name(r));
+}
+
+// The trim order of dev_hdd1/caches: the newest game caches stay, quick rebuilds first, compiled code last
+void test_disk_cache()
+{
+    namespace dc = utils::ps4::disk_cache;
+    constexpr std::uint64_t mb = 1ull << 20;
+
+    static_assert(dc::bytes_to_remove(4096 * mb, 4096 * mb) == 0 && dc::bytes_to_remove(100, 4096 * mb) == 0);
+    // LittleBigPlanet 3 of the logs: 4531.25 MB over a 4096 MB limit, trimmed down to 80 % of the limit
+    static_assert(dc::bytes_to_remove(4531 * mb + mb / 4, 4096 * mb) == 4531 * mb + mb / 4 - 3435973836ull);
+    static_assert(dc::bytes_to_remove(~0ull, ~0ull - 1) > 0);
+    static_assert(dc::kind_of("ppu-T8Uo0F1m-EBOOT.BIN", true) == dc::kind::compiled && dc::kind_of("ppu-x", false) == dc::kind::game_cache);
+    static_assert(dc::kind_of("shaders_cache", true) == dc::kind::rebuilt && dc::kind_of("spu-legacy-v1-tane.dat", false) == dc::kind::rebuilt);
+    static_assert(dc::kind_of("BCUS81138_BCUS81138", true) == dc::kind::game_cache);
+
+    const std::vector<dc::entry> entries = {
+        {".", 999, true},
+        {"..", 999, true},
+        {"BLES00001_A", 100, true},
+        {"BCUS81138_BCUS81138", 500, true}, // the game played last (LittleBigPlanet 3)
+        {"file.tmp", 50, false},
+        {"BLES00002_B", 300, true},
+        {"shaders_cache", 450, true},
+        {"NPUB30002_C", 400, true},
+        {"ppu-abc-EBOOT.BIN", 10, true},
+    };
+    std::vector<std::size_t> kept;
+    const std::vector<std::size_t> order = dc::eviction_order(entries, dc::protected_newest, &kept);
+    // kept: the two newest game caches, newest first; rebuildable and compiled folders are never "kept"
+    assert((kept == std::vector<std::size_t>{3, 7}));
+    // removed in order: the shader cache, then the game caches oldest first (the loose file too), the PPU objects last
+    assert((order == std::vector<std::size_t>{6, 4, 2, 5, 8}));
+    // no protection
+    assert((dc::eviction_order(entries, 0) == std::vector<std::size_t>{6, 4, 2, 5, 7, 3, 8}));
+    // fewer folders than the protection: all kept
+    const std::vector<dc::entry> one = {{"BLUS30443_DS", 5, true}, {"x.bin", 1, false}};
+    std::vector<std::size_t> kept_one;
+    assert((dc::eviction_order(one, 2, &kept_one) == std::vector<std::size_t>{1}) && (kept_one == std::vector<std::size_t>{0}));
+    // ties keep the listing order, for the protection and the order
+    const std::vector<dc::entry> ties = {{"A", 7, true}, {"B", 7, true}, {"C", 7, true}, {"D", 7, true}};
+    std::vector<std::size_t> kept_ties;
+    assert((dc::eviction_order(ties, 2, &kept_ties) == std::vector<std::size_t>{2, 3}) && (kept_ties == std::vector<std::size_t>{0, 1}));
+    assert(dc::eviction_order({}, 2).empty());
+    // the log list
+    assert(dc::names_text({}) == "none" && dc::names_text({"A", "B"}) == "A, B");
+    std::vector<std::string> many;
+    for (int i = 0; i < 10; ++i) many.push_back("T" + std::to_string(i));
+    assert(dc::names_text(many) == "T0, T1, T2, T3, T4, T5, T6, T7 (+2 more)");
+}
+
 int main()
 {
     test_pure();
     test_probe();
     test_run_detached();
     test_disc_image();
+    test_header_less();
+    test_disk_cache();
     std::puts("disc_probe_test: OK");
     return 0;
 }

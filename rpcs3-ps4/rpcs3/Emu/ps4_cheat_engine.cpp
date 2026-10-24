@@ -13,6 +13,7 @@
 #include "Emu/Cell/lv2/sys_prx.h"
 #include "Emu/Cell/lv2/sys_sync.h"
 #include "util/ps4_cheats.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -312,12 +313,28 @@ void boot_apply(std::vector<u32>& applied, const ppu_module<lv2_obj>& main, bool
     reset();
     const std::string serial = Emu.GetTitleID();
     if (!cheats::valid_serial(serial)) return;
+    // 0.40: a player without cheats gets no file written on a boot (0.38 had no cheats at all): the executable record is
+    // kept only once the cheats folder exists (an import or a cheat list made it)
+    const bool folder = fs::is_dir(cheats::folder);
+
+    // 0.40: the feature row live_cheats; at safe-mode level 1 a game boots without its cheats (boot writes and the
+    // tick), so a cheat cannot be what keeps failing
+    if (!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::live_cheats))
+    {
+        if (folder)
+        {
+            const cheats::game_cheats game = cheats::load_game(serial, Emu.GetTitle(), Emu.GetAppVersion());
+            const auto on = std::count_if(game.rows.begin(), game.rows.end(), [](const cheats::row& r) { return r.on; });
+            if (on) ps4_startup_checkpoint(fmt::format("cheats: %u on for %s, none applied in this boot (safe mode)", static_cast<u32>(on), serial).c_str());
+        }
+        return;
+    }
 
     std::vector<cheats::segment> segs;
     for (const ppu_segment& seg : main.segs)
         if (seg.type == 0x1 && seg.size) segs.push_back({seg.addr, static_cast<u32>(std::min<u64>(u64{seg.addr} + seg.size, 0xffffffffu)), (seg.flags & 0x1) != 0});
     const std::string hash = Emu.GetExecutableHash();
-    cheats::write_seen(serial, {hash, Emu.GetAppVersion(), segs});
+    if (folder) cheats::write_seen(serial, {hash, Emu.GetAppVersion(), segs});
 
     auto s = std::make_shared<session>();
     s->game = cheats::load_game(serial, Emu.GetTitle(), Emu.GetAppVersion());
@@ -448,7 +465,8 @@ void boot_apply(std::vector<u32>& applied, const ppu_module<lv2_obj>& main, bool
 
 void tick(u64 now_us) noexcept
 {
-    if (!g_live.load(std::memory_order_relaxed)) return;
+    // 0.40: boot_apply already leaves no live session at safe-mode level 1; the row is read here too (one relaxed load)
+    if (!g_live.load(std::memory_order_relaxed) || !utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::live_cheats)) return;
     const std::shared_ptr<session> s = current();
     if (!s) return;
     if (!Emu.IsRunning() || ps4_in_background())

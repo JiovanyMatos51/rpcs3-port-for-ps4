@@ -238,6 +238,13 @@ constexpr bool l1_serializes_cpu(s64 room, bool slope_rule) noexcept
     return room < static_cast<s64>(cpu_serialize_room) || slope_rule;
 }
 
+// The same decision at the time of use: 'floor' (room below cpu_serialize_room, flexible memory low, or the 0.38 rules)
+// holds in any stage; the slope rule, sampled without regard to the stage, never counts while a compile stage runs.
+constexpr bool cpu_l1_in_stage(bool floor, bool slope_rule_any_stage, bool compile_stage) noexcept
+{
+    return floor || (slope_rule_any_stage && !compile_stage);
+}
+
 // Compile slot classes (util/ps4_memory_governor.hpp compile_slot). The slots held are packed in one word, 10 bits
 // per class, so the class and total checks are one compare-and-swap.
 enum class slot_kind : unsigned char
@@ -301,6 +308,13 @@ constexpr slot_mode slot_mode_v039(int level, bool cpu_l1, bool threads_high, bo
     if ((level == 1 && cpu_l1) || threads_high) return slot_mode::one_per_class;
     if (cool) return slot_mode::two_in_total;
     return slot_mode::parallel;
+}
+
+// 0.38 slot mode (the default rules): every compile shares one slot from memory level 1, at thread level 2 and in
+// "Modo frio"; otherwise no limit.
+constexpr slot_mode slot_mode_v038(int level, bool threads_high, bool cool) noexcept
+{
+    return level > 0 || threads_high || cool ? slot_mode::one_in_total : slot_mode::parallel;
 }
 
 // Only PPU/SPU compiles wait up to 2 s for the level to fall at L2 (0.38: every compile); RSX jobs never do, the RSX

@@ -4,6 +4,12 @@
 #include "vkutils/graphics_pipeline_state.hpp"
 #include "util/fnv_hash.hpp"
 
+#ifdef RPCS3_PS4
+#include <deque>
+#include <memory>
+#include <mutex>
+#endif
+
 namespace vk
 {
 	class render_device;
@@ -41,6 +47,9 @@ namespace vk
 	// previous value. Sets refused that way since boot.
 	bool ps4_set_descriptor_nullable(bool nullable) noexcept;
 	u64 ps4_descriptor_sets_refused() noexcept;
+
+	// get_system_time() for the queue time stamp of pipeline jobs (VKPipelineCompiler.cpp).
+	u64 ps4_pipe_now_us() noexcept;
 
 	namespace glsl
 	{
@@ -184,6 +193,11 @@ namespace vk
 
 			op_flags flags;
 
+#ifdef RPCS3_PS4
+			// When the job was queued (pipeline wait telemetry).
+			u64 ps4_queued_us = ps4_pipe_now_us();
+#endif
+
 			pipe_compiler_job(
 				const vk::pipeline_props& props,
 				VkShaderModule modules[2],
@@ -247,13 +261,24 @@ namespace vk
 		VkPipelineCache m_pipeline_cache = VK_NULL_HANDLE;
 
 #ifdef RPCS3_PS4
-		// 0.39: shader interpreter links (PS4_INTERPRETER_LINK) of every worker, run before the next game pipeline
-		// job of whichever worker is free first; dropped by destroy_pipe_compiler() once the workers are gone.
+		// With the interp_lane feature: shader interpreter links (PS4_INTERPRETER_LINK) of every worker, run before the
+		// next game pipeline job of whichever worker is free first; dropped by destroy_pipe_compiler() once the workers
+		// are gone. Off (default): the links go to m_work_queue and the workers run the 0.38 loop.
 		static lf_queue<pipe_compiler_job> s_ps4_lane;
 
 		// 0.39 (shader-translate-async.flag): translations of new vertex/fragment programs (ProgramStateCache.h), run
 		// by whichever worker is free first, before the interpreter links; dropped by destroy_pipe_compiler().
 		static lf_queue<std::function<void()>> s_ps4_translate;
+
+		// With the pipelines_first feature: the graphics jobs of every worker in one shared queue per kind (game
+		// pipelines, shader interpreter links), taken one job at a time by whichever worker is free: a game pipeline
+		// first, an interpreter link only when no game pipeline is queued and no other worker is linking one. Guarded
+		// by s_ps4_shared_mutex; s_ps4_shared_seq changes after every push and every finished link (worker wake-up).
+		static std::deque<std::unique_ptr<pipe_compiler_job>> s_ps4_shared_game;
+		static std::deque<std::unique_ptr<pipe_compiler_job>> s_ps4_shared_links;
+		static std::mutex s_ps4_shared_mutex;
+		static u32 s_ps4_shared_links_running;
+		static atomic_t<u32> s_ps4_shared_seq;
 
 		// Runs one job under the compile admission; false when it was dropped because the worker is being destroyed.
 		bool ps4_run_job(pipe_compiler_job& job);
@@ -261,9 +286,14 @@ namespace vk
 		void ps4_drain_lane();
 		// Runs the queued program translations (none while the worker is being destroyed: they stay queued).
 		void ps4_drain_translations();
+		// Takes and runs the next shared job; false when none may start now.
+		bool ps4_run_shared_job();
+		// Queues a graphics job in the shared queue of its kind and wakes a worker.
+		static void ps4_push_shared(std::unique_ptr<pipe_compiler_job> job);
 
 	public:
 		static void ps4_drop_lane() noexcept;
+		static void ps4_drop_shared() noexcept;
 
 		// Queues a program translation for the workers (renderer thread). The job decides itself whether it still has
 		// to run (the renderer thread may have taken it back).

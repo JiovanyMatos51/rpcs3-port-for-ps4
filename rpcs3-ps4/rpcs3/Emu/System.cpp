@@ -62,6 +62,7 @@ const char* ps4_fpu_selftest_detail() noexcept;
 #include "util/ps4_i18n.hpp"
 #include "util/ps4_memory_governor.hpp"
 #include "util/ps4_virtual_memory.hpp"
+#include "util/ps4_safe_mode.hpp" // 0.40: this boot's feature rows (set_for_boot), join_prestart, pause_thread_refusable
 #include "ps4_fatal.h"
 
 // Emu/Cell/lv2/sys_fs.cpp: releases mount point locks left by a thread that ended in a fatal error.
@@ -377,8 +378,12 @@ void init_fxo_for_exec(utils::serial* ar, bool full = false)
 #ifdef RPCS3_PS4
 	ps4_startup_checkpoint("boot: input ready");
 
-	// 0.39: the stop's thread exists before the game can fill the thread cap
-	ps4_prestart_join_thread();
+	// 0.39: the stop's thread exists before the game can fill the thread cap. 0.40: row join_prestart (opt-in:
+	// join-prestart.flag or features.txt); off, the stop creates it, as in 0.38 (it holds a slot the whole game)
+	if (utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::join_prestart))
+	{
+		ps4_prestart_join_thread();
+	}
 #endif
 
 	usz pos = 0;
@@ -466,6 +471,12 @@ static void fixup_settings(const psf::registry* _psf)
 				sys_log.warning("PS4: '%s' = '%s' for this run (was '%s'; %s): %s", setting.get_name(), setting.to_string(), old,
 					utils::ps4::unsafe_option_for(g_cfg, setting) ? "unavailable on PS4" : "PS4 limit", why);
 			}
+			else if (kind == utils::ps4::change_kind::migration)
+			{
+				// 0.40: a value an older automatic profile wrote into the saved file, not a fix for this game
+				sys_log.warning("PS4: migration: '%s' = '%s' for this run (was '%s'): %s",
+					setting.get_name(), utils::ps4::setting_text(setting), old, why);
+			}
 			else
 			{
 				// 0.33: setting_text, since a config database entry can set Libraries Control (a set, no to_string()).
@@ -517,6 +528,14 @@ static void fixup_settings(const psf::registry* _psf)
 			sys_log.warning("PS4: keep-user-settings.flag present; automatic configuration and per-title fixes NOT forced");
 			ps4_startup_checkpoint("Configuração automática: desativada por keep-user-settings.flag (nada é forçado)");
 			break;
+		}
+
+		// 0.40: this boot's feature rows (util/ps4_safe_mode.hpp): the flag files, features.txt, the global safe mode and
+		// the title's safe-mode level read by the boot policy; logs the 'features:' line. Before g_fxo builds the service
+		// threads and before the renderer, which read their rows. Only the game's own pass (Emu.Init passes no title).
+		if (_psf)
+		{
+			utils::ps4::safe_mode::set_for_boot(title_id, static_cast<u8>(result.safe_level), static_cast<utils::ps4::safe_mode::fail_kind>(result.safe_kind));
 		}
 
 		// 0.34: guest usleeps <= 100 us normally run lv2's yield loop (precise sleep). A title whose PC database entry
@@ -936,8 +955,55 @@ void Emulator::Init()
 	{
 		if (const fs::file native_cfg{"/data/rpcs3/ps4-settings.yml"})
 		{
-			if (!g_cfg.from_string(native_cfg.to_string()))
+			// 0.40: name the file that runs (it overrides config.yml, silently before) and, when config.yml was written
+			// after it (a PC copy, a hand edit over FTP), the config.yml values it replaces
+			const std::string native_text = native_cfg.to_string();
+			sys_log.notice("Applying PS4 global settings: /data/rpcs3/ps4-settings.yml (format %u, %u pin(s)); it overrides config.yml",
+				utils::ps4::saved_settings_format(native_text), utils::ps4::pins_of(native_text).size());
+
+			fs::stat_t native_stat{}, base_stat{};
+			const bool base_newer = fs::get_stat("/data/rpcs3/ps4-settings.yml", native_stat) && fs::get_stat(cfg_path, base_stat) && base_stat.mtime > native_stat.mtime;
+			std::vector<utils::ps4::policy_detail::setting_value> base_values;
+
+			if (base_newer)
+			{
+				utils::ps4::policy_detail::collect_settings(g_cfg.get_nodes(), base_values);
+			}
+
+			if (!g_cfg.from_string(native_text))
 				sys_log.error("Failed to parse native PS4 settings");
+
+			if (base_newer)
+			{
+				std::string replaced;
+				u32 count = 0;
+
+				for (const auto& [setting, text] : base_values)
+				{
+					const std::string now = utils::ps4::setting_text(*setting);
+
+					if (now == text)
+					{
+						continue;
+					}
+
+					// The first 8 by name, then a count
+					if (++count <= 8)
+					{
+						fmt::append(replaced, "%s'%s' '%s' -> '%s'", replaced.empty() ? "" : ", ", setting->get_name(), text, now);
+					}
+				}
+
+				if (count)
+				{
+					const u64 later_s = static_cast<u64>(base_stat.mtime - native_stat.mtime);
+					const std::string later = later_s < 120 ? fmt::format("%u s", later_s) : later_s < 7200 ? fmt::format("%u min", later_s / 60)
+						: later_s < 172800 ? fmt::format("%u h", later_s / 3600) : fmt::format("%u days", later_s / 86400);
+					sys_log.warning("PS4: config.yml was written %s after /data/rpcs3/ps4-settings.yml, which replaces %u of its value(s): %s%s "
+						"(the PS4 settings menu saves ps4-settings.yml; change these values there)",
+						later, count, replaced, count > 8 ? fmt::format(" and %u more", count - 8) : std::string{});
+				}
+			}
 		}
 	}
 #endif
@@ -3539,6 +3605,25 @@ bool Emulator::Pause(bool freeze_emulation, bool show_resume_message)
 
 		g_fxo->need<thread_t>();
 		g_fxo->get<thread_t>().m_thread.reset();
+#ifdef RPCS3_PS4
+		// 0.40: at the console's thread cap (a game frozen after a guest access violation is often there) the pause goes
+		// on without its refresh thread instead of ending the application in a must-succeed start: the message stays
+		// queued, Resume removes it through m_pause_msgs_refs as before, and a stop ends it with the overlays.
+		if (utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::pause_thread_refusable))
+		{
+			auto refresh_thread = std::make_unique<named_thread<decltype(refresh_l)>>(stx::try_launch, "Pause Message Thread", std::move(refresh_l));
+
+			if (!refresh_thread->ps4_try_start())
+			{
+				sys_log.error("PS4: 'Pause Message Thread' not started (thread refused); the pause message is not refreshed");
+				ps4_startup_checkpoint("PS4 threads: 'Pause Message Thread' not started (thread budget)");
+				return;
+			}
+
+			g_fxo->get<thread_t>().m_thread = std::move(refresh_thread);
+			return;
+		}
+#endif
 		g_fxo->get<thread_t>().m_thread = std::make_unique<named_thread<decltype(refresh_l)>>("Pause Message Thread"sv, std::move(refresh_l));
 	});
 
@@ -3939,7 +4024,8 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 
 			std::shared_ptr<std::shared_ptr<void>> pause_thread = std::make_shared<std::shared_ptr<void>>();
 
-			*pause_thread = make_ptr(new named_thread("Savestate Prepare Thread"sv, [pause_thread, allow_autoexit, this]() mutable
+			// 0.40: the body is a named closure so the PS4 build can start it with a refusable create (below)
+			auto prepare_body = [pause_thread, allow_autoexit, this]() mutable
 			{
 				struct scoped_success_guard
 				{
@@ -4041,7 +4127,36 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 				{
 					// Join thread
 				}, nullptr, false);
-			}));
+			};
+
+#ifdef RPCS3_PS4
+			// 0.40: at the console's thread cap the savestate is cancelled instead of ending the application in a
+			// must-succeed start. Nothing is paused yet, so the game keeps running; the same reset as a failed savestate
+			// (continuous mode, the restart callback) and the close-pending flag cleared, so a later savestate or stop
+			// works. The home menu calls this on the main thread.
+			if (utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::pause_thread_refusable))
+			{
+				auto* const prepare_ptr = new named_thread<decltype(prepare_body)>(stx::try_launch, "Savestate Prepare Thread", std::move(prepare_body));
+				*pause_thread = make_ptr(prepare_ptr);
+
+				if (!prepare_ptr->ps4_try_start())
+				{
+					// The never-started body holds a copy of pause_thread: drop the object here to break that cycle
+					// (stand-by object: no join)
+					pause_thread->reset();
+					SetContinuousMode(false);
+					after_kill_callback = nullptr;
+					m_emu_state_close_pending = false;
+
+					sys_log.error("PS4: 'Savestate Prepare Thread' not started (thread refused); the savestate was cancelled, the game keeps running");
+					ps4_startup_checkpoint("PS4 threads: 'Savestate Prepare Thread' not started (thread budget); the savestate was cancelled, the game keeps running");
+					ps4_notify(utils::ps4::i18n::tr(utils::ps4::i18n::str::TOAST_SAVESTATE_SEM_THREAD));
+				}
+
+				return;
+			}
+#endif
+			*pause_thread = make_ptr(new named_thread("Savestate Prepare Thread"sv, std::move(prepare_body)));
 
 			return;
 		}
@@ -4318,7 +4433,8 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 		if (savestate)
 		{
 			// Savestate thread
-			named_thread emu_state_cap_thread("Emu State Capture Thread", [&]()
+			// 0.40: the body is a named closure so the PS4 build can start it with a refusable create (below)
+			auto emu_state_cap_body = [&]()
 			{
 				g_tls_log_prefix = []()
 				{
@@ -4483,16 +4599,46 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 				// Final file write, the file is ready to be committed
 				ar.seek_end();
 				ar.m_file_handler->finalize(ar);
-			});
+			};
 
-			// Join it
-			emu_state_cap_thread();
+#ifdef RPCS3_PS4
+			// 0.40: at the console's thread cap the stop goes on without the savestate (the same path as a capture that
+			// failed: nothing is committed, the temporary file is removed) instead of ending the application in a
+			// must-succeed start. The game's threads are already stopped, so it cannot keep running.
+			named_thread<decltype(emu_state_cap_body)> emu_state_cap_thread(stx::try_launch, "Emu State Capture Thread", std::move(emu_state_cap_body));
+			bool ps4_capture_started = true;
 
-			if (emu_state_cap_thread == thread_state::errored)
+			if (utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::pause_thread_refusable))
 			{
-				sys_log.error("Saving savestate failed due to fatal error!");
+				ps4_capture_started = emu_state_cap_thread.ps4_try_start();
+			}
+			else
+			{
+				emu_state_cap_thread = thread_state::created;
+			}
+
+			if (!ps4_capture_started)
+			{
+				sys_log.error("PS4: 'Emu State Capture Thread' not started (thread refused); the game stops without its savestate");
+				ps4_startup_checkpoint("PS4 threads: 'Emu State Capture Thread' not started (thread budget); the game stops without its savestate");
+				ps4_notify(utils::ps4::i18n::tr(utils::ps4::i18n::str::TOAST_SAVESTATE_STOP_SEM_THREAD));
 				to_ar->reset();
 				savestate = false;
+			}
+			else
+#else
+			named_thread emu_state_cap_thread("Emu State Capture Thread", std::move(emu_state_cap_body));
+#endif
+			{
+				// Join it
+				emu_state_cap_thread();
+
+				if (emu_state_cap_thread == thread_state::errored)
+				{
+					sys_log.error("Saving savestate failed due to fatal error!");
+					to_ar->reset();
+					savestate = false;
+				}
 			}
 		}
 

@@ -11,6 +11,10 @@
 #include "Emu/NP/np_handler.h"
 #include "Emu/NP/np_helpers.h"
 
+#ifdef RPCS3_PS4
+#include "util/ps4_safe_mode.hpp"
+#endif
+
 LOG_CHANNEL(cellNetCtl);
 
 template <>
@@ -305,6 +309,17 @@ struct netstart_hack
 	}
 };
 
+#ifdef RPCS3_PS4
+// Type of the game's last NetStart dialog (g_fxo state: reset at every boot).
+struct ps4_netstart_state
+{
+	atomic_t<s32> type{CELL_NET_CTL_NETSTART_TYPE_NET};
+};
+
+// startup.log lines of the NP NetStart rule, a few per process (RPCS3.log has every one).
+static atomic_t<u32> s_ps4_netstart_lines{0};
+#endif
+
 error_code cellNetCtlNetStartDialogLoadAsync(vm::cptr<CellNetCtlNetStartDialogParam> param)
 {
 	cellNetCtl.warning("cellNetCtlNetStartDialogLoadAsync(param=*0x%x)", param);
@@ -330,6 +345,10 @@ error_code cellNetCtlNetStartDialogLoadAsync(vm::cptr<CellNetCtlNetStartDialogPa
 	{
 		return CELL_NET_CTL_ERROR_INVALID_SIZE;
 	}
+
+#ifdef RPCS3_PS4
+	g_fxo->get<ps4_netstart_state>().type = param->type;
+#endif
 
 	// This is a hack for Diva F 2nd that registers the sysutil callback after calling this function.
 	g_fxo->get<named_thread<netstart_hack>>()(0);
@@ -373,6 +392,24 @@ error_code cellNetCtlNetStartDialogUnloadAsync(vm::ptr<CellNetCtlNetStartDialogR
 	}
 
 	result->result = nph.get_net_status() == CELL_NET_CTL_STATE_IPObtained ? 0 : CELL_NET_CTL_ERROR_DIALOG_CANCELED;
+
+#ifdef RPCS3_PS4
+	// An NP NetStart ('sign in to PSN') ends as the PS3's declined sign-in while NP is offline (network up, RPCN not
+	// logged in): on 'success' Minecraft BLUS31426 took its online host path and never loaded a world. Kill switch:
+	// netstart-upstream.flag (util/ps4_safe_mode.hpp row netstart_np).
+	if (!result->result && g_fxo->get<ps4_netstart_state>().type == CELL_NET_CTL_NETSTART_TYPE_NP &&
+		nph.get_psn_status() != SCE_NP_MANAGER_STATUS_ONLINE &&
+		utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::netstart_np))
+	{
+		result->result = CELL_NET_CTL_ERROR_DIALOG_CANCELED;
+		cellNetCtl.warning("PS4: NetStart (NP): PSN offline, reported as DIALOG_CANCELED");
+
+		if (s_ps4_netstart_lines++ < 4)
+		{
+			ps4_startup_checkpoint("PS4: NetStart (NP): PSN offline, reported as DIALOG_CANCELED (netstart-upstream.flag: the upstream result)");
+		}
+	}
+#endif
 
 	sysutil_send_system_cmd(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED, 0);
 	return CELL_OK;

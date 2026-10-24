@@ -3,6 +3,7 @@
 #ifdef RPCS3_PS4
 
 #include "Emu/Audio/AudioBackend.h"
+#include "util/ps4_audio_stream.hpp"
 
 #include <atomic>
 #include <thread>
@@ -17,6 +18,7 @@ struct ps4_cell_audio_window
 	u64 max_wake_late_us = 0;  // largest such wake-up delay
 	u64 in_progress_waits = 0; // waits for a port buffer the game was still writing
 	u64 silent = 0;            // silent blocks enqueued (no started port, or nothing written in the period)
+	u64 fill_silent = 0;       // of 'silent': for ports the game wrote within the last 100 ms (a gap inside its audio)
 	u64 untouched_waits = 0;   // waits for a port buffer the game had not touched yet
 	u64 wait_us = 0;           // time from the first wait of a period to its advance (cellAudio waiting for the game)
 	u64 drops = 0;             // mixed blocks dropped because the output ring was full
@@ -57,19 +59,29 @@ public:
 
 private:
 	void output_loop();
+	// One stream, from Play() to Pause() or a failed output; 'parked': the gate decides when it ends, else m_running.
+	int stream(bool parked);
+	bool start_thread();
+	void stop_thread();
 
 	std::atomic<bool> m_running{false};
-	// Set when sceAudioOutOutput failed and the output thread ended (output device change, rest mode). cellAudio
-	// ignores the state event, but it polls Operational(): false makes it close this backend and open a new port.
-	// Cleared by Open().
+	// Set when sceAudioOutOutput failed and the output thread ended (output device change, rest mode), or when the
+	// output thread could not be created. cellAudio ignores the state event, but it polls Operational(): false makes
+	// it close this backend and open a new one. Cleared by Open().
 	std::atomic<bool> m_failed{false};
 	// Read in Open(), used by the output thread it starts. Short blocks are concealed unless
 	// /data/rpcs3/audio-no-conceal.flag exists; /data/rpcs3/audio-high-priority.flag runs the output thread one
 	// priority step above the RSX thread.
 	bool m_conceal = true;
 	bool m_high_priority = false;
+	// 0.40: the output thread is created by Open() and parks between streams (pauses, a setting change that reopens
+	// the port), so a resume near the console's thread cap needs no new thread; Close() keeps it, the destructor ends
+	// it. audio-thread-per-play.flag (row audio_out_parked off): the 0.39 lifetime, created by Play() and joined by
+	// Pause(). Chosen when no thread exists, so a thread keeps the lifetime it was started with.
+	utils::ps4::stream_gate m_gate;
+	bool m_parked_thread = true;
 	// 0.28: a native thread, not std::thread: libc++ throws when the console is out of thread resources and
-	// this TU is -fno-exceptions (std::terminate). On failure the audio stays silent instead.
+	// this TU is -fno-exceptions (std::terminate).
 	pthread_t m_thread{};
 	bool m_thread_valid = false;
 	int m_handle = -1;

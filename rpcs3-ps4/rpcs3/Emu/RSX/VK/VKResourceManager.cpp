@@ -58,19 +58,23 @@ namespace vk
 	}
 
 	// vkutils/memory.cpp (0.39): every empty VMA block released (bytes); a window-rated fatal load that a trim can change
-	// (util/ps4_vram_policy.hpp fatal_load).
+	// (util/ps4_vram_policy.hpp fatal_load); whether the current allocator runs the vma_release feature.
 	u64 ps4_vma_free_empty_blocks();
 	bool ps4_fatal_rating_confirmed();
+	bool ps4_vma_release_on() noexcept;
 
 	// Fatal trims hard-sync the GPU (flush_command_queue + driver drain) before evicting anything. Near the window
 	// budget the load stays above 95% while nothing more can be evicted, which turned every frame into a hard sync
-	// (Wipeout: 1024 fatal trims in 79 s; GTA IV 0.38: two hard syncs per frame for 18 min). 0.39: window-rated fatal
-	// trims run at most once a second, and 4 s apart while the last one did not lower the allocator's blocks by
-	// 16 MiB (util/ps4_vram_policy.hpp); the others run at severe. Allocation failures and trims requested by other
-	// threads keep the fatal path. Only the RSX thread runs trims (vmm_handle_memory_pressure hands the others over),
-	// so plain statics suffice.
+	// (Wipeout: 1024 fatal trims in 79 s). Default (vma_release off, as 0.38): after a fatal trim that relieved nothing,
+	// the window-load check runs at severe for the next 500 ms. With vma_release (GTA IV 0.38: two hard syncs per frame
+	// for 18 min): window-rated fatal trims run at most once a second, and 4 s apart while the last one did not lower
+	// the allocator's blocks by 16 MiB (util/ps4_vram_policy.hpp); the others run at severe. Allocation failures and
+	// trims requested by other threads keep the fatal path. Only the RSX thread runs trims (vmm_handle_memory_pressure
+	// hands the others over), so plain statics suffice.
+	constexpr u64 ps4_fatal_trim_backoff_us = 500'000;
 	static u64 s_ps4_last_fatal_trim_us = 0;
-	static u64 s_ps4_fatal_trim_blocks_before = 0; // VMA block total right before the last fatal trim
+	static bool s_ps4_last_fatal_trim_relieved = true;
+	static u64 s_ps4_fatal_trim_blocks_before = 0; // VMA block total right before the last fatal trim (vma_release)
 	static u32 s_ps4_empty_block_passes = 0;
 	// /data/rpcs3/vram-trim-every-frame.flag restores a fatal trim on every check. 0 = not read yet for this
 	// renderer, 1 = back-off on, 2 = flag present. Reset with the renderer (vmm_reset).
@@ -113,6 +117,37 @@ namespace vk
 
 	static bool ps4_back_off_fatal_trim()
 	{
+		if (!ps4_vma_release_on())
+		{
+			// The 0.38 back-off: 500 ms at severe after a fatal trim that freed nothing.
+			if (s_ps4_last_fatal_trim_relieved)
+			{
+				return false;
+			}
+
+			const u64 now = get_system_time();
+			if (now - s_ps4_last_fatal_trim_us >= ps4_fatal_trim_backoff_us)
+			{
+				return false;
+			}
+
+			if (ps4_trim_every_frame())
+			{
+				return false;
+			}
+
+			utils::ps4::gpu::note_trim_backoff();
+			if (!s_ps4_trim_backoff_logged)
+			{
+				s_ps4_trim_backoff_logged = true;
+				ps4_startup_checkpoint(fmt::format("VRAM: fatal trim backed off to severe (the fatal trim %llu ms ago freed nothing); "
+					"later ones are counted as 'fatal trims backed off' in the PS4 VRAM line (vram-trim-every-frame.flag disables this)",
+					(now - s_ps4_last_fatal_trim_us) / 1000).c_str());
+			}
+
+			return true;
+		}
+
 		if (!s_ps4_last_fatal_trim_us || ps4_trim_every_frame())
 		{
 			return false;
@@ -297,6 +332,7 @@ namespace vk
 #ifdef RPCS3_PS4
 		// The renderer is gone: the next one starts without a back-off and reads the flag again.
 		s_ps4_last_fatal_trim_us = 0;
+		s_ps4_last_fatal_trim_relieved = true;
 		s_ps4_fatal_trim_blocks_before = 0;
 		s_ps4_empty_block_passes = 0;
 		s_ps4_trim_every_frame_state = 0;
@@ -374,9 +410,10 @@ namespace vk
 				// Drivers will often crash long before returning OUT_OF_DEVICE_MEMORY errors.
 				load_severity = rsx::problem_severity::fatal;
 #ifdef RPCS3_PS4
-				// 0.39: blocks VMA holds but does not use (released by the allocator itself) do not make a fatal rating;
-				// the allocations over 95% or no 64 MiB free range in the window do (vram-trim-every-frame.flag: 0.38).
-				if (!ps4_trim_every_frame() && !ps4_fatal_rating_confirmed())
+				// vma_release: blocks VMA holds but does not use (released by the allocator itself) do not make a fatal
+				// rating; the allocations over 95% or no 64 MiB free range in the window do (vram-trim-every-frame.flag:
+				// 0.38). Off (default): the 0.38 rating.
+				if (ps4_vma_release_on() && !ps4_trim_every_frame() && !ps4_fatal_rating_confirmed())
 				{
 					load_severity = rsx::problem_severity::severe;
 				}
@@ -466,6 +503,20 @@ namespace vk
 				return vkthr->ps4_retire_completed_work();
 			}
 
+			if (!ps4_vma_release_on())
+			{
+				// 0.38: the trim's own result feeds the back-off.
+				const bool relieved = vkthr->on_vram_exhausted(severity);
+				if (severity >= rsx::problem_severity::fatal)
+				{
+					// Every fatal trim (window load or a failed allocation) feeds the back-off in vmm_check_memory_usage.
+					s_ps4_last_fatal_trim_us = get_system_time();
+					s_ps4_last_fatal_trim_relieved = relieved;
+				}
+
+				return relieved;
+			}
+
 			if (severity >= rsx::problem_severity::fatal)
 			{
 				// Every fatal trim (window load or a failed allocation) feeds the back-off in vmm_check_memory_usage, which
@@ -532,8 +583,8 @@ namespace vk
 
 		const auto ps4_rated = load_severity;
 
-		// 0.39: at a severe or fatal rating, every empty allocator block goes back to the window first (no GPU sync:
-		// an empty block holds no allocation). vma-keep-empty.flag turns this off.
+		// vma_release: at a severe or fatal rating, every empty allocator block goes back to the window first (no GPU
+		// sync: an empty block holds no allocation). Off (default): ps4_vma_free_empty_blocks() frees nothing.
 		if (ps4_rated >= rsx::problem_severity::severe)
 		{
 			if (const u64 freed = ps4_vma_free_empty_blocks())

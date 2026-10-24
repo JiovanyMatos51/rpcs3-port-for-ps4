@@ -4,8 +4,76 @@
 #include "state_tracker.hpp"
 #include "pixel_settings.hpp"
 
+#ifdef RPCS3_PS4
+#include "util/ps4_i18n.hpp"
+#include "util/ps4_safe_mode.hpp"
+#endif
+
 namespace gl
 {
+#ifdef RPCS3_PS4
+	// A texture released after the renderer's GL context ended (gl::ps4_has_command_context): its GL calls are
+	// skipped (the name goes with the context). One line per process; the rest are only counted.
+	static void ps4_note_release_without_context()
+	{
+		static atomic_t<u32> s_count{0};
+		if (s_count++ == 0)
+		{
+			rsx_log.warning("PS4 GL: a texture was released after the renderer's GL context ended (teardown after a fatal); its GL calls were skipped");
+		}
+	}
+
+	// Binds a new texture name for its initialization (texture::texture).
+	static void ps4_bind_new_texture(GLenum target, GLuint id)
+	{
+		if (!gl::ps4_has_command_context())
+		{
+			// No renderer state tracker (teardown): bind directly
+			glActiveTexture(GL_TEXTURE0 + GL_TEMP_IMAGE_SLOT(0));
+			glBindTexture(target, id);
+			return;
+		}
+
+		gl::get_command_context()->bind_texture(GL_TEMP_IMAGE_SLOT(0), target, id, GL_TRUE);
+	}
+
+	// The storage calls of texture::texture, for the second attempt after a failed allocation.
+	static void ps4_texture_storage(GLenum target, GLuint width, GLuint height, GLuint depth, GLuint mipmaps, GLubyte samples, GLenum storage_fmt)
+	{
+		switch (target)
+		{
+		case GL_TEXTURE_1D:
+			glTexStorage1D(target, mipmaps, storage_fmt, width);
+			break;
+		case GL_TEXTURE_2D:
+		case GL_TEXTURE_CUBE_MAP:
+			glTexStorage2D(target, mipmaps, storage_fmt, width, height);
+			break;
+		case GL_TEXTURE_2D_MULTISAMPLE:
+			glTexStorage2DMultisample(target, samples, storage_fmt, width, height, GL_TRUE);
+			break;
+		case GL_TEXTURE_3D:
+		case GL_TEXTURE_2D_ARRAY:
+			glTexStorage3D(target, mipmaps, storage_fmt, width, height, depth);
+			break;
+		case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
+			glTexStorage3DMultisample(target, samples, storage_fmt, width, height, depth, GL_TRUE);
+			break;
+		default:
+			break;
+		}
+	}
+
+	// True when the bound texture got its storage: Mesa clears the levels of a texture whose immutable storage could
+	// not be allocated (GL_OUT_OF_MEMORY), so level 0 then reports width 0.
+	static bool ps4_texture_has_storage(GLenum target)
+	{
+		GLint width = 0;
+		glGetTexLevelParameteriv(target == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP_POSITIVE_X : target, 0, GL_TEXTURE_WIDTH, &width);
+		return width > 0;
+	}
+#endif
+
 	static GLenum sizedfmt_to_ifmt(GLenum sized)
 	{
 		switch (sized)
@@ -88,7 +156,11 @@ namespace gl
 		glGenTextures(1, &m_id);
 
 		// Must bind to initialize the new texture
+#ifdef RPCS3_PS4
+		ps4_bind_new_texture(target, m_id);
+#else
 		gl::get_command_context()->bind_texture(GL_TEMP_IMAGE_SLOT(0), target, m_id, GL_TRUE);
+#endif
 
 		const GLenum storage_fmt = sizedfmt_to_ifmt(sized_format);
 		switch (target)
@@ -120,6 +192,49 @@ namespace gl
 		case GL_TEXTURE_BUFFER:
 			break;
 		}
+
+#ifdef RPCS3_PS4
+		// gl_vram_guard: Zink has no video memory budget. Out of device memory or address space the storage is not
+		// allocated and the texture would fail later ("Unhandled GL format", a dead RSX and a crash at the stop). The
+		// texture cache gives back what it can, the GPU drains (deferred deletions are freed), one more attempt; if
+		// it still fails, a clear stop that names Vulkan, which has a budget.
+		if (target != GL_TEXTURE_BUFFER && utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::gl_vram_guard) &&
+			!ps4_texture_has_storage(target))
+		{
+			static atomic_t<u32> s_ps4_failures{0};
+			if (s_ps4_failures++ == 0)
+			{
+				rsx_log.error("PS4 GL: texture storage %ux%ux%u (%u mip(s), %u sample(s), format 0x%x) not allocated: OpenGL (Zink) is out of video memory; "
+					"releasing cached textures and trying once more (gl-vram-guard-off.flag: as upstream)", width, height, depth, mipmaps, samples, storage_fmt);
+			}
+
+			// The failed storage call left GL_OUT_OF_MEMORY pending: read it now, so that after a successful second
+			// attempt a later context check (gl::check_state) does not take it for a lost context
+			glGetError();
+
+			if (gl::ps4_has_command_context())
+			{
+				gl::get_command_context()->unbind_texture(target, m_id);
+			}
+
+			glDeleteTextures(1, &m_id);
+			const bool released = gl::ps4_vram_relief();
+			glFinish();
+
+			glGenTextures(1, &m_id);
+			ps4_bind_new_texture(target, m_id);
+			ps4_texture_storage(target, width, height, depth, mipmaps, samples, storage_fmt);
+
+			if (!ps4_texture_has_storage(target))
+			{
+				rsx_log.error("PS4 GL: texture storage %ux%ux%u (format 0x%x) still not allocated after the release; the game stops (use Vulkan)", width, height, depth, storage_fmt);
+				fmt::throw_exception("%s", utils::ps4::i18n::tr(utils::ps4::i18n::str::VRAM_OPENGL_SEM_MEMORIA_USE_VULKAN));
+			}
+
+			rsx_log.warning("PS4 GL: texture storage %ux%ux%u allocated on the second attempt (%s)", width, height, depth,
+				released ? "after releasing cached textures" : "after a GPU drain");
+		}
+#endif
 
 		if (target != GL_TEXTURE_BUFFER)
 		{
@@ -218,6 +333,16 @@ namespace gl
 
 	texture::~texture()
 	{
+#ifdef RPCS3_PS4
+		if (!gl::ps4_has_command_context())
+		{
+			// Released after the renderer's GL context ended (a teardown after an RSX fatal): no GL call can be made
+			ps4_note_release_without_context();
+			m_handle64 = GL_NONE;
+			m_id = GL_NONE;
+			return;
+		}
+#endif
 		gl::get_command_context()->unbind_texture(static_cast<GLenum>(m_target), m_id);
 
 		if (m_handle64)
@@ -386,6 +511,15 @@ namespace gl
 
 	texture_view::~texture_view()
 	{
+#ifdef RPCS3_PS4
+		if (m_id && !gl::ps4_has_command_context())
+		{
+			// Released after the renderer's GL context ended: no GL call can be made
+			ps4_note_release_without_context();
+			m_id = GL_NONE;
+			return;
+		}
+#endif
 		if (m_id)
 		{
 			gl::get_command_context()->unbind_texture(static_cast<GLenum>(m_target), m_id);

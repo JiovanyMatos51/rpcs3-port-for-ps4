@@ -27,10 +27,13 @@
 //   locate_files    PARAM.SFO, LIC.DAT and EBOOT.BIN through the ISO 9660 tree of plain region 0
 //   drive           disc status for the XMB and for a running game installed from a disc (ps4_disc_lock.hpp):
 //                   poll() never waits for the network, a worker re-reads sectors 0-1; hold() keeps the drive to an
-//                   install
+//                   install. When no FTP server answers the status keeps NetCtl's state (net_link): GoldHEN's FTP
+//                   server does not listen without an IP address, so "no network" and "FTP server off" read apart
 //   read_header     sectors 0-1 and 16 through a temporary connection (disc probe, stage 3)
+//   network_line    NetCtl's state and the console clock against this build's date, for the offline paths
 //   PS4 only        socket calls, server list, service::instance(), the virtual file the ISO loader opens
-// Log lines start with "disc stream:".
+// Log lines start with "disc stream:"; the drive's state changes also go to RPCS3.log through log_mirror, the sink the
+// frontend sets for the disc lines testers send most (drive, key search, disc lock).
 
 #include <algorithm>
 #include <array>
@@ -195,6 +198,88 @@ inline std::string title_id_from_header(const unsigned char* sector1, std::size_
 {
     if (size < 0x20 || !has_ps3_magic(sector1, size)) return {};
     return canonical_title_id(detail::printable(sector1 + 0x10, 0x10));
+}
+
+// The NetCtl state in which the console has an IP address (sceNetCtlGetState)
+inline constexpr int netctl_ip_obtained = 3;
+
+namespace detail
+{
+// Days from 1970-01-01 to a civil date (H. Hinnant's days_from_civil)
+inline std::int64_t days_from_civil(std::int64_t year, unsigned month, unsigned day) noexcept
+{
+    year -= month <= 2;
+    const std::int64_t era = (year >= 0 ? year : year - 399) / 400;
+    const auto yoe = static_cast<unsigned>(year - era * 400);
+    const unsigned doy = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5 + day - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+}
+
+// "2026-10-16" of a time in unix seconds (UTC), with " 14:05 UTC" when 'with_time'; "an unknown date" when negative
+inline std::string utc_text(std::int64_t unix_seconds, bool with_time = false)
+{
+    if (unix_seconds < 0) return "an unknown date";
+    // Civil date of a day count (the inverse of days_from_civil)
+    const std::int64_t z = unix_seconds / 86400 + 719468;
+    const std::int64_t era = z / 146097, doe = z - era * 146097;
+    const std::int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const std::int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+    const std::int64_t day = doy - (153 * mp + 2) / 5 + 1, month = mp < 10 ? mp + 3 : mp - 9, year = yoe + era * 400 + (month <= 2);
+    const std::int64_t minutes = unix_seconds % 86400 / 60;
+    char text[48];
+    if (with_time)
+        std::snprintf(text, sizeof(text), "%04lld-%02lld-%02lld %02lld:%02lld UTC", static_cast<long long>(year), static_cast<long long>(month),
+            static_cast<long long>(day), static_cast<long long>(minutes / 60), static_cast<long long>(minutes % 60));
+    else
+        std::snprintf(text, sizeof(text), "%04lld-%02lld-%02lld", static_cast<long long>(year), static_cast<long long>(month), static_cast<long long>(day));
+    return text;
+}
+
+// Unix seconds at 00:00 UTC of "YYYY-MM-DD"; -1 when the text is not such a date
+inline std::int64_t unix_of_date(std::string_view date) noexcept
+{
+    if (date.size() != 10 || date[4] != '-' || date[7] != '-') return -1;
+    unsigned value[3]{};
+    const std::size_t at[3] = {0, 5, 8}, length[3] = {4, 2, 2};
+    for (int part = 0; part < 3; ++part)
+        for (std::size_t i = at[part]; i < at[part] + length[part]; ++i)
+        {
+            if (date[i] < '0' || date[i] > '9') return -1;
+            value[part] = value[part] * 10 + static_cast<unsigned>(date[i] - '0');
+        }
+    if (value[0] < 1970 || value[1] < 1 || value[1] > 12 || value[2] < 1 || value[2] > 31) return -1;
+    return days_from_civil(value[0], value[1], value[2]) * 86400;
+}
+}
+
+// A console clock earlier than the day before this build's date cannot be right: no console runs an application built
+// after its own date (a reset clock breaks every certificate check). True when either value is unknown (a negative
+// clock, a malformed date), so nothing is blamed on the clock without evidence.
+inline bool clock_plausible(std::int64_t now_unix, std::string_view build_date) noexcept
+{
+    const std::int64_t built = detail::unix_of_date(build_date);
+    return now_unix < 0 || built < 0 || now_unix >= built - 86400;
+}
+
+// "network: netctl state 1, IP no, clock 2026-10-23 14:05 UTC (plausible)": what the disc paths depend on offline
+inline std::string network_line(int link, std::int64_t now_unix, std::string_view build_date)
+{
+    return "network: netctl state " + std::to_string(link) + (link < 0 ? std::string(" (unknown)") : std::string{}) + ", IP " +
+        (link == netctl_ip_obtained ? "yes" : link < 0 ? "unknown" : "no") + ", clock " + detail::utc_text(now_unix, true) + " (" +
+        (now_unix < 0 ? "unknown" : clock_plausible(now_unix, build_date) ? "plausible" : "before the build") + ")";
+}
+
+// A second sink for the few disc lines support needs from RPCS3.log, the log testers send far more often than
+// startup.log: the drive's state changes, the key search's result and sources, the disc lock's decisions. The frontend
+// points it at its RPCS3.log channel; nullptr (the default, and in the host tests) mirrors nothing. The lines it gets
+// never hold a key, only check values.
+using mirror_fn = void (*)(std::string_view line);
+inline std::atomic<mirror_fn> log_mirror{nullptr};
+
+inline void mirror(std::string_view line)
+{
+    if (const mirror_fn sink = log_mirror.load(std::memory_order_acquire)) sink(line);
 }
 
 // Runs 'work' on a detached thread; false when no thread could be created. On the console pthread_create reports a
@@ -1734,7 +1819,23 @@ struct disc_status
     int reply = 0;                // when it failed: the server's last reply code (550, 451, ...), 0 when none came
     std::uint32_t generation = 0; // changes whenever another disc is seen
     std::int64_t checked_ms = 0;  // steady clock of the check, 0: never
+    int net_link = -1;            // no_server: NetCtl's state at that check (netctl_ip_obtained: an IP address); -1 unknown
 };
+
+// No FTP server answered while the console had no IP address: GoldHEN's FTP server does not listen without one, so the
+// drive stays invisible until the console joins a network (internet is not needed). False when the state is unknown.
+inline bool no_network(const disc_status& s) noexcept
+{
+    return s.state == disc_state::no_server && s.net_link >= 0 && s.net_link != netctl_ip_obtained;
+}
+
+// Why no FTP server answered, for log lines: " (no network: netctl state 1)", " (network up: GoldHEN FTP off?)"
+inline std::string net_clause(int link)
+{
+    if (link < 0) return " (network state unknown)";
+    if (link != netctl_ip_obtained) return " (no network: netctl state " + std::to_string(link) + ")";
+    return " (network up: GoldHEN FTP off?)";
+}
 
 // A failed check in which the server read the drive and said there is nothing to read: the device read failed (451:
 // the console's answer for an empty drive, also while the tray moves) or the device ended before sector 2. A
@@ -1769,6 +1870,7 @@ class drive
 public:
     using exists_fn = std::function<bool(const std::string& path)>;
     using annotate_fn = std::function<void(disc_status&)>; // adds what is installed of a PS3 disc (worker thread)
+    using link_fn = std::function<int()>;                  // NetCtl state now (netctl_ip_obtained: an IP address), -1 unknown
 
     drive(std::unique_ptr<reader> disc, exists_fn exists, std::string key_dir, drive_config cfg = {}, log_fn log = {})
         : m_state(std::make_shared<state>())
@@ -1839,6 +1941,14 @@ public:
         m_state->annotate = std::move(fn);
     }
 
+    // Asked when no FTP server answers, to tell a console without a network from an FTP server switched off
+    // (disc_status::net_link); without it the state stays unknown
+    void set_link_probe(link_fn fn)
+    {
+        std::lock_guard lock(m_state->mutex);
+        m_state->link = std::move(fn);
+    }
+
     // The XMB is left alone (its slowest idle tier): without a PS3 disc the drive is checked every check_ms_idle. Back
     // to active, the next such check is at most check_ms_searching away. Requested checks are never delayed.
     void set_idle(bool idle)
@@ -1905,6 +2015,7 @@ private:
         std::condition_variable wake;
         disc_status status; // [mutex]
         annotate_fn annotate; // [mutex]
+        link_fn link;         // [mutex]
         bool held = false;    // [mutex]
         bool idle = false;    // [mutex] set_idle()
         bool worker = false;
@@ -1997,6 +2108,7 @@ private:
         out.server = to_string(s.disc->server());
         out.banner = s.disc->banner();
         out.generation = s.checked.generation;
+        std::string failure;
 
         if (result == read_status::ok)
         {
@@ -2064,8 +2176,22 @@ private:
             if (s.has_identity) s.disc->drop_cache();
             s.has_identity = false;
             out.state = result == read_status::no_server ? disc_state::no_server : disc_state::no_disc;
-            out.detail = std::string(to_string(result)) + ": " + s.disc->last_failure();
-            if (result == read_status::stopped) out.state = s.checked.state;
+            failure = s.disc->last_failure();
+            out.detail = std::string(to_string(result)) + ": " + failure;
+            if (result == read_status::stopped)
+            {
+                out.state = s.checked.state;
+                out.net_link = s.checked.net_link;
+            }
+            else if (out.state == disc_state::no_server)
+            {
+                link_fn link;
+                {
+                    std::lock_guard lock(s.mutex);
+                    link = s.link;
+                }
+                out.net_link = link ? link() : -1;
+            }
         }
 
         // The drive is left without a transfer between checks; the control connections stay (NOOP keepalive)
@@ -2074,7 +2200,7 @@ private:
         // A line when something changed
         const disc_status& before = s.checked;
         if (out.state != before.state || out.generation != before.generation || out.key_present != before.key_present || out.title != before.title ||
-            out.installed != before.installed || out.partial != before.partial)
+            out.installed != before.installed || out.partial != before.partial || out.net_link != before.net_link)
         {
             switch (out.state)
             {
@@ -2087,7 +2213,7 @@ private:
                 break;
             case disc_state::not_ps3: log(s, "drive: a disc that is not a PS3 game disc (" + out.detail + ")"); break;
             case disc_state::no_disc: log(s, "drive: no readable disc (" + out.detail + ")"); break;
-            case disc_state::no_server: log(s, "drive: " + out.detail); break;
+            case disc_state::no_server: log(s, std::string("drive: ") + to_string(read_status::no_server) + net_clause(out.net_link) + ": " + failure); break;
             case disc_state::unknown: break;
             }
         }
@@ -2360,7 +2486,10 @@ inline std::optional<endpoint> configured_server(std::string* problem = nullptr)
 
 #ifdef RPCS3_PS4
 #include "Utilities/File.h"
+#include "util/ps4_build_version.hpp"
 #include "util/ps4_net.hpp"
+
+#include <ctime>
 
 // Frontend object (ps4_launcher.cpp), always linked: one line in startup.log
 void ps4_startup_checkpoint(const char* stage);
@@ -2414,6 +2543,12 @@ inline server_list servers(const log_fn& log = {})
     list.last.push_back({loopback_ipv4, 1337});
     return list;
 }
+
+// network_line() for now: NetCtl's state and the console clock against this build's date
+inline std::string network_line_now()
+{
+    return network_line(utils::ps4::net::link_state(), static_cast<std::int64_t>(std::time(nullptr)), ps4_build_date);
+}
 }
 
 class disc_file;
@@ -2466,7 +2601,20 @@ private:
 
     service()
     {
-        const log_fn log = [](const std::string& line) { ps4_startup_checkpoint(line.c_str()); };
+        const log_fn log = [](const std::string& line)
+        {
+            ps4_startup_checkpoint(line.c_str());
+            // The drive's state changes also go to RPCS3.log; no FTP server answering is followed by the network and the
+            // clock (a console without an IP address, or with a clock no certificate is valid at)
+            if (!line.starts_with("disc stream: drive: ")) return;
+            mirror(line);
+            if (line.starts_with("disc stream: drive: no FTP server"))
+            {
+                const std::string network = sys::network_line_now();
+                ps4_startup_checkpoint(network.c_str());
+                mirror(network);
+            }
+        };
         reader_config cfg;
         cfg.log_features = true;
         auto disc = std::make_unique<reader>(sys::net(), sys::servers(log), cfg, log);
@@ -2476,6 +2624,7 @@ private:
             return fs::get_stat(path, info) && !info.is_directory;
         };
         m_drive = std::make_unique<drive>(std::move(disc), exists, rpcs3::utils::get_redump_key_dir(), drive_config{}, log);
+        m_drive->set_link_probe([] { return utils::ps4::net::link_state(); });
     }
 
     inline bool register_device();

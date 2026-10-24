@@ -45,6 +45,7 @@
 #include "util/ps4_hr_wait.hpp"
 #include "util/ps4_disc_lock.hpp"
 #include "util/ps4_i18n.hpp"
+#include "util/ps4_safe_mode.hpp"
 #include "util/ps4_xmb_notice.hpp"
 #include "util/sysinfo.hpp"
 #include "Emu/system_progress.hpp"
@@ -61,8 +62,12 @@
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlay_message_dialog.h"
+#include "Emu/RSX/Overlays/overlay_media_list_dialog.h"
+#include "Emu/RSX/Overlays/overlay_osk.h"
 #include "Emu/RSX/Overlays/overlay_save_dialog.h"
 #include "Emu/RSX/Overlays/overlay_trophy_notification.h"
+#include "Emu/RSX/Overlays/overlay_user_list_dialog.h"
+#include "Emu/RSX/Overlays/HomeMenu/overlay_home_menu.h"
 #include "Emu/Cell/Modules/cellSysutil.h"
 #include "Emu/Cell/lv2/sys_fs.h"
 #include "Emu/VFS.h"
@@ -91,6 +96,7 @@
 #include <string>
 #include <utility>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <fcntl.h>
 #include <pthread.h>
@@ -124,8 +130,13 @@ LOG_CHANNEL(ps4_log, "PS4");
 
 // 0.39: interface language of the toasts and XMB texts built here (util/ps4_i18n.hpp, table ps4_i18n_main.inc)
 namespace i18n = utils::ps4::i18n;
+// 0.40: the feature table and the per-game safe mode (util/ps4_safe_mode.hpp)
+namespace safe_mode = utils::ps4::safe_mode;
 
 [[noreturn]] void report_fatal_error(std::string_view text, bool is_html = false, bool include_help_text = true);
+
+// System.cpp: non-zero while a PPU module compile holds the Stop Watchdog (it then waits 25 s instead of 10 s)
+extern atomic_t<u64> g_watchdog_hold_ctr;
 
 namespace rsx
 {
@@ -190,6 +201,18 @@ const shared_mutex& ps4_perf_lock() noexcept;
 // sys_fs.cpp: head of the mount point chain ('/' -> /app_home -> ... -> /dev_hdd0 -> ... -> /dev_usb); sys_fs.h
 // exports only /dev_hdd0 and the no-device entry.
 extern lv2_fs_mount_point g_mp_sys_dev_root;
+
+// util/logs.cpp (0.40): the summaries and notes of the repeated-line limiter of the live log; main thread, about once
+// per second.
+namespace logs
+{
+	void ps4_flush_repeated_lines();
+}
+
+// sys_fs.cpp (0.40): the movie file the game holds open now (the most recently opened one still open); false when
+// none. 'name' gets its file name without folders (NUL-terminated, cut to name_size - 1 bytes), 'seconds' the whole
+// seconds since it was opened. Any thread, lock-free, allocation-free.
+bool ps4_fs_movie_status(char* name, std::size_t name_size, unsigned* seconds) noexcept;
 
 // Image base (OpenOrbis link.x). .text starts at ELF address 0, so 'address - __text_start' of a global is its
 // llvm-nm address in rpcs3_ps4.elf.
@@ -722,7 +745,9 @@ namespace
                     const std::string& kept = filter.kept();
                     const auto kept_lines = static_cast<u32>(std::count(kept.begin(), kept.end(), '\n'));
                     marker = fmt::format("\n[log history 0.34: %llu bytes left out here; the original file had %llu bytes. Of its last %llu bytes, the %u newest "
-                        "error/PS4/AudioOut line(s) of %u follow]\n", left_out, r.size, scanned, kept_lines, filter.matched());
+                        "error/PS4/AudioOut line(s) of %u follow%s]\n", left_out, r.size, scanned, kept_lines, filter.matched(),
+                        filter.repeats() ? fmt::format("; %u more TODO line(s) left out (the first %u of each text are kept)", filter.repeats(),
+                            utils::ps4::history_line_filter::todo_keep) : std::string());
                     kept_part = kept + "[log history 0.34: end of the kept lines; the end of the file follows]\n";
                 }
             }
@@ -909,6 +934,10 @@ namespace
         // nothing is written when no game title is set (XMB, a failed boot).
         if (utils::ps4::adapt::note(utils::ps4::adapt::key_threads_low))
             ps4_fatal_note("adapt: ", "thread resources exhausted; the next boots of this game use a lighter thread budget (threads=low)");
+        // 0.40: and the per-game safe mode goes one level up; the session record ends (the application is left)
+        safe_mode::note_failure(safe_mode::fail_kind::threads);
+        if (char title[utils::ps4::adapt::title_size]; utils::ps4::adapt::current_title(title))
+            utils::ps4::adapt::write_record(title, utils::ps4::session_record::suffix, "end threads");
         ps4_startup_checkpoint(fmt::format("lifecycle: thread resources exhausted (%s; kernel internal memory free %llu bytes;"
             " flexible memory free %llu bytes); leaving application instead of stopping the guest",
             reason, internal_free, ps4_flexible_memory_free()).c_str());
@@ -1226,13 +1255,16 @@ namespace
     // $HOME nor $XDG_CACHE_HOME exists), so RADV/ACO recompiled every pipeline and interpreter variant (and Zink every
     // GL shader) on every boot. 0.28 made it opt-in after a ScePthread pool exhaustion in Demon's Souls 0.27, later
     // traced to 2 MiB stack exhaustion (handled by the own-stack rescue since 0.29-0.31).
-    // 0.39: on by default. Mesa's default cache database is bounded by MESA_SHADER_CACHE_MAX_SIZE and evicts old entries
-    // (the single-file cache ignores that limit, so it is not selected); it adds one Mesa queue thread. The variables are
-    // set before the first thread of the process (musl's setenv may free the environment array a getenv on another
-    // thread reads, e.g. curl's proxy lookup in the TLS self-test) and long before any EGL/Vulkan initialization (the
-    // first game boot), which reads them. A folder that refuses writes (made by the GoldHEN FTP) makes Mesa turn the
-    // cache off by itself; it is probed here and, when it refused, again after the permission repair, and logged.
-    // Off: /data/rpcs3/mesa-cache-off.flag.
+    // 0.39 turned it on by default; 0.40 makes it opt-in again (the feature row mesa_cache: mesa-cache.flag, or the name
+    // in features.txt; mesa-cache-off.flag and the global safe mode keep it off). Mesa's 'disk$' queue threads run
+    // outside the RPCS3 thread registry and count against the console's thread cap: 0.39 sessions carried 5-8 threads
+    // outside the registry instead of 2-3, and Mortal Kombat's movie demuxer and Demon's Souls' libsail thread were
+    // refused. When on: Mesa's default cache database, bounded by MESA_SHADER_CACHE_MAX_SIZE and evicting old entries
+    // (the single-file cache ignores that limit, so it is not selected). The variables are set before the first thread
+    // of the process (musl's setenv may free the environment array a getenv on another thread reads, e.g. curl's proxy
+    // lookup in the TLS self-test) and long before any EGL/Vulkan initialization (the first game boot), which reads
+    // them, so the row is fixed for the life of the process. A folder that refuses writes (made by the GoldHEN FTP) makes
+    // Mesa turn the cache off by itself; it is probed here and, when it refused, again after the permission repair.
     constexpr char mesa_cache_dir[] = "/data/rpcs3/cache/mesa/";
     bool s_mesa_cache_recheck = false; // the folder refused writes before the permission repair
 
@@ -1259,18 +1291,28 @@ namespace
         return fmt::format("refuses writes (errno %d, mode 0%o uid %u; made by the GoldHEN FTP?)", error, static_cast<u32>(st.st_mode & 07777), static_cast<u32>(st.st_uid));
     }
 
+    // After safe_mode::init_process(), which fixes the row for the process.
     void apply_mesa_shader_cache()
     {
-        if (fs::is_file("/data/rpcs3/mesa-cache.flag"))
-            ps4_startup_checkpoint("Mesa shader cache: mesa-cache.flag is no longer needed (the cache is on by default); it changes nothing");
-        if (fs::is_file("/data/rpcs3/mesa-cache-off.flag"))
+        const char* const env_dir = ::getenv("MESA_SHADER_CACHE_DIR");
+        const bool env_set = env_dir && env_dir[0];
+        // The reason only names the file in the line; the value is the one init_process() fixed
+        const safe_mode::reason why = safe_mode::why(safe_mode::read_inputs(), safe_mode::row(safe_mode::feature::mesa_cache));
+        if (!safe_mode::enabled(safe_mode::feature::mesa_cache))
         {
-            ps4_startup_checkpoint("Mesa shader cache: off (mesa-cache-off.flag)");
+            const char* const off = why == safe_mode::reason::kill_flag ? "Mesa shader cache: off (mesa-cache-off.flag)"
+                : why == safe_mode::reason::safe_level ? "Mesa shader cache: off (global safe mode, safe-mode.flag)"
+                : "Mesa shader cache: off (default; mesa-cache.flag turns it on: fewer pipeline compiles per boot, more threads)";
+            // 0.38 behaviour: no cache folder is set; a folder of mesa-env.txt is still Mesa's own choice
+            if (env_set)
+                ps4_startup_checkpoint(fmt::format("%s; MESA_SHADER_CACHE_DIR=%s from mesa-env.txt is used by Mesa as set", off, env_dir).c_str());
+            else
+                ps4_startup_checkpoint(off);
             return;
         }
-        if (const char* dir = ::getenv("MESA_SHADER_CACHE_DIR"); dir && dir[0])
+        if (env_set)
         {
-            ps4_startup_checkpoint(fmt::format("Mesa shader cache: MESA_SHADER_CACHE_DIR=%s from mesa-env.txt kept", dir).c_str());
+            ps4_startup_checkpoint(fmt::format("Mesa shader cache: MESA_SHADER_CACHE_DIR=%s from mesa-env.txt kept", env_dir).c_str());
             return;
         }
         const std::string refusal = mesa_cache_refusal(mesa_cache_dir);
@@ -1278,7 +1320,9 @@ namespace
         ::setenv("MESA_SHADER_CACHE_MAX_SIZE", "512M", 0);
         if (refusal.empty())
         {
-            ps4_startup_checkpoint(fmt::format("Mesa shader cache: %s (512 MiB, Mesa's cache database; on by default, mesa-cache-off.flag disables)", mesa_cache_dir).c_str());
+            // The 0.28-0.38 line, then where the switch came from
+            ps4_startup_checkpoint(fmt::format("Mesa shader cache: %s (512 MiB)%s", mesa_cache_dir,
+                why == safe_mode::reason::enable_flag ? "; Mesa's cache database; mesa-cache.flag" : "; Mesa's cache database; features.txt").c_str());
             return;
         }
         s_mesa_cache_recheck = true;
@@ -1587,6 +1631,18 @@ namespace
         }
     }
 
+    // 0.40: " last: <name>(<result>)@<address> ..." of a PPU thread's newest HLE/LV2 calls (at most 8, newest first), for
+    // its STALL line; empty before its first call. The caller holds the IDM lock (the thread stays alive).
+    std::string recent_calls_text(const ppu_thread& ppu)
+    {
+        ps4_hle_call calls[8];
+        const u32 n = ps4_ppu_recent_calls(ppu, calls, static_cast<u32>(std::size(calls)));
+        if (!n) return {};
+        std::string text = " last:";
+        for (u32 i = 0; i < n; i++) fmt::append(text, " %s(0x%llx)@0x%x", calls[i].name ? calls[i].name : "?", calls[i].ret, calls[i].cia);
+        return text;
+    }
+
     void report_stall(const std::string& reason)
     {
         // Always-on stall dump.
@@ -1629,6 +1685,7 @@ namespace
                 // 0.37: host locks it holds while blocked or parked by lv2, and the one it waits for (lv2.cpp)
                 if (const std::string locks = lv2_obj::ps4_lock_state_text(ppu); !locks.empty()) line += " " + locks;
                 line += describe_ppu_back_chain(ppu);
+                line += recent_calls_text(ppu);
                 lines.push_back(std::move(line));
             }, idm::unlocked);
             idm::select<named_thread<spu_thread>>([&](u32 id, named_thread<spu_thread>& spu)
@@ -1739,6 +1796,7 @@ namespace
         u64 stage_since = 0;      // process time the PPU compile text was first seen (0 = not in that stage)
         u32 done_at_start = 0;    // g_progr_pdone then
         std::string eta;          // appended to the 60 s 'progress:' line while the stage lasts
+        u64 minutes_left = 0;     // 0.40: the same estimate for the heartbeat (0 = no measured rate yet)
     };
     first_boot_compile s_first_compile;
 
@@ -1754,6 +1812,7 @@ namespace
         {
             s.stage_since = 0;
             s.eta.clear();
+            s.minutes_left = 0;
             return;
         }
         const u32 total = g_progr_ptotal.load();
@@ -1771,7 +1830,8 @@ namespace
         const u32 left = total > done ? total - done : 0;
         const u32 finished = done > s.done_at_start ? done - s.done_at_start : 0;
         const double measured = finished >= 2 && elapsed >= 30'000'000 ? finished * 60'000'000. / static_cast<double>(elapsed) : 0.;
-        s.eta = measured > 0 ? fmt::format("; PPU compile %.1f modules/min, ~%llu min left", measured, utils::ps4::compile_minutes_left(left, measured)) : std::string();
+        s.minutes_left = measured > 0 ? utils::ps4::compile_minutes_left(left, measured) : 0;
+        s.eta = measured > 0 ? fmt::format("; PPU compile %.1f modules/min, ~%llu min left", measured, s.minutes_left) : std::string();
         if (s.toast_shown || !utils::ps4::first_boot_toast_due(modules, left, elapsed, measured > 0)) return;
         s.toast_shown = true;
         const u64 minutes = utils::ps4::compile_minutes_left(left, measured > 0 ? measured : 4.);
@@ -1791,16 +1851,45 @@ namespace
     bool s_video_stuck_told = false;
 
     // 0.39: the previous heartbeat line of this boot (process time, guest flips)
+    // 0.40: and the session's draw samples then, so each line tells its own minute
     struct heartbeat_state
     {
         u64 at = 0;
         u64 flips = 0;
+        u32 draw_seconds = 0;
+        u32 measured_seconds = 0;
     };
     heartbeat_state s_heartbeat;
 
     // Stall activity beyond guest flips, progress counters and the save list (s_save_list_open): a native message dialog
     // on screen, kept from the last pass that could read the overlay list (its lock may be busy)
     bool s_native_dialog = false;
+
+    // 0.40: any native dialog of the emulator on screen that waits for the player (message dialog, on-screen keyboard,
+    // user list, media list, home menu), kept the same way. Not activity of the toast rule (that keeps the 0.39
+    // message-dialog rule); it only keeps the per-game safe mode from taking a wait for the player for a failure.
+    bool s_native_ui = false;
+
+    // Main thread (g_fxo is reset on this thread, so the manager cannot go away during the call)
+    void poll_native_ui()
+    {
+        const auto manager = g_fxo->try_get<rsx::overlays::display_manager>();
+        if (!manager)
+        {
+            s_native_dialog = s_native_ui = false;
+            return;
+        }
+        const int dialog = manager->ps4_try_has<rsx::overlays::message_dialog>();
+        if (dialog >= 0) s_native_dialog = dialog > 0;
+        int any = dialog;
+        for (const int has : {manager->ps4_try_has<rsx::overlays::osk_dialog>(), manager->ps4_try_has<rsx::overlays::user_list_dialog>(),
+                 manager->ps4_try_has<rsx::overlays::media_list_dialog>(), manager->ps4_try_has<rsx::overlays::home_menu_dialog>()})
+        {
+            if (any < 0) break;
+            any = has < 0 ? has : any | has;
+        }
+        if (any >= 0) s_native_ui = any > 0;
+    }
 
     // Guest sys_fs_read + sys_fs_write totals of the last passes (one per second, in a ring), for the file I/O rule
     struct fs_io_ring
@@ -1822,15 +1911,73 @@ namespace
     };
     flip_watch s_flip_watch;
 
-    // /data/rpcs3/stall-strict.flag: only guest flips, progress counters and the save list are stall activity (native
-    // dialogs and guest file I/O are not)
+    // 0.40: the 0.38 stall clock beside the activity rule (its dumps are written even when the rule keeps the main
+    // clock running) and the no-progress clock of the per-game safe mode; the reason that kept the main clock running
+    // last, for the dump's headline; the suppressed dumps of this boot (at most two).
+    utils::ps4::quiet_clock s_quiet;
+    utils::ps4::quiet_clock s_no_progress;
+    std::string s_quiet_reason;
+    u32 s_suppressed_dumps = 0;
+    bool s_no_progress_noted = false;
+
+    // 0.40: guest flips that draw nothing (MK Komplete 0.39: 110 s of empty frames after its movie demuxer was refused)
+    utils::ps4::empty_frames_watch s_empty_frames;
+    u64 s_render_passes_seen = 0; // rsx::g_ps4_rsx_phase.render_passes at the previous 1 s sample
+
+    // 0.40: one game session (from a successful boot to the next return to the XMB), for the session line, the
+    // heartbeat, the session record and the clean-session note of the per-game safe mode. Main thread only.
+    struct session_state
+    {
+        std::string title;          // TITLE_ID, empty while no game runs
+        std::string name;           // PARAM.SFO title, for the session record
+        u64 booted_at = 0;          // process time of the boot
+        u64 running_us = 0;         // time the game ran in the foreground
+        u64 last_sample_at = 0;     // previous 1 s sample while running
+        u64 flips = 0;              // guest flips at the last sample
+        u32 draw_seconds = 0;       // 1 s samples with a draw
+        u32 measured_seconds = 0;   // 1 s samples on a renderer that tells draws
+        u32 peak_threads = 0;       // highest console thread count (live + exited not joined)
+        u32 loops = 0;              // HLE loops reported
+        u8 level = 0;               // safe-mode level this boot runs
+        bool refused_before = false; // a thread create had been refused in this process before this boot
+        bool ok_noted = false;      // the clean-session note of this boot was written
+        bool empty_dumped = false;  // the empty-frames dump of this boot was written
+        bool empty_told = false;    // the empty-frames verdict of this boot was logged
+        bool compile_noted = false; // the record said "compile" once at the start of a progress text
+    };
+    session_state s_session;
+
+    // The title and safe-mode level of the last game booted in this process (kept after it ended, for the notice of the
+    // next refusal: the safe mode may have raised that game's level)
+    std::string s_last_boot_title;
+    u8 s_last_boot_level = 0;
+
+    // 0.40: per-thread state of the HLE loop detector (by PPU thread id; cleared at every boot)
+    struct hle_loop_state
+    {
+        u64 last_index = 0;   // the thread's call counter at the previous pass
+        u64 window[6]{};      // calls per 10 s pass, last minute
+        u32 next = 0, filled = 0;
+        u64 told_at = 0;      // first LOOP line of the thread (0 = none)
+        bool seen = false;    // the counter was read once
+        bool told_again = false;
+    };
+    std::unordered_map<u32, hle_loop_state> s_hle_loops;
+    u64 s_hle_next = 0;
+
+    // The 0.38 activity rule: only guest flips, progress counters and the save list are stall activity (native dialogs
+    // and guest file I/O are not). 0.40: the feature row stall_activity, read on every pass (off with stall-strict.flag
+    // or at safe-mode level 1); one line per boot.
+    bool s_strict_told = false;
     bool stall_strict()
     {
-        static const bool strict = [] {
-            const bool present = ::access("/data/rpcs3/stall-strict.flag", F_OK) == 0;
-            if (present) ps4_startup_checkpoint("STALL: 0.38 activity rule (stall-strict.flag): native dialogs and guest file I/O are not activity");
-            return present;
-        }();
+        const bool strict = !safe_mode::enabled(safe_mode::feature::stall_activity);
+        if (strict && !std::exchange(s_strict_told, true))
+        {
+            ps4_startup_checkpoint(::access("/data/rpcs3/stall-strict.flag", F_OK) == 0
+                ? "STALL: 0.38 activity rule (stall-strict.flag): native dialogs and guest file I/O are not activity"
+                : "STALL: 0.38 activity rule (safe mode): native dialogs and guest file I/O are not activity");
+        }
         return strict;
     }
 
@@ -1845,8 +1992,19 @@ namespace
         s_video_stuck_told = false;
         s_heartbeat = {};
         s_native_dialog = false;
+        s_native_ui = false;
         s_io_ring = {};
         s_flip_watch = {};
+        s_quiet.reset_boot();
+        s_no_progress.reset_boot();
+        s_quiet_reason.clear();
+        s_suppressed_dumps = 0;
+        s_no_progress_noted = false;
+        s_empty_frames.reset_boot();
+        s_render_passes_seen = 0;
+        s_hle_loops.clear();
+        s_hle_next = 0;
+        s_strict_told = false;
     }
 
     // 0.39: age of the RSX loop heartbeat in ms, read from rsx::ps4_rsx_wait_state() ("heartbeat N ms ago"); empty
@@ -1865,9 +2023,74 @@ namespace
         return ms;
     }
 
+    // 0.40: whether the renderer drew since the previous 1 s sample. Vulkan counts the render passes its draws open
+    // (rsx::g_ps4_rsx_phase.render_passes, set back to 0 by the RSX thread's 10 s line), so a sample sees the draws since
+    // the previous one or since that reset. Empty on other renderers, without a renderer, and with the phase counters
+    // off (rsx-profiler-off.flag). Main thread, once per second.
+    std::optional<bool> drew_since_last_sample()
+    {
+        if (g_cfg.video.renderer.get() != video_renderer::vulkan || !rsx::get_current_renderer() || !rsx::g_ps4_rsx_phase.on.observe())
+        {
+            s_render_passes_seen = 0;
+            return std::nullopt;
+        }
+        const u64 passes = rsx::g_ps4_rsx_phase.render_passes.observe();
+        const bool drew = passes && passes != s_render_passes_seen;
+        s_render_passes_seen = passes;
+        return drew;
+    }
+
+    // 0.40: the thread classes of the census line (Utilities/Thread.h), without its "PS4 threads: " prefix
+    std::string census_classes()
+    {
+        char line[768];
+        std::string_view text(line, ps4_thread_census_line(line, sizeof(line)));
+        if (constexpr std::string_view prefix = "PS4 threads: "; text.starts_with(prefix)) text.remove_prefix(prefix.size());
+        return std::string(text);
+    }
+
+    // 0.40: "<what> <s> <draw s> <name>" as the session record of the running game (util/ps4_lifecycle.hpp)
+    void write_session_record(const char* what, u64 now)
+    {
+        if (s_session.title.empty()) return;
+        char line[256];
+        const u64 seconds = now > s_session.booted_at ? (now - s_session.booted_at) / 1'000'000 : 0;
+        if (utils::ps4::session_record::format(line, sizeof(line), what, seconds, s_session.draw_seconds, s_session.name))
+            utils::ps4::adapt::write_record(s_session.title, utils::ps4::session_record::suffix, line);
+    }
+
+    // 0.40: what the progress text says the emulator does, for the heartbeat; the overlay texts follow the interface
+    // language, so they are compared with the localized ones. Without a progress text, a message dialog on screen while
+    // a renderer exists and its RSX loop has not run yet is the shader cache preload (the guest draws nothing before
+    // that loop runs). Main thread.
+    utils::ps4::progress_stage boot_progress_stage(bool rsx_loop_ran)
+    {
+        using utils::ps4::progress_stage;
+        if (!g_progr_text)
+        {
+            if (rsx_loop_ran || !rsx::get_current_renderer()) return progress_stage::none;
+            const auto manager = g_fxo->try_get<rsx::overlays::display_manager>();
+            return manager && manager->ps4_try_has<rsx::overlays::message_dialog>() > 0 ? progress_stage::shader_cache : progress_stage::none;
+        }
+        const std::string text = g_progr_text;
+        const auto is = [&text](localized_string_id id) { return text == get_localized_string(id); };
+        if (is(localized_string_id::PROGRESS_DIALOG_COMPILING_PPU_MODULES)) return progress_stage::ppu_compile;
+        if (is(localized_string_id::PROGRESS_DIALOG_BUILDING_SPU_CACHE)) return progress_stage::spu_cache;
+        for (const localized_string_id id : {localized_string_id::PROGRESS_DIALOG_SCANNING_PPU_EXECUTABLE, localized_string_id::PROGRESS_DIALOG_ANALYZING_PPU_EXECUTABLE,
+                 localized_string_id::PROGRESS_DIALOG_SCANNING_PPU_MODULES, localized_string_id::PROGRESS_DIALOG_LOADING_PPU_MODULES,
+                 localized_string_id::PROGRESS_DIALOG_LINKING_PPU_MODULES, localized_string_id::PROGRESS_DIALOG_APPLYING_PPU_CODE})
+        {
+            if (is(id)) return progress_stage::ppu_prepare;
+        }
+        return progress_stage::other;
+    }
+
     // 0.39: one RPCS3.log line per minute while a game exists (testers often send RPCS3.log alone): a session that ends
     // without a stop or fatal line still shows whether the game was drawing, frozen or paused when it ended. The 'PS4'
     // channel is kept by the log history when a long RPCS3.log is cut.
+    // 0.40: plus the thread classes and the safe-mode level, and the "alive" session record; the stage of a boot
+    // progress text instead of "starting or stopping" (a first boot compiles for up to an hour, and testers closed such
+    // boots), and the seconds with a draw since the previous line (flips without draws = a black screen).
     void log_heartbeat(u64 now)
     {
         u64 flips = 0;
@@ -1875,21 +2098,48 @@ namespace
         const u64 elapsed = s_heartbeat.at && now > s_heartbeat.at ? now - s_heartbeat.at : 0;
         const std::string fps = elapsed && flips >= s_heartbeat.flips ? fmt::format("%.1f FPS over %llu s", (flips - s_heartbeat.flips) * 1'000'000. / elapsed, elapsed / 1'000'000)
                                                                        : std::string("first sample");
-        s_heartbeat = {now, flips};
-        const char* state = "starting or stopping";
+        // A new session restarts its sample counts: then the line tells the samples of that session
+        const bool samples_restarted = s_session.measured_seconds < s_heartbeat.measured_seconds;
+        const u32 draw_seconds = samples_restarted ? s_session.draw_seconds : s_session.draw_seconds - std::min(s_heartbeat.draw_seconds, s_session.draw_seconds);
+        const u32 measured_seconds = samples_restarted ? s_session.measured_seconds : s_session.measured_seconds - s_heartbeat.measured_seconds;
+        s_heartbeat = {now, flips, s_session.draw_seconds, s_session.measured_seconds};
+        std::string state = "starting or stopping";
+        bool known_state = true;
         switch (Emu.GetStatus(false))
         {
         case system_state::running: state = ps4_in_background() ? "running, in the background" : "running"; break;
         case system_state::paused: state = "paused"; break;
         case system_state::frozen: state = "frozen"; break;
-        default: break;
+        default: known_state = false; break;
         }
         const std::optional<u64> age = rsx_heartbeat_age_ms();
+        const utils::ps4::progress_stage stage = boot_progress_stage(age.has_value());
+        const std::string stage_text = utils::ps4::progress_stage_text(stage, g_progr_pdone.load(), g_progr_ptotal.load(),
+            stage == utils::ps4::progress_stage::ppu_compile ? s_first_compile.minutes_left : 0);
+        if (!stage_text.empty()) state = known_state ? state + ", " + stage_text : stage_text;
+        // 0.40: the movie file the game holds open (played by its own decoder or through VDEC), so a black or frozen
+        // minute inside a cutscene shows as one. The name comes from the game's files: control characters are masked.
+        std::string movie;
+        {
+            char name[96] = {};
+            unsigned seconds = 0;
+            if (ps4_fs_movie_status(name, sizeof(name), &seconds))
+            {
+                name[sizeof(name) - 1] = 0;
+                for (char* p = name; *p; ++p)
+                    if (static_cast<unsigned char>(*p) < 0x20) *p = '?';
+                movie = fmt::format("; movie '%s' open for %u s", name, seconds);
+            }
+        }
         const ps4_thread_load load = ps4_thread_load_now();
         const u64 rate = ps4_cell_audio_rate_milli();
-        ps4_log.notice("heartbeat: %s %s; guest flips %llu (%s); RSX loop %s; threads %u (live %u + exited not joined %u); audio rate %s",
-            Emu.GetTitleID(), state, flips, fps, age ? fmt::format("%llu ms ago", *age) : std::string("not started"),
-            load.total, load.live, load.unjoined, rate == umax ? std::string("not measured") : fmt::format("%.2f", rate / 1000.));
+        ps4_log.notice("heartbeat: %s %s; guest flips %llu (%s); %s%s; RSX loop %s; threads %u (live %u + exited not joined %u); audio rate %s; %s; safe level %u",
+            Emu.GetTitleID(), state, flips, fps, utils::ps4::heartbeat_draws_text(draw_seconds, measured_seconds), movie,
+            age ? fmt::format("%llu ms ago", *age) : std::string("not started"),
+            load.total, load.live, load.unjoined, rate == umax ? std::string("not measured") : fmt::format("%.2f", rate / 1000.), census_classes(),
+            safe_mode::g_level.load(std::memory_order_relaxed));
+        // "compile" while a progress text is shown (a cache build): a session closed then gets no safe-mode hint
+        write_session_record(g_progr_text ? "compile" : "alive", now);
     }
 
     // 0.37: the SPURS state at the first RSX semaphore timeout of a boot (the RSX thread wrote its label ring then), seen
@@ -1931,12 +2181,92 @@ namespace
         return recent;
     }
 
+    // 0.40: a 1 s sample of the running game for the session line, the heartbeat and the clean-session note of the
+    // per-game safe mode: >= 10 min in the foreground with guest flips and, where the renderer tells, draws, and no
+    // failure in the session (safe_mode::note_ok checks that and writes only at a title level).
+    void sample_session(u64 now, bool running, u64 flips, const std::optional<bool>& drew)
+    {
+        session_state& s = s_session;
+        if (!running || !s.booted_at)
+        {
+            s.last_sample_at = 0;
+            return;
+        }
+        if (s.last_sample_at && now > s.last_sample_at && !ps4_in_background()) s.running_us += std::min<u64>(now - s.last_sample_at, 2'000'000);
+        s.last_sample_at = now;
+        s.flips = flips;
+        if (drew)
+        {
+            s.measured_seconds++;
+            s.draw_seconds += *drew;
+        }
+        s.peak_threads = std::max(s.peak_threads, ps4_thread_load_now().total);
+        if (s.ok_noted || s.running_us < 600'000'000 || flips < 600 || (s.measured_seconds && s.draw_seconds < 60)) return;
+        s.ok_noted = true;
+        safe_mode::note_ok();
+        // note_ok writes only at a level of the title itself (not for the global safe mode alone) and only when this
+        // session noted no failure
+        if (s.level && safe_mode::detail::g_title_level.load(std::memory_order_relaxed) && !safe_mode::detail::g_session_kind.load(std::memory_order_acquire))
+            ps4_startup_checkpoint(fmt::format("safe mode: %s ran 10 min in the foreground at level %u without a failure (safe_ok: the level stays for 8 more boots)",
+                s.title, s.level).c_str());
+    }
+
+    // 0.40: a successful boot starts the session of its game (main thread, right after adapt::set_title)
+    void begin_session()
+    {
+        s_session = {};
+        s_session.title = Emu.GetTitleID();
+        s_session.name = Emu.GetTitle();
+        s_session.booted_at = sceKernelGetProcessTime();
+        s_session.level = safe_mode::g_level.load(std::memory_order_relaxed);
+        ps4_thread_load at{};
+        s_session.refused_before = ps4_thread_first_refusal(at);
+        s_last_boot_title = s_session.title;
+        s_last_boot_level = s_session.level;
+        write_session_record("boot", s_session.booted_at);
+    }
+
+    // 0.40: back to the XMB: one line that sums up the session (startup.log and RPCS3.log), and the end of its record.
+    // Not on the way out of the application: a session closed from the home screen keeps a record without its end.
+    void end_session(const char* why)
+    {
+        session_state& s = s_session;
+        if (!s.booted_at) return;
+        const u64 now = sceKernelGetProcessTime();
+        ps4_thread_load at{};
+        const bool refused = !s.refused_before && ps4_thread_first_refusal(at);
+        const std::string line = fmt::format("session: %s ran %llu s (%llu s in the foreground), flips %llu (%s), peak threads %u/%u, thread create refused in "
+            "this boot: %s, stall dumps %u (suppressed by the activity rule %u, empty frames %u), loops %u, safe level %u, features 0x%llx; %s",
+            s.title.empty() ? std::string("(no title id)") : s.title, now > s.booted_at ? (now - s.booted_at) / 1'000'000 : 0, s.running_us / 1'000'000, s.flips,
+            s.measured_seconds ? fmt::format("draws>0 for %u of %u sampled s", s.draw_seconds, s.measured_seconds) : std::string("draws not measured"),
+            s.peak_threads, utils::ps4::governor::thread_cap(), refused ? fmt::format("yes (at %u threads)", at.total) : std::string("no"),
+            s_stall_dumps_total, s_suppressed_dumps, s.empty_dumped ? 1u : 0u, s.loops, s.level, safe_mode::g_on.load(std::memory_order_relaxed), why);
+        ps4_startup_checkpoint(line.c_str());
+        ps4_log.notice("%s", line);
+        if (!s.title.empty()) utils::ps4::adapt::write_record(s.title, utils::ps4::session_record::suffix, "end xmb");
+        s = {};
+    }
+
     void poll_stall_watchdog(u64 now)
     {
         static u64 next_check = 0;
         u32& total_dumps = s_stall_dumps_total;
         if (now < next_check) return;
         next_check = now + 1'000'000;
+        // 0.40: a focus change, a resume from rest mode, or a gap in these passes (the main loop did not get here for
+        // 10 s) restarts the safe mode's clocks below: time spent away says nothing about the game
+        static u32 s_focus_seen = 0;
+        static u64 s_last_pass = 0;
+        const u32 focus = ps4_focus_epoch();
+        const bool away = std::exchange(s_focus_seen, focus) != focus || (s_last_pass && now - s_last_pass > 10'000'000);
+        s_last_pass = now;
+        // 0.40: the class census Utilities/Thread.cpp asked for (a thread level change, a refused create), printed here and
+        // never on the thread that creates or refuses
+        if (ps4_census_due())
+        {
+            char census[1024];
+            if (ps4_thread_census_line(census, sizeof(census))) ps4_startup_checkpoint(census);
+        }
         const bool running = Emu.IsRunning();
         poll_rsx_timeout_dump(running);
         u64 flips = 0;
@@ -1947,48 +2277,117 @@ namespace
         }
         const u64 progress = (u64{g_progr_pdone.load()} << 32) ^ (u64{g_progr_ptotal.load()} << 48) ^
             (u64{g_progr_fdone.load()} << 8) ^ g_progr_ftotal.load();
-        u64 activity = (flips * 0x9e3779b97f4a7c15ull) ^ progress;
         // 0.33: an open native save data list counts as activity: native UI frames are not guest flips, and the game
-        // thread waiting in the list must not earn the 'game looks frozen' toast, fatal note and STALL dumps
+        // thread waiting in the list must not earn the 'game looks frozen' toast, fatal note and STALL dumps.
+        // 0.40: this is the 0.38 activity, also the one of the quiet clocks below.
         const bool save_list = s_save_list_open.load(std::memory_order_relaxed) != 0;
+        // Each signature is built from 'moved' once (a wait mixes 'now' in a single time, so two waits cannot cancel)
+        const u64 moved = (flips * 0x9e3779b97f4a7c15ull) ^ progress;
+        const u64 strict_activity = moved ^ (save_list ? now : 0);
         // The same for a native message dialog on screen (a game's install progress bar, a question not answered yet)
         // and for a game busy with its own file I/O, while the RSX loop runs: the RSX thread draws the dialog, so a stale
-        // heartbeat means the picture is frozen too, and the dumps and the video toast stay
+        // heartbeat means the picture is frozen too, and the dumps and the video toast stay.
+        // 0.40: dialogs and file I/O are read in every pass while the game runs (the safe mode's no-progress rule waits
+        // for them too); only the toast rule depends on stall_activity.
         std::string reason;
         std::optional<u64> rsx_age;
-        if (running && !stall_strict())
+        bool heavy_io = false;
+        if (running)
         {
-            // g_fxo is reset on this thread (the main thread), so the manager cannot go away during the call
-            if (auto manager = g_fxo->try_get<rsx::overlays::display_manager>())
-                if (const int has = manager->ps4_try_has<rsx::overlays::message_dialog>(); has >= 0) s_native_dialog = has > 0;
+            poll_native_ui();
             const u64 io_calls = recent_fs_io_calls(now);
+            // The safe mode's no-progress rule waits for file I/O whatever the RSX loop does (a heartbeat is not
+            // reported by every renderer); the toast rule keeps its 0.39 condition
+            heavy_io = io_calls >= busy_fs_io_calls;
             rsx_age = rsx_heartbeat_age_ms();
-            if (rsx_age && *rsx_age < 20'000)
+            if (!stall_strict() && rsx_age && *rsx_age < 20'000)
             {
                 if (s_native_dialog) reason = "a native message dialog is on screen";
-                else if (io_calls >= busy_fs_io_calls) reason = fmt::format("the game reads or writes files (%llu calls in 5 s)", io_calls);
+                else if (heavy_io) reason = fmt::format("the game reads or writes files (%llu calls in 5 s)", io_calls);
             }
         }
         else
         {
             s_io_ring = {};
         }
-        if (save_list || !reason.empty()) activity ^= now;
+        const u64 activity = moved ^ (save_list || !reason.empty() ? now : 0);
         // One line per boot once such a reason kept the stall clock running for as long as the first dump takes
         if (flips != s_flip_watch.flips || !s_flip_watch.since) s_flip_watch = {flips, now, s_flip_watch.told};
         if (!save_list && !reason.empty() && !s_flip_watch.told && now - s_flip_watch.since >= utils::ps4::stall_watchdog::first_dump_us)
         {
             s_flip_watch.told = true;
-            ps4_startup_checkpoint(fmt::format("STALL: no guest flip for %llu s while %s; RSX loop %llu ms ago: counted as activity, no STALL dump and no "
-                "'game looks frozen' toast (stall-strict.flag restores the 0.38 rule)", (now - s_flip_watch.since) / 1'000'000, reason, *rsx_age).c_str());
+            ps4_startup_checkpoint(fmt::format("STALL: no guest flip for %llu s while %s; RSX loop %llu ms ago: counted as activity, no 'game looks frozen' "
+                "toast; STALL dumps at 60 s and 300 s (stall-strict.flag restores the 0.38 rule)", (now - s_flip_watch.since) / 1'000'000, reason, *rsx_age).c_str());
         }
         const bool compiling = poll_compile_stage();
         poll_first_boot_compile(now, compiling);
+        // 0.40: the session record says so as soon as a progress text appears, not only at the next heartbeat
+        if (compiling && s_session.booted_at && !std::exchange(s_session.compile_noted, true)) write_session_record("compile", now);
         const bool dump_due = s_stall.poll(running, now, activity);
         // 0.31: after 30 s without a guest flip or progress, one toast and one fatal note, so the player learns how to
         // close the game and the next boot shows why. Called on every pass: a pass without a long stall re-arms it.
         // Never while the progress text is shown, in the background or while paused.
         utils::ps4::health::on_stall(s_stall.stalled_us(now), running, ps4_in_background(), compiling);
+
+        // 0.40: the same stall under the 0.38 rule. While the activity rule keeps the main clock running, its 60 s and
+        // 300 s marks still get a dump, without a toast or a fatal note (the Minecraft 0.39 world loads left none).
+        const unsigned quiet_mark = s_quiet.poll(running, now, strict_activity);
+        if (!s_quiet.quiet_us(now)) s_quiet_reason.clear();
+        if (!reason.empty()) s_quiet_reason = reason;
+        if (quiet_mark && s_suppressed_dumps < 2 && !s_quiet_reason.empty() && s_stall.stalled_us(now) + 2'000'000 < s_quiet.quiet_us(now))
+        {
+            s_suppressed_dumps++;
+            report_stall(fmt::format("no guest flip or progress for %llu s (guest flips=%llu) (suppressed by the activity rule: %s)",
+                s_quiet.quiet_us(now) / 1'000'000, flips, s_quiet_reason));
+        }
+
+        // 0.40: the no-progress failure of the per-game safe mode: 5 min without a guest flip or a progress counter, and
+        // nothing a legitimate long wait shows (any progress text, e.g. a PPU/SPU/pipeline cache build; a native dialog,
+        // on-screen keyboard, user or media list, the home menu or the save list; heavy guest file I/O; pipelines still
+        // queued or compiling; the home screen or a system overlay; a resume or a gap in these passes). A pause stops
+        // the clock.
+        const bool pipelines = rsx::g_ps4_rsx_counters.pipe_pending.load() != 0;
+        const bool waiting = compiling || save_list || s_native_ui || s_native_dialog || heavy_io || pipelines || ps4_in_background() || away;
+        if (s_no_progress.poll(running, now, moved ^ (waiting ? now : 0)) == 2 && !std::exchange(s_no_progress_noted, true))
+        {
+            safe_mode::note_failure(safe_mode::fail_kind::stall);
+            ps4_startup_checkpoint(fmt::format("STALL: no guest flip or progress for %llu s, and no progress text, native dialog, file activity, pipeline compile "
+                "or home screen to wait for: a failure of %s for the per-game safe mode (fail=stall; one failure per session)", s_no_progress.quiet_us(now) / 1'000'000,
+                s_session.title.empty() ? std::string("the game") : s_session.title).c_str());
+        }
+
+        // 0.40: guest flips that draw nothing. One PPU dump at 60 s; at 120 s a failure when a thread create was refused in
+        // this boot (Mortal Kombat Komplete 0.39). Not while something legitimate is shown or loads, nor while pipelines
+        // still compile (their draws are skipped by design).
+        const std::optional<bool> drew = drew_since_last_sample();
+        const bool counted = running && drew && !waiting;
+        switch (s_empty_frames.poll(counted, now, flips != s_session.flips, drew.value_or(false)))
+        {
+        case 1:
+            if (!std::exchange(s_session.empty_dumped, true))
+                report_stall(fmt::format("guest flips without a draw for %llu s (guest flips=%llu)", s_empty_frames.empty_us(now) / 1'000'000, flips));
+            break;
+        case 2:
+            if (s_session.empty_told) break;
+            s_session.empty_told = true;
+            if (ps4_thread_load refused{}; !s_session.refused_before && ps4_thread_first_refusal(refused))
+            {
+                safe_mode::note_failure(safe_mode::fail_kind::stall);
+                ps4_startup_checkpoint(fmt::format("STALL: guest flips without a draw for %llu s after a refused thread create (at %u threads): a failure of %s "
+                    "for the per-game safe mode (fail=stall; one failure per session)", s_empty_frames.empty_us(now) / 1'000'000, refused.total,
+                    s_session.title.empty() ? std::string("the game") : s_session.title).c_str());
+            }
+            else
+            {
+                ps4_startup_checkpoint(fmt::format("STALL: guest flips without a draw for %llu s; no thread create was refused in this boot: not counted as a failure",
+                    s_empty_frames.empty_us(now) / 1'000'000).c_str());
+            }
+            break;
+        default:
+            break;
+        }
+        sample_session(now, running, flips, drew);
+
         if (!dump_due || total_dumps >= 15) return;
         total_dumps++;
         report_stall(fmt::format("no guest flip or progress for %llu s (guest flips=%llu, dump %u/%u)",
@@ -2004,6 +2403,62 @@ namespace
             ps4_startup_checkpoint(fmt::format("STALL: the RSX loop heartbeat is %llu ms old after %llu s without a guest flip; toast asks to close the application",
                 *age, s_stall.stalled_us(now) / 1'000'000).c_str());
             ps4_notify(i18n::tr(i18n::str::MAIN_JOGO_TRAVOU_VIDEO));
+        }
+    }
+
+    // 0.40: a PPU thread stuck repeating a short list of HLE/LV2 calls while the game still flips (Mortal Kombat Komplete
+    // 0.39: 'PoolThread' opened and closed an audio port about 80 times a second, 19351 TODO lines). Every 10 s, with the
+    // IDM lock only tried (as report_stall), each thread's call counter and its last 32 calls (PPUThread.cpp
+    // ps4_ppu_recent_calls). A thread with 1000 calls a minute or more whose recent calls are at most three names and an
+    // open/close (create/destroy, init/end, ...) pair or one CELL error code over and over gets one LOOP line, and one more
+    // if it still repeats 5 min later. A log line only: such a loop may be the game's own polling.
+    void poll_hle_loops(u64 now)
+    {
+        if (now < s_hle_next) return;
+        s_hle_next = now + 10'000'000;
+        if (!Emu.IsRunning() || !id_manager::g_mutex.try_lock_shared()) return;
+        std::vector<std::string> lines;
+        u32 first_lines = 0;
+        idm::select<named_thread<ppu_thread>>([&](u32 id, named_thread<ppu_thread>& ppu)
+        {
+            hle_loop_state& st = s_hle_loops[id];
+            // Written by that thread on every call (aligned u64): a stale value only delays a verdict
+            const u64 index = ppu.syscall_history.index;
+            const u64 delta = st.seen && index >= st.last_index ? index - st.last_index : 0;
+            const bool counted = st.seen;
+            st.seen = true;
+            st.last_index = index;
+            if (!counted) return;
+            st.window[st.next] = delta;
+            st.next = (st.next + 1) % std::size(st.window);
+            st.filled = std::min<u32>(st.filled + 1, static_cast<u32>(std::size(st.window)));
+            u64 calls = 0;
+            for (u32 i = 0; i < st.filled; i++) calls += st.window[i];
+            const u64 seconds = u64{st.filled} * 10;
+            if (calls * 60 < 1000 * seconds) return;
+            if (st.told_at && (st.told_again || now - st.told_at < 300'000'000)) return;
+            ps4_hle_call recent[32];
+            const u32 n = ps4_ppu_recent_calls(ppu, recent, static_cast<u32>(std::size(recent)));
+            const utils::ps4::call_pattern p = utils::ps4::recent_pattern(recent, n);
+            if (!p.first || p.distinct > 3 || !(p.pair || p.same_error)) return;
+            const bool again = st.told_at != 0;
+            if (again) st.told_again = true;
+            else
+            {
+                st.told_at = now;
+                first_lines++;
+            }
+            lines.push_back(fmt::format("LOOP: PPU 0x%x '%s' repeats %s%s%s (%llu calls in %llu s, ret 0x%llx%s)%s", id, ppu.get_name(), p.first,
+                p.second ? "/" : "", p.second ? p.second : "", calls, seconds, p.ret, p.same_error ? ", the same error every call" : "",
+                again ? "; still repeating 5 min later" : ""));
+        }, idm::unlocked);
+        id_manager::g_mutex.unlock_shared();
+        s_session.loops += first_lines;
+        // File I/O only after the IDM lock is released
+        for (const std::string& line : lines)
+        {
+            ps4_startup_checkpoint(line.c_str());
+            ps4_log.warning("%s", line);
         }
     }
 
@@ -2136,6 +2591,48 @@ namespace
         return title.empty() ? game_display_name(path) : ps4_fatal_detail::utf8_prefix(title, 70);
     }
 
+    // 0.40: the safe-mode level the next boot of the game at 'path' runs when a failure of its last session in this
+    // process raised it (its adapt file holds a level above the one that session ran), else 0; also 0 once level 3
+    // failed again. For the notice of the refusal after a thread fatal: the game is worth a new start then.
+    unsigned raised_safe_level(const std::string& path)
+    {
+        if (s_last_boot_title.empty() || boot_title_id(path) != s_last_boot_title) return 0;
+        const std::string text = utils::ps4::adapt::read_text(s_last_boot_title);
+        const utils::ps4::adapt::safe_state st = utils::ps4::adapt::safe_status(text);
+        return st.level > s_last_boot_level && !st.exhausted ? st.level : 0;
+    }
+
+    // 0.40: session records left without their end after less than 10 min (util/ps4_lifecycle.hpp session_record): the
+    // player closed the game from the home screen soon after it started, e.g. because the menus worked but the game
+    // never got past them. Not a failure, so no level is written; one toast per title (at most two) points at the
+    // per-game row, and the record is closed so the toast comes once. Main thread, before the first XMB.
+    void suggest_safe_mode_after_short_sessions()
+    {
+        namespace adapt = utils::ps4::adapt;
+        namespace sr = utils::ps4::session_record;
+        u32 shown = 0;
+        for (const auto& entry : fs::dir(std::string(adapt::adapt_dir) + "/"))
+        {
+            if (entry.is_directory || entry.name.size() <= sr::suffix.size() || !entry.name.ends_with(sr::suffix)) continue;
+            const std::string title = entry.name.substr(0, entry.name.size() - sr::suffix.size());
+            const std::string record = adapt::read_record(title, sr::suffix);
+            const sr::state st = sr::parse(record);
+            if (!sr::hint_due(st)) continue;
+            adapt::write_record(title, sr::suffix, "end hint");
+            // A failure of that session already raised the title's level: its next boot says so itself
+            const std::string text = adapt::read_text(title);
+            if (const adapt::safe_state safe = adapt::safe_status(text); safe.level && !safe.boots_since)
+            {
+                ps4_startup_checkpoint(fmt::format("session: %s ended after %llu s without returning to the XMB; a failure was noted (safe level %u): no hint",
+                    title, st.seconds, safe.level).c_str());
+                continue;
+            }
+            ps4_startup_checkpoint(fmt::format("session: %s ended after %llu s without returning to the XMB (closed from the home screen?); toast suggests "
+                "the per-game safe mode%s", title, st.seconds, shown < 2 ? "" : " (not shown: two toasts already)").c_str());
+            if (shown++ < 2) ps4_notify(i18n::trf(i18n::str::MAIN_DICA_MODO_SEGURO, {st.name.empty() ? std::string_view(title) : st.name}).c_str());
+        }
+    }
+
     // 0.34: the disc package install that ran inside the current BootGame (on_install_pkgs, main thread), for the
     // boot result shown afterwards: the installer's own line for install_failed, and for an install-only disc
     // (nothing_to_boot) the game it installed. Reset by select_and_boot before every BootGame.
@@ -2181,7 +2678,9 @@ namespace
 
     // Main loop, every pass. The drive is read by the drive service's own worker; tick_event only reads its last
     // status (at most every 250 ms).
-    void poll_disc_watch(u64 now)
+    // 0.40: the pause is the feature row disc_pause; at safe-mode level 1 a removal closes the game as in 0.38 (the same
+    // graceful stop as L1+R1+Triangle) and 'menu_notice' says why.
+    void poll_disc_watch(u64 now, std::string& menu_notice)
     {
         using utils::ps4::disc_lock::watch_event;
         if (s_disc_watch.due())
@@ -2190,6 +2689,14 @@ namespace
             {
             case watch_event::removed:
             {
+                if (!safe_mode::enabled(safe_mode::feature::disc_pause))
+                {
+                    ps4_startup_checkpoint("disc lock: the game's disc left the drive; the game is closed (safe mode: the 0.38 rule, no pause)");
+                    // The untranslated marker, as in 0.38: the XMB recognises it and shows the translated system dialog
+                    if (menu_notice.empty()) menu_notice = utils::ps4::disc_lock::removed_notice;
+                    s_lifecycle.request_menu();
+                    break;
+                }
                 const bool running = Emu.IsRunning();
                 if (running) Emu.Pause(false, false);
                 s_disc_paused = true;
@@ -3119,9 +3626,13 @@ namespace
             }
         }
         i18n::apply(setting.value_or(i18n::setting::automatic), rc == 0 ? system : -1);
-        ps4_startup_checkpoint(fmt::format("i18n: ui-language.txt '%s' (%s), PS4 system language %d (rc 0x%x) -> %s; game language auto -> %s",
+        // 0.40: the automatic game language is English (US) again (as 0.25-0.38); the PS4 language is the row value
+        // "Idioma do PS4" of Configurações > Idioma dos jogos (or game_language_ps4 in features.txt). Each boot's policy
+        // line names the language that boot uses.
+        ps4_startup_checkpoint(fmt::format("i18n: ui-language.txt '%s' (%s), PS4 system language %d (rc 0x%x) -> %s; game language auto -> English (US) "
+            "(default; Configurações > Idioma dos jogos chooses another; the PS4 language there: %s)",
             ps4_fatal_detail::utf8_prefix(token, 64), origin, rc == 0 ? system : -1, static_cast<u32>(rc), i18n::lang_token(i18n::current()),
-            i18n::tr(i18n::game_language_name(i18n::game_language_auto()), i18n::lang::en)).c_str());
+            i18n::tr(i18n::game_language_name(i18n::cell_lang_from_ps4(i18n::system_language())), i18n::lang::en)).c_str());
     }
 
 	void configure_callbacks()
@@ -3240,6 +3751,15 @@ namespace
             // no syscalls); its memory and the GPU are still in use, so returning to the XMB
             // is unsafe. Record it and ask the shell to close us; never abort/_Exit (CE-34878-0).
             ps4_startup_checkpoint(fmt::format("shutdown: emulation threads did not stop within %d s", seconds).c_str());
+            // 0.40: a stop that never finished is a failure of the game for the per-game safe mode (allocation-free notes).
+            // Not while a PPU module compile holds the stop: a module compile cannot be interrupted, may outlast the
+            // watchdog on the Jaguar, and no safe-mode level makes it shorter.
+            if (!g_watchdog_hold_ctr)
+                safe_mode::note_failure(safe_mode::fail_kind::stall);
+            else
+                ps4_startup_checkpoint("shutdown: a PPU module compile still holds the stop; not counted as a failure of the game");
+            if (char title[utils::ps4::adapt::title_size]; utils::ps4::adapt::current_title(title))
+                utils::ps4::adapt::write_record(title, utils::ps4::session_record::suffix, "end stall");
             report_guest_threads();
             if (!ps4_try_leave_application("emulation stop timed out"))
                 ps4_notify(i18n::tr(i18n::str::MAIN_RPCS3_PS4_JOGO_NAO_RESPONDEU));
@@ -3321,6 +3841,17 @@ namespace
 			// 0.39: the home menu's audio and overlay settings take effect in the running game, as on PC
 			// (main_application::OnEmuSettingsChange, also run on the main thread there). configure_audio only stores a
 			// request for the cellAudio thread; the call is skipped when the game stopped meanwhile.
+			// 0.40: the feature row home_menu_apply. No title level reverts it (the near-cap titles that reach a level are
+			// the ones whose sound needs the change), but the global safe mode is the player's request for the 0.38 path
+			// everywhere, so there only the log settings apply at once (the saved values apply from the next boot).
+			if (!safe_mode::enabled(safe_mode::feature::home_menu_apply) || safe_mode::global_this_boot())
+			{
+				// One line per game boot (the adapt title sequence changes at every boot), not one per changed value
+				static std::atomic<u32> s_told_seq{0};
+				if (const u32 seq = utils::ps4::adapt::g_title_seq.load(std::memory_order_acquire); s_told_seq.exchange(seq, std::memory_order_acq_rel) != seq)
+					ps4_startup_checkpoint("home menu: audio and overlay settings apply from the next boot (safe mode: the 0.38 rule)");
+				return;
+			}
 			Emu.CallFromMainThread([]
 			{
 				if (Emu.IsStopped()) return;
@@ -3404,6 +3935,9 @@ int main(int argc, char** argv)
     ps4_startup_main_entered();
     ps4_startup_checkpoint(fmt::format("RPCS3 PS4 EDITION %s", ps4_build_version).c_str());
     init_interface_language(); // before the first toast or XMB text built here
+    // 0.40: the feature table (util/ps4_safe_mode.hpp): enable/kill flags, features.txt, safe-mode.flag; fixes the rows
+    // that hold for the whole process (the Mesa cache below) and logs 'features (process): ...'
+    safe_mode::init_process();
     {
         // 0.26: round-robin among equal priorities (Utilities/Thread.cpp). Before any emulator thread
         // exists, so std::thread/Mesa children inherit it.
@@ -3669,6 +4203,8 @@ int main(int argc, char** argv)
         ps4_pads::refresh(/*compact=*/true, /*force=*/true);
     else
         ps4_startup_checkpoint("pads: pad library not ready at boot; retried on the next refresh");
+    // 0.40: a game closed from the home screen soon after it started: one toast suggests its per-game safe mode
+    suggest_safe_mode_after_short_sessions();
     std::string last_game_path;
     const auto select_and_boot = [&](const std::string& preferred, const std::string& notice = {})
     {
@@ -3759,15 +4295,24 @@ int main(int argc, char** argv)
                 ps4_startup_checkpoint(fmt::format("lifecycle: boot-next not written for '%s': incomplete image", path).c_str());
                 notice = incomplete_iso_fatal_notice();
             }
-            else if (s_same_fatal_again && path == s_boot_next_game)
+            else if (const unsigned raised = raised_safe_level(path); s_same_fatal_again && path == s_boot_next_game && !raised)
             {
                 ps4_startup_checkpoint(fmt::format("lifecycle: '%s' ended with the same fatal as the previous session after a boot-next start; boot-next not written", path).c_str());
                 notice = emulator_error_encoded(i18n::trf(i18n::str::MAIN_FECHOU_NOVO_MESMO_ERRO, {boot_title_name(path)}), false);
             }
             else
             {
-                // The dialog asks to close and reopen the application; the boot-next note follows
-                notice = emulator_error_encoded(boot_next_note(path));
+                // The dialog asks to close and reopen the application; the boot-next note follows. 0.40: while the per-game
+                // safe mode raises the game's level (up to 3), a new start is worth it even after the same fatal: the
+                // next boot runs with fewer changes, and the dialog says so.
+                std::string note = boot_next_note(path);
+                if (raised)
+                {
+                    ps4_startup_checkpoint(fmt::format("lifecycle: '%s': boot-next written; its next boot opens in safe mode level %u%s", path, raised,
+                        s_same_fatal_again && path == s_boot_next_game ? " (same fatal as the previous session)" : "").c_str());
+                    note += " · " + i18n::trf(i18n::str::MAIN_ABRE_MODO_SEGURO_NIVEL, {raised});
+                }
+                notice = emulator_error_encoded(note);
             }
             path = ps4_select_game(path, xmb_text(notice));
             if (path == refused && std::chrono::steady_clock::now() - asked_at < std::chrono::milliseconds(300))
@@ -3840,6 +4385,8 @@ int main(int argc, char** argv)
             s_frozen_seen = false;
             start_disc_watch(path);
             rearm_stall_watchdog();
+            // 0.40: the session line, the session record and the safe mode's clean-session note count from here
+            begin_session();
             // 0.38: the session's memory peaks for its record (written when the XMB opens again)
             s_games_booted++;
             utils::ps4::governor::begin_session();
@@ -3878,6 +4425,7 @@ int main(int argc, char** argv)
     }
 
     u64 next_progress_report = sceKernelGetProcessTime() + 10'000'000;
+    u64 next_log_flush = 0;
     const bool detailed_diagnostics = fs::is_file("/data/rpcs3/diagnostics.flag");
     std::string menu_notice;
     bool gpu_lost_stop = false; // 0.31: the pending return to the XMB follows a GPU device loss
@@ -3989,6 +4537,8 @@ int main(int argc, char** argv)
             static const bool s_frozen_stays = fs::is_file("/data/rpcs3/frozen-stays.flag");
             char fault[160]{};
             const bool known = ps4_take_guest_fault(fault, sizeof(fault));
+            // 0.40: a crash of the game for the per-game safe mode (also when it stays frozen)
+            safe_mode::note_failure(safe_mode::fail_kind::crash);
             if (s_frozen_stays)
             {
                 ps4_startup_checkpoint(fmt::format("lifecycle: the game froze after a guest access violation (%s); it stays frozen (frozen-stays.flag)",
@@ -4011,7 +4561,7 @@ int main(int argc, char** argv)
         }
         // 0.38: the disc of a game installed from a PS3 disc left the drive: the game was closed. 0.39: it pauses until
         // a disc of the game is back (poll_disc_watch).
-        if (!Emu.IsStopped() && !s_lifecycle.requested()) poll_disc_watch(sceKernelGetProcessTime());
+        if (!Emu.IsStopped() && !s_lifecycle.requested()) poll_disc_watch(sceKernelGetProcessTime(), menu_notice);
         // 0.38: the renderer could not serve a required allocation (GPU window, or the CPU heap for an RSX container)
         // and asked for a graceful stop (util/ps4_vram_policy.hpp; it already showed a toast and asked for the XMB): the
         // XMB says why in a system dialog. A CPU heap stop also arms the clean-process rule.
@@ -4062,6 +4612,17 @@ int main(int argc, char** argv)
                         ps4_startup_checkpoint("lifecycle: staying in the game (it relaunched itself); XMB not opened");
                         const std::string running = Emu.GetTitleID();
                         char noted[utils::ps4::adapt::title_size];
+                        // 0.40: a relaunch into another title ends this session and starts that title's one
+                        if (running != s_session.title)
+                        {
+                            end_session("the game started another title's executable");
+                            if (!running.empty() && (!utils::ps4::adapt::current_title(noted) || running != noted))
+                                utils::ps4::adapt::set_title(running);
+                            rearm_stall_watchdog();
+                            begin_session();
+                            next_progress_report = sceKernelGetProcessTime() + 10'000'000;
+                            break;
+                        }
                         if (!running.empty() && (!utils::ps4::adapt::current_title(noted) || running != noted))
                             utils::ps4::adapt::set_title(running);
                         rearm_stall_watchdog();
@@ -4090,6 +4651,9 @@ int main(int argc, char** argv)
                     {
                         ps4_startup_checkpoint("lifecycle: emulator still stopping after 15 s; opening the XMB anyway");
                     }
+                    // 0.40: a stop that did not finish is a failure of the game for the per-game safe mode, except while a
+                    // PPU module compile holds it (uninterruptible; the Stop Watchdog waits 25 s for it)
+                    if (!g_watchdog_hold_ctr) safe_mode::note_failure(safe_mode::fail_kind::stall);
                 }
                 if (take_gpu_lost())
                 {
@@ -4113,6 +4677,8 @@ int main(int argc, char** argv)
                 s_disc_resume_due = false;
                 // the cheat session of the game that ended (the next boot starts its own)
                 ps4_cheats::reset();
+                // 0.40: the session line and the end of the session record, while the adapt title is still set
+                end_session("back to the XMB");
                 // 0.31: on the main thread, after the stop and right before the XMB: clears the adapt title (a failure
                 // from now on is not charged to the game that just ended) and returns free heap carve-outs.
                 utils::ps4::health::on_return_to_xmb();
@@ -4148,7 +4714,7 @@ int main(int argc, char** argv)
                 // live estimate from exit notes), exited but not joined (stack still pinned), joined, returned, and
                 // libkernel stacks held = flexible used since main / 2 MiB.
                 char census[768];
-                ps4_thread_census_line(census, sizeof(census));
+                ps4_orbis_census_line(census, sizeof(census));
                 ps4_startup_checkpoint(census);
             }
             // 0.29: live RPCS3 threads by name (registry) and the own-stack pool / rescue state.
@@ -4202,6 +4768,14 @@ int main(int argc, char** argv)
         // in the background; at most 4096 accesses / 2 ms per pass
         ps4_cheats::tick(sceKernelGetProcessTime());
         poll_stall_watchdog(sceKernelGetProcessTime());
+        // 0.40: HLE loop lines (every 10 s, log only)
+        poll_hle_loops(sceKernelGetProcessTime());
+        // 0.40: the repeated-line limiter's summaries and notes (util/logs.cpp), once per second
+        if (const u64 now = sceKernelGetProcessTime(); now >= next_log_flush)
+        {
+            next_log_flush = now + 1'000'000;
+            logs::ps4_flush_repeated_lines();
+        }
         // 0.29: the sampling profiler runs here (no thread of its own); it asks for ~1 ms ticks only while a census
         // waits for replies or a burst samples.
         const bool running = Emu.IsRunning();

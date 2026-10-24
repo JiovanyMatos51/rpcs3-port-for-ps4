@@ -1125,6 +1125,38 @@ void test_drive()
     d.request_check();
     s = wait_for([](const ds::disc_status& x) { return x.state == ds::disc_state::no_server; });
     assert(logs.has("disc stream: drive: no FTP server"));
+    // Without a link probe the cause is unknown: the 0.39 texts
+    assert(s.net_link == -1 && !ds::no_network(s) && logs.has("disc stream: drive: no FTP server (network state unknown): "));
+
+    // Every server refused while NetCtl has no IP address: the network is missing (GoldHEN's FTP server does not listen
+    // without one), told apart from an FTP server switched off on a console with a network; each change of the cause is
+    // one line, the drive row says which
+    std::atomic<int> link{1};
+    d.set_link_probe([&link] { return link.load(); });
+    d.request_check();
+    s = wait_for([](const ds::disc_status& x) { return x.net_link == 1; });
+    assert(s.state == ds::disc_state::no_server && ds::no_network(s));
+    assert(logs.has("disc stream: drive: no FTP server (no network: netctl state 1): 127.0.0.1:2121: connect failed"));
+    assert(di::drive_row(s, nullptr).label == "Disco de PS3: sem rede, o FTP do GoldHEN não atende");
+    assert(di::drive_row(s, nullptr).help.find("não precisa de internet") != std::string::npos);
+    const std::size_t lines_before = logs.count("disc stream: drive: no FTP server");
+    d.request_check();
+    s = wait_for([&](const ds::disc_status& x) { return x.checked_ms > s.checked_ms; });
+    assert(s.net_link == 1 && logs.count("disc stream: drive: no FTP server") == lines_before); // no change: no line
+    link = ds::netctl_ip_obtained;
+    d.request_check();
+    s = wait_for([](const ds::disc_status& x) { return x.net_link == ds::netctl_ip_obtained; });
+    assert(s.state == ds::disc_state::no_server && !ds::no_network(s));
+    assert(logs.has("disc stream: drive: no FTP server (network up: GoldHEN FTP off?): "));
+    assert(di::drive_row(s, nullptr).label == "Disco de PS3: ligue o FTP do GoldHEN");
+    // The disc lines that go to RPCS3.log as well: nothing without a sink, every line given to one
+    static std::vector<std::string> mirrored;
+    ds::mirror("disc stream: drive: test");
+    ds::log_mirror.store([](std::string_view line) { mirrored.emplace_back(line); });
+    ds::mirror("disc stream: drive: test");
+    ds::log_mirror.store(nullptr);
+    ds::mirror("disc stream: drive: test 2");
+    assert(mirrored == std::vector<std::string>{"disc stream: drive: test"});
 
     // The worker ends once poll() is no longer called
     assert(d.wait_idle(5000));

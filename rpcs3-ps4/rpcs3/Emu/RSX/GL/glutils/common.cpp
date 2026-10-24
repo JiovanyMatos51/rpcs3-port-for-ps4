@@ -26,10 +26,46 @@ namespace gl
 		s_current_state = &ctx;
 	}
 
+#ifdef RPCS3_PS4
+	static bool (*s_ps4_vram_relief)() = nullptr;
+
+	void ps4_set_vram_relief(bool (*relief)())
+	{
+		s_ps4_vram_relief = relief;
+	}
+
+	bool ps4_vram_relief()
+	{
+		return s_ps4_vram_relief && s_ps4_vram_relief();
+	}
+
+	void ps4_clear_command_context()
+	{
+		s_current_state = nullptr;
+	}
+
+	bool ps4_has_command_context()
+	{
+		return s_current_state != nullptr;
+	}
+
+	gl::command_context get_command_context()
+	{
+		if (!s_current_state) [[unlikely]]
+		{
+			// Bookkeeping only (bind tables): nothing reaches a destroyed renderer
+			static gl::driver_state s_detached;
+			return { s_detached };
+		}
+
+		return { *s_current_state };
+	}
+#else
 	gl::command_context get_command_context()
 	{
 		return { *s_current_state };
 	}
+#endif
 
 	attrib_t vao::operator[](u32 index) const noexcept
 	{

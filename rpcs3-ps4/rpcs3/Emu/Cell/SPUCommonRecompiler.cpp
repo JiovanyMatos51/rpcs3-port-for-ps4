@@ -1087,7 +1087,11 @@ void spu_cache::initialize(bool build_existing_cache)
 		// workers that would only wait for their turn (each one costs a 2 MiB stack)
 		if (worker_count > 1 && utils::ps4::governor::serialize_compiles())
 		{
-			spu_log.warning("PS4: memory or thread pressure: building the SPU cache with 1 worker instead of %u", worker_count);
+			// The inputs of that decision, so a 1-worker build on a console log names its reason
+			char ps4_reason[160];
+			utils::ps4::governor::serialize_reason(ps4_reason, sizeof(ps4_reason));
+			spu_log.warning("PS4: memory or thread pressure: building the SPU cache with 1 worker instead of %u (%s)", worker_count, ps4_reason);
+			ps4_extra_note = fmt::format(" (1 instead of %u: %s)", worker_count, ps4_reason);
 			worker_count = 1;
 		}
 		else if (worker_count > 1 && !utils::ps4::governor::extra_spu_workers_disabled())
@@ -1634,6 +1638,13 @@ void spu_cache::initialize(bool build_existing_cache)
 
 	for (u32 i = 0; i < ps4_extra_workers; i++)
 	{
+		// 0.40: an optional thread: only while it leaves the last 8 slots below the console's thread cap to the game
+		if (!utils::ps4::governor::optional_thread_allowed("SPU cache worker"))
+		{
+			spu_log.warning("PS4: SPU cache: optional worker %u of %u not started (thread budget); building with %u workers", i + 1, ps4_extra_workers, worker_count + i);
+			break;
+		}
+
 		auto thread = std::make_unique<named_thread<decltype(ps4_extra_body)>>(stx::try_launch, fmt::format("SPU Worker %u", worker_count + i + 1), ps4_extra_body);
 
 		if (!thread->ps4_try_start())
@@ -10261,6 +10272,10 @@ struct spu_llvm
 		// app); worker_count becomes the number actually running. With none, this thread compiles the queued
 		// blocks itself (ps4_spu_llvm_compile_one below), so it keeps its 2 MiB stack for LLVM codegen.
 		const u32 wanted_workers = worker_count;
+		// 0.40: they are optional threads: only as many as leave the last 8 slots below the console's thread cap to
+		// the game (row optional_thread_rule; optional-threads-free.flag starts them all)
+		const u32 budget_workers = utils::ps4::governor::optional_threads_allowed("SPU LLVM worker", worker_count);
+		worker_count = budget_workers;
 		m_workers = make_single<named_thread_group<spu_llvm_worker>>(stx::try_launch, "SPUW.", worker_count);
 		auto workers_ptr = m_workers.load();
 		auto& workers = *workers_ptr;
@@ -10285,10 +10300,13 @@ struct spu_llvm
 
 		if (worker_count != wanted_workers)
 		{
-			spu_log.error("PS4: SPU LLVM: %u of %u compile worker thread(s) started (thread creation refused)%s%s%s", worker_count, wanted_workers,
+			// Fewer than wanted: the thread budget, the console refused a create, or both
+			const char* const why = worker_count < budget_workers ? (budget_workers < wanted_workers ? "thread budget and thread creation refused" : "thread creation refused")
+				: "thread budget: the last 8 slots below the thread cap are kept for the game";
+			spu_log.error("PS4: SPU LLVM: %u of %u compile worker thread(s) started (%s)%s%s%s", worker_count, wanted_workers, why,
 				worker_count ? "" : "; compiling on the SPU LLVM thread", recycle_note, queue_note);
-			ps4_startup_checkpoint(fmt::format("SPU LLVM: %u of %u compile worker thread(s) started, no profiler thread (thread creation refused)%s%s%s",
-				worker_count, wanted_workers, worker_count ? "" : "; compiling on the SPU LLVM thread", recycle_note, queue_note).c_str());
+			ps4_startup_checkpoint(fmt::format("SPU LLVM: %u of %u compile worker thread(s) started, no profiler thread (%s)%s%s%s",
+				worker_count, wanted_workers, why, worker_count ? "" : "; compiling on the SPU LLVM thread", recycle_note, queue_note).c_str());
 		}
 		else
 		{

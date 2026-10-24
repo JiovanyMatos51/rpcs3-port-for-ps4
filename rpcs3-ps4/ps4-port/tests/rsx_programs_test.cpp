@@ -4,6 +4,11 @@
 // 0.39: the interpreter texture environment of texture-less variants drawn with the generic form, the image array
 // write count, the RSX.W compile slot level, the telemetry counters and their duration totals, the window maximum of
 // the program translation time and the asynchronous translation constants.
+// 0.40: the compile slot under the 0.38 and the 0.39 governor rules; the interpreter step bound (the define, and both
+// interpreter sources with and without it: the upstream loops when it is absent). Occlusion reports and conditional
+// rendering of skipped draws, the pipeline wait histogram and its percentile, the pipeline burst line, the shared-queue
+// job pick, the Resolution Scale deferral and slider maximum, the command buffer split and the render-pass close
+// caller tally.
 // Build: clang++ -std=c++20 -static -I rpcs3 -I . ps4-port/tests/rsx_programs_test.cpp
 #include "util/ps4_rsx_programs.hpp"
 
@@ -13,6 +18,7 @@
 #include <cstring>
 #include <random>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -350,16 +356,147 @@ void test_image_array_write_count()
 
 void test_compile_slot_level()
 {
-    // Slots enabled: only a real shortage (level 2 or 3) makes RSX.W jobs take one.
-    assert(!rp::rsx_job_takes_slot(true, 0));
-    assert(!rp::rsx_job_takes_slot(true, 1));
-    assert(rp::rsx_job_takes_slot(true, 2));
-    assert(rp::rsx_job_takes_slot(true, 3));
-
-    // rsx-compile-no-slot.flag: never.
+    // 0.38 governor rules (the default): every job takes a slot at every level, as 0.38 did (the slot rules then
+    // serialise it with PPU/SPU compiles from level 1, and it counts as an active compile at level 0).
     for (int level = 0; level <= 3; ++level)
     {
-        assert(!rp::rsx_job_takes_slot(false, level));
+        assert(rp::rsx_job_takes_slot(true, level, false));
+    }
+
+    // 0.39 rules (governor_v039): only a real shortage (level 2 or 3) makes RSX.W jobs take one.
+    assert(!rp::rsx_job_takes_slot(true, 0, true));
+    assert(!rp::rsx_job_takes_slot(true, 1, true));
+    assert(rp::rsx_job_takes_slot(true, 2, true));
+    assert(rp::rsx_job_takes_slot(true, 3, true));
+
+    // rsx-compile-no-slot.flag: never, with either rules.
+    for (int level = 0; level <= 3; ++level)
+    {
+        assert(!rp::rsx_job_takes_slot(false, level, false));
+        assert(!rp::rsx_job_takes_slot(false, level, true));
+    }
+}
+
+// The interpreter sources exactly as ShaderInterpreter.h embeds them (raw string literals).
+const std::string g_fragment_interpreter =
+#include "Emu/RSX/Program/GLSLInterpreter/FragmentInterpreter.glsl"
+    ;
+const std::string g_vertex_interpreter =
+#include "Emu/RSX/Program/GLSLInterpreter/VertexInterpreter.glsl"
+    ;
+
+std::vector<std::string> glsl_lines(const std::string& text)
+{
+    std::vector<std::string> lines;
+    std::size_t pos = 0;
+    while (pos <= text.size())
+    {
+        std::size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(pos, end - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(std::move(line));
+        pos = end + 1;
+    }
+    return lines;
+}
+
+std::string trimmed(const std::string& s)
+{
+    const std::size_t b = s.find_first_not_of(" \t");
+    if (b == std::string::npos) return {};
+    const std::size_t e = s.find_last_not_of(" \t");
+    return s.substr(b, e - b + 1);
+}
+
+// What the GLSL preprocessor keeps of the step-limit blocks, with the define injected or not. Every other directive is
+// kept as text. Asserts the block shape: '#ifdef PS4_INTERP_STEP_LIMIT', bounded loop, '#else', upstream loop, '#endif'
+// with no directive in between; returns the number of blocks.
+std::size_t resolve_step_limit(const std::vector<std::string>& in, bool defined, std::vector<std::string>& out)
+{
+    std::size_t blocks = 0;
+    for (std::size_t i = 0; i < in.size(); ++i)
+    {
+        if (trimmed(in[i]) != "#ifdef PS4_INTERP_STEP_LIMIT")
+        {
+            out.push_back(in[i]);
+            continue;
+        }
+
+        blocks++;
+        std::size_t j = i + 1;
+        std::vector<std::string> bounded, upstream;
+        for (; j < in.size() && trimmed(in[j]) != "#else"; ++j)
+        {
+            assert(trimmed(in[j]).rfind('#', 0) != 0);
+            bounded.push_back(in[j]);
+        }
+        assert(j < in.size());
+        for (++j; j < in.size() && trimmed(in[j]) != "#endif"; ++j)
+        {
+            assert(trimmed(in[j]).rfind('#', 0) != 0);
+            upstream.push_back(in[j]);
+        }
+        assert(j < in.size());
+        assert(!bounded.empty() && !upstream.empty());
+        for (const auto& l : defined ? bounded : upstream) out.push_back(l);
+        i = j;
+    }
+    return blocks;
+}
+
+std::size_t count_of(const std::vector<std::string>& lines, const std::string& needle)
+{
+    std::size_t n = 0;
+    for (const auto& l : lines) n += l.find(needle) != std::string::npos;
+    return n;
+}
+
+void test_interpreter_step_limit()
+{
+    // The injected line defines the macro the GLSL tests, with the limit of the header, as an unsigned literal.
+    static_assert(rp::interp_step_limit == 65536);
+    assert(std::string(rp::interp_step_define) == "#define PS4_INTERP_STEP_LIMIT " + std::to_string(rp::interp_step_limit) + "u\n");
+
+    const std::string frag_upstream = "while (!inst.end)";
+    const std::string vert_upstream = "while (current_instruction >= 0 && current_instruction < 544) // NOTE: CEX can hold upto 544 instructions";
+
+    for (const bool defined : {false, true})
+    {
+        std::vector<std::string> frag, vert;
+        assert(resolve_step_limit(glsl_lines(g_fragment_interpreter), defined, frag) == 1);
+        assert(resolve_step_limit(glsl_lines(g_vertex_interpreter), defined, vert) == 1);
+
+        if (!defined)
+        {
+            // Without the define the GLSL is the upstream text: the upstream loop line, no PS4 identifier at all.
+            assert(count_of(frag, "ps4_") == 0 && count_of(vert, "ps4_") == 0);
+            std::size_t f = 0, v = 0;
+            for (const auto& l : frag) f += trimmed(l) == frag_upstream;
+            for (const auto& l : vert) v += trimmed(l) == vert_upstream;
+            assert(f == 1 && v == 1);
+            continue;
+        }
+
+        // With it: one counter declared right before its loop, which tests the counter against the limit and keeps the
+        // upstream condition first.
+        for (auto* lines : {&frag, &vert})
+        {
+            std::size_t decl = 0, loop = 0;
+            for (std::size_t i = 0; i < lines->size(); ++i)
+            {
+                const std::string t = trimmed((*lines)[i]);
+                if (t == "uint ps4_steps = 0u;") decl = i + 1;
+                if (t.find("ps4_steps++ < PS4_INTERP_STEP_LIMIT") != std::string::npos) loop = i + 1;
+            }
+            assert(decl && loop == decl + 1);
+            assert(count_of(*lines, "ps4_steps") == 2);
+        }
+        std::size_t f = 0, v = 0;
+        for (const auto& l : frag) f += trimmed(l) == "while (!inst.end && ps4_steps++ < PS4_INTERP_STEP_LIMIT)";
+        for (const auto& l : vert)
+            v += trimmed(l) == "while (current_instruction >= 0 && current_instruction < 544 && ps4_steps++ < PS4_INTERP_STEP_LIMIT) // NOTE: CEX can hold upto 544 instructions";
+        assert(f == 1 && v == 1);
     }
 }
 
@@ -465,6 +602,320 @@ void test_add_duration()
 
     assert(us3.load() == 300'000 && ms3.load() == 300);
 }
+
+void test_report_with_skips()
+{
+    // Upstream sum when the query is complete, also for an empty count (occluded).
+    assert(rp::report_with_skips(0, 0, false) == 0);
+    assert(rp::report_with_skips(0, 7, false) == 7);
+    assert(rp::report_with_skips(5, 7, false) == 12);
+    // A skipped draw: an empty count answers visible (1); a count with samples stays what the host counted.
+    assert(rp::report_with_skips(0, 0, true) == 1);
+    assert(rp::report_with_skips(0, 9, true) == 9);
+    assert(rp::report_with_skips(4, 0, true) == 4);
+    assert(rp::report_with_skips(4, 3, true) == 7);
+    static_assert(rp::report_with_skips(0, 0, true) == 1);
+
+    // GPU predicate: only with the guard on, for an incomplete source or no host data at all.
+    assert(!rp::cond_render_forced_visible(false, true, 0));
+    assert(!rp::cond_render_forced_visible(false, false, 0));
+    assert(rp::cond_render_forced_visible(true, true, 3));
+    assert(rp::cond_render_forced_visible(true, false, 0));
+    assert(!rp::cond_render_forced_visible(true, false, 1));
+    assert(!rp::cond_render_forced_visible(true, false, 5));
+
+    rp::pipeline_stats s;
+    assert(s.queries_forced_visible.load() == 0 && s.cond_render_forced_visible.load() == 0);
+}
+
+void test_pipeline_waits()
+{
+    // Buckets: edges inclusive, the last bucket open.
+    assert(rp::wait_bucket(0) == 0);
+    assert(rp::wait_bucket(25'000) == 0);
+    assert(rp::wait_bucket(25'001) == 1);
+    assert(rp::wait_bucket(1'000'000) == 5);
+    assert(rp::wait_bucket(30'000'000) == std::size(rp::wait_edges_ms) - 1);
+    assert(rp::wait_bucket(30'000'001) == std::size(rp::wait_edges_ms));
+    assert(rp::wait_bucket(~0ull) == rp::wait_bucket_count - 1);
+    for (std::size_t i = 1; i < std::size(rp::wait_edges_ms); ++i)
+    {
+        assert(rp::wait_edges_ms[i - 1] < rp::wait_edges_ms[i]);
+    }
+
+    // Percentile: the edge of the bucket holding the rank, never above the window maximum.
+    u64 counts[rp::wait_bucket_count]{};
+    assert(rp::wait_percentile_ms(counts, 90, 0) == 0);
+    counts[rp::wait_bucket(10'000)] = 9;    // nine fast pipelines
+    counts[rp::wait_bucket(4'000'000)] = 1; // one 4 s wait
+    assert(rp::wait_percentile_ms(counts, 90, 4000) == 25);
+    assert(rp::wait_percentile_ms(counts, 100, 4000) == 4000);
+    assert(rp::wait_percentile_ms(counts, 91, 4000) == 4000);
+    assert(rp::wait_percentile_ms(counts, 0, 4000) == 25);   // clamped to the first rank
+    assert(rp::wait_percentile_ms(counts, 500, 4000) == 4000); // clamped to 100
+    // A single pipeline above the last edge: the maximum stands in for the open bucket.
+    u64 one[rp::wait_bucket_count]{};
+    one[rp::wait_bucket_count - 1] = 1;
+    assert(rp::wait_percentile_ms(one, 90, 45'000) == 45'000);
+    // The maximum caps an edge (a 30 ms wait sits in the 50 ms bucket).
+    u64 small[rp::wait_bucket_count]{};
+    small[rp::wait_bucket(30'000)] = 1;
+    assert(rp::wait_percentile_ms(small, 90, 30) == 30);
+
+    // The window and burst maxima.
+    rp::pipeline_waits w;
+    w.note(10'000);
+    w.note(2'500'000);
+    w.note(40'000);
+    assert(w.burst_max_us.load() == 2'500'000);
+    u64 taken[rp::wait_bucket_count]{};
+    u64 taken_max = 0;
+    w.take(taken, taken_max);
+    assert(taken_max == 2'500'000);
+    assert(taken[0] == 1 && taken[rp::wait_bucket(40'000)] == 1 && taken[rp::wait_bucket(2'500'000)] == 1);
+    assert(rp::wait_percentile_ms(taken, 90, taken_max / 1000) == 2500);
+    // Taking starts the window over, the burst maximum stays for the burst tracker.
+    u64 again[rp::wait_bucket_count]{};
+    u64 again_max = 1;
+    w.take(again, again_max);
+    assert(again_max == 0 && rp::wait_percentile_ms(again, 90, 0) == 0);
+    assert(w.burst_max_us.load() == 2'500'000);
+
+    // Concurrent workers: every wait is counted.
+    rp::pipeline_waits c;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+    {
+        threads.emplace_back([&c, t]()
+        {
+            for (int i = 0; i < 10000; ++i)
+            {
+                c.note(static_cast<u64>(i % 100) * 1000 + static_cast<u64>(t));
+            }
+        });
+    }
+
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+
+    u64 all[rp::wait_bucket_count]{};
+    u64 all_max = 0;
+    c.take(all, all_max);
+    u64 total = 0;
+    for (const u64 n : all)
+    {
+        total += n;
+    }
+
+    assert(total == 40000 && all_max == 99'003);
+}
+
+void test_burst_line()
+{
+    rp::burst_summary b;
+    b.pipelines = 37;
+    b.seconds = 6.25;
+    b.ready_max_ms = 5120;
+    b.links = 3;
+    b.link_ms = 4410;
+    b.skipped = 1534;
+    b.frames_with_skips = 151;
+    b.interpreter_draws = 20811;
+    assert(rp::burst_line(b) == "PS4 RSX: pipeline burst: 37 new pipelines in 6.2 s, ready after 5120 ms (oldest), 3 interpreter links meanwhile (4410 ms), "
+        "1534 draws skipped in 151 frames, 20811 drawn by the interpreter" ||
+        rp::burst_line(b) == "PS4 RSX: pipeline burst: 37 new pipelines in 6.3 s, ready after 5120 ms (oldest), 3 interpreter links meanwhile (4410 ms), "
+        "1534 draws skipped in 151 frames, 20811 drawn by the interpreter");
+    b.last = true;
+    b.seconds = 1.5;
+    const std::string last = rp::burst_line(b);
+    assert(last.find("in 1.5 s") != std::string::npos);
+    const std::string suffix = " (last burst line of this renderer)";
+    assert(last.size() > suffix.size() && last.compare(last.size() - suffix.size(), suffix.size(), suffix) == 0);
+
+    // Large values still fit the line.
+    rp::burst_summary big;
+    big.pipelines = big.ready_max_ms = big.links = big.link_ms = big.skipped = big.frames_with_skips = big.interpreter_draws = ~0ull;
+    big.seconds = 123456.7;
+    big.last = true;
+    const std::string line = rp::burst_line(big);
+    assert(line.find("18446744073709551615 drawn by the interpreter (last burst line of this renderer)") != std::string::npos);
+}
+
+void test_pick_next_job()
+{
+    using rp::job_pick;
+    static_assert(rp::max_links_running == 1);
+
+    // A queued game pipeline always goes first, whatever links wait or run.
+    assert(rp::pick_next_job(true, false, 0) == job_pick::game);
+    assert(rp::pick_next_job(true, true, 0) == job_pick::game);
+    assert(rp::pick_next_job(true, true, 1) == job_pick::game);
+    // A link only when no game pipeline is queued and no other worker is linking one.
+    assert(rp::pick_next_job(false, true, 0) == job_pick::link);
+    assert(rp::pick_next_job(false, true, 1) == job_pick::none);
+    assert(rp::pick_next_job(false, true, 2) == job_pick::none);
+    assert(rp::pick_next_job(false, false, 0) == job_pick::none);
+
+    // Model of two workers over a queue: links 30 s, game pipelines 0.2 s. A game pipeline queued while a link runs
+    // is taken by the free worker at once; a second link waits for the first one.
+    struct worker
+    {
+        job_pick job = job_pick::none;
+        double busy_until = 0;
+    };
+
+    std::vector<double> game_queue_times = {0.0, 0.1, 0.2, 5.0};
+    u32 links_queued = 2;
+    u32 game_next = 0;
+    worker workers[2];
+    double max_game_wait = 0;
+    u32 links_done = 0;
+
+    for (double now = 0; now < 120 && (game_next < game_queue_times.size() || links_queued || workers[0].job != job_pick::none || workers[1].job != job_pick::none); now += 0.05)
+    {
+        for (auto& w : workers)
+        {
+            if (w.job != job_pick::none && now >= w.busy_until)
+            {
+                links_done += w.job == job_pick::link ? 1 : 0;
+                w.job = job_pick::none;
+            }
+        }
+
+        for (auto& w : workers)
+        {
+            if (w.job != job_pick::none)
+            {
+                continue;
+            }
+
+            u32 running = 0;
+            for (const auto& other : workers)
+            {
+                running += other.job == job_pick::link ? 1 : 0;
+            }
+
+            const bool game_queued = game_next < game_queue_times.size() && game_queue_times[game_next] <= now;
+            switch (rp::pick_next_job(game_queued, links_queued != 0, running))
+            {
+            case job_pick::game:
+                max_game_wait = std::max(max_game_wait, now - game_queue_times[game_next]);
+                game_next++;
+                w = {job_pick::game, now + 0.2};
+                break;
+            case job_pick::link:
+                links_queued--;
+                w = {job_pick::link, now + 30};
+                break;
+            case job_pick::none:
+                break;
+            }
+        }
+    }
+
+    assert(game_next == game_queue_times.size());
+    assert(links_done == 2);
+    assert(max_game_wait < 0.5); // never behind a 30 s link
+}
+
+void test_scale_rules()
+{
+    // A live Resolution Scale change waits for the next boot only with MSAA on.
+    assert(rp::scale_change_deferred(true));
+    assert(!rp::scale_change_deferred(false));
+
+    // Slider maximum: 150 %, or the running value up to the console limit.
+    static_assert(rp::scale_slider_max == 150 && rp::scale_console_limit == 200);
+    assert(rp::scale_slider_maximum(25) == 150);
+    assert(rp::scale_slider_maximum(100) == 150);
+    assert(rp::scale_slider_maximum(150) == 150);
+    assert(rp::scale_slider_maximum(175) == 175);
+    assert(rp::scale_slider_maximum(200) == 200);
+    assert(rp::scale_slider_maximum(650) == 200);
+    assert(rp::scale_slider_maximum(800) == 200);
+}
+
+void test_cb_split()
+{
+    static_assert(rp::cb_split_draws == 384);
+    // Off (limit 0): never.
+    assert(!rp::cb_split_due(0, 0, false));
+    assert(!rp::cb_split_due(100000, 0, false));
+    // On: at the limit, not before, never under an active GPU conditional render.
+    assert(!rp::cb_split_due(383, rp::cb_split_draws, false));
+    assert(rp::cb_split_due(384, rp::cb_split_draws, false));
+    assert(rp::cb_split_due(385, rp::cb_split_draws, false));
+    assert(!rp::cb_split_due(384, rp::cb_split_draws, true));
+    assert(!rp::cb_split_due(1000, rp::cb_split_draws, true));
+
+    // 1,536 draws in one frame, counting reset by every submit: four parts.
+    u32 draws = 0, submits = 0;
+    for (u32 i = 0; i < 1536; ++i)
+    {
+        if (rp::cb_split_due(++draws, rp::cb_split_draws, false))
+        {
+            submits++;
+            draws = 0;
+        }
+    }
+
+    assert(submits == 4 && draws == 0);
+}
+
+void test_caller_tally()
+{
+    rp::caller_tally<4> t;
+    // Nothing yet.
+    u32 calls = 0;
+    assert(t.take([&](u64, u64) { calls++; }) == 0 && calls == 0);
+
+    for (int i = 0; i < 5; ++i) t.note(0x1000);
+    for (int i = 0; i < 9; ++i) t.note(0x2000);
+    t.note(0x3000);
+    t.note(0x4000);
+    t.note(0x5000); // no slot left
+    t.note(0);      // unknown site
+
+    std::vector<std::pair<u64, u64>> seen;
+    const u64 more = t.take([&](u64 site, u64 count) { seen.emplace_back(site, count); });
+    assert(more == 2);
+    assert(seen.size() == 4);
+    assert(seen[0] == std::make_pair(u64{0x2000}, u64{9})); // busiest first
+    assert(seen[1] == std::make_pair(u64{0x1000}, u64{5}));
+    assert((seen[2].second == 1 && seen[3].second == 1));
+
+    // The counts start over, the sites keep their slots.
+    seen.clear();
+    t.note(0x3000);
+    assert(t.take([&](u64 site, u64 count) { seen.emplace_back(site, count); }) == 0);
+    assert(seen.size() == 1 && seen[0] == std::make_pair(u64{0x3000}, u64{1}));
+
+    // Concurrent notes of the same sites from several threads: every close is counted once.
+    rp::caller_tally<8> c;
+    std::vector<std::thread> threads;
+    for (int th = 0; th < 4; ++th)
+    {
+        threads.emplace_back([&c]()
+        {
+            for (int i = 0; i < 20000; ++i)
+            {
+                c.note(0x100 + static_cast<u64>(i % 6) * 0x10);
+            }
+        });
+    }
+
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+
+    u64 total = 0;
+    u32 sites = 0;
+    const u64 rest = c.take([&](u64, u64 count) { total += count; sites++; });
+    assert(rest == 0 && total == 80000 && sites == 6);
+}
 } // namespace
 
 int main()
@@ -483,9 +934,17 @@ int main()
     test_texture_env();
     test_image_array_write_count();
     test_compile_slot_level();
+    test_interpreter_step_limit();
     test_stats_fields();
     test_add_duration();
     test_note_max();
+    test_report_with_skips();
+    test_pipeline_waits();
+    test_burst_line();
+    test_pick_next_job();
+    test_scale_rules();
+    test_cb_split();
+    test_caller_tally();
     std::puts("rsx_programs_test: all tests passed");
     return 0;
 }

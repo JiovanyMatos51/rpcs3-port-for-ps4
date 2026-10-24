@@ -125,4 +125,17 @@ namespace gl
 		// This spec workaround allows it to be abused by ISVs to indicate a broken GL context.
 		ensure(glGetError() != GL_OUT_OF_MEMORY);
 	}
+
+#ifdef RPCS3_PS4
+	// The renderer's state tracker and GL context are gone (end of GLGSRender::on_exit, ~GLGSRender). Objects released
+	// afterwards (after an RSX fatal the teardown order is not the usual one) must not reach the destroyed tracker:
+	// get_command_context() then returns a detached one, and textures skip their GL calls.
+	void ps4_clear_command_context();
+	bool ps4_has_command_context();
+
+	// Set by the OpenGL renderer for its lifetime (nullptr clears it): releases what its texture cache can give back
+	// when a texture's storage could not be allocated. True when something was released. RSX thread.
+	void ps4_set_vram_relief(bool (*relief)());
+	bool ps4_vram_relief();
+#endif
 }

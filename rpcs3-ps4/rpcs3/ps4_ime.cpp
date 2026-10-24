@@ -11,10 +11,12 @@
 // system writes the typed text into the buffer while the dialog is open; both are zeroed after every dialog.
 
 #include "ps4_launcher.h"
+#include "ps4_fatal.h"
 
 #include <orbis/Sysmodule.h>
 #include <orbis/UserService.h>
 #include <orbis/_types/ime_dialog.h>
+#include <orbis/libkernel.h>
 
 #include <atomic>
 #include <cstdarg>
@@ -119,6 +121,20 @@ unsigned s_setup_failures = 0;
 unsigned s_log_lines = 0;     // startup.log lines written by this file
 dialog_entry_points s_fn{};
 unsigned s_bound_by_name = 0; // entry points found by sceKernelDlsym
+
+// A request() waiting to be opened by poll() (launcher thread only, like the rest of this file's state)
+struct queued_dialog
+{
+    bool on = false;
+    kind type = kind::text;
+    unsigned max_len = 0;
+    std::string title;
+    std::string initial; // never a password: a password dialog starts empty
+    deferred::gate gate;
+};
+
+queued_dialog s_queued;
+std::uint64_t s_closed_at = 0; // process time at which the last dialog ended (0: none yet)
 
 [[gnu::format(printf, 1, 2)]] void checkpoint(const char* format, ...)
 {
@@ -280,16 +296,14 @@ bool setup()
     s_setup = 1;
     return true;
 }
-} // namespace
 
-bool open(kind type, std::string_view title, unsigned max_len, std::string_view initial)
+// Opens the dialog: the preferred options first, then fewer. 'code' receives the last refusal of sceImeDialogInit (0
+// when the dialog opened or failed before that call). 'queued': an attempt for a request(), which stops at a
+// not-ready refusal instead of trying fewer options (they cannot help, and the dialog would lose its options if the
+// system became ready during the fallback).
+bool start_dialog(kind type, std::string_view title, unsigned max_len, std::string_view initial, bool queued, std::int32_t& code)
 {
-    if (s_active.load(std::memory_order_acquire))
-    {
-        ps4_ime_log.warning("on-screen keyboard: open(%s) ignored, a dialog is already open", kind_name(type));
-        return false;
-    }
-
+    code = 0;
     if (!setup())
     {
         return false;
@@ -352,9 +366,13 @@ bool open(kind type, std::string_view title, unsigned max_len, std::string_view 
         }
         checkpoint("on-screen keyboard: sceImeDialogInit(%s, options 0x%x) refused 0x%x", kind_name(type), options,
             static_cast<std::uint32_t>(result));
+        if (queued && deferred::not_ready_refusal(result))
+        {
+            break;
+        }
     }
     // The number keyboard is not verified on this firmware: refused, the Latin keyboard takes the same digits
-    if (result < 0 && type == kind::number)
+    if (result < 0 && type == kind::number && !(queued && deferred::not_ready_refusal(result)))
     {
         s_param.type = ORBIS_TYPE_BASIC_LATIN;
         s_param.option = 0;
@@ -365,6 +383,7 @@ bool open(kind type, std::string_view title, unsigned max_len, std::string_view 
 
     if (result < 0)
     {
+        code = result;
         wipe_buffers();
         return false;
     }
@@ -382,11 +401,113 @@ bool open(kind type, std::string_view title, unsigned max_len, std::string_view 
     return true;
 }
 
+void drop_queued()
+{
+    s_queued.on = false;
+    std::string().swap(s_queued.title);
+    std::string().swap(s_queued.initial);
+}
+
+// poll() without an open dialog while a request waits: opens it when the rule of 'deferred' allows it
+state open_queued()
+{
+    const std::uint64_t now = sceKernelGetProcessTime();
+    const kind type = s_queued.type;
+    switch (s_queued.gate.next(now, s_active.load(std::memory_order_acquire) || ps4_in_background()))
+    {
+    case deferred::step::wait:
+        return state::waiting;
+    case deferred::step::give_up:
+        checkpoint("on-screen keyboard: queued %s dialog not opened: the system did not allow it within %u ms", kind_name(type),
+            static_cast<unsigned>(deferred::timeout_us / 1000));
+        drop_queued();
+        return state::not_opened;
+    case deferred::step::open:
+        break;
+    }
+
+    std::int32_t code = 0;
+    if (start_dialog(type, s_queued.title, s_queued.max_len, s_queued.initial, true, code))
+    {
+        // How long after the previous close the system took a chained dialog (the console proof of the rule). A dialog
+        // asked for long after the last close is a first one: RPCS3.log's "opened" line is enough, and startup.log
+        // keeps its few lines for this file's failures.
+        const bool closed_before = s_closed_at && now >= s_closed_at;
+        const std::uint64_t since_close = closed_before ? now - s_closed_at : 0;
+        if ((closed_before && since_close < 2'000'000) || s_queued.gate.retries)
+        {
+            checkpoint("on-screen keyboard: queued %s dialog opened %llu ms after the previous one closed (retries: %u)", kind_name(type),
+                static_cast<unsigned long long>(since_close / 1000), s_queued.gate.retries);
+        }
+        drop_queued();
+        return state::running;
+    }
+    if (s_queued.gate.refused(now, code))
+    {
+        checkpoint("on-screen keyboard: queued %s dialog refused 0x%x while the previous one was closing; one more try in %u ms",
+            kind_name(type), static_cast<std::uint32_t>(code), static_cast<unsigned>(deferred::settle_us / 1000));
+        return state::waiting;
+    }
+    checkpoint("on-screen keyboard: queued %s dialog not opened (0x%x)", kind_name(type), static_cast<std::uint32_t>(code));
+    drop_queued();
+    return state::not_opened;
+}
+} // namespace
+
+bool open(kind type, std::string_view title, unsigned max_len, std::string_view initial)
+{
+    if (s_active.load(std::memory_order_acquire))
+    {
+        ps4_ime_log.warning("on-screen keyboard: open(%s) ignored, a dialog is already open", kind_name(type));
+        return false;
+    }
+    if (s_queued.on)
+    {
+        ps4_ime_log.warning("on-screen keyboard: open(%s) ignored, a queued %s dialog waits", kind_name(type), kind_name(s_queued.type));
+        return false;
+    }
+
+    std::int32_t code = 0;
+    return start_dialog(type, title, max_len, initial, false, code);
+}
+
+bool request(kind type, std::string_view title, unsigned max_len, std::string_view initial)
+{
+    if (s_active.load(std::memory_order_acquire) || s_queued.on)
+    {
+        ps4_ime_log.warning("on-screen keyboard: request(%s) ignored, %s", kind_name(type),
+            s_queued.on ? "another dialog is queued" : "a dialog is already open");
+        return false;
+    }
+
+    s_queued.on = true;
+    s_queued.type = type;
+    s_queued.max_len = max_len;
+    s_queued.title.assign(title);
+    if (type == kind::password) s_queued.initial.clear();
+    else s_queued.initial.assign(initial);
+    s_queued.gate.start(s_closed_at);
+    ps4_ime_log.notice("on-screen keyboard: %s dialog queued (it opens when the system allows it)", kind_name(type));
+    return true;
+}
+
+bool pending()
+{
+    return s_queued.on;
+}
+
+void cancel_request()
+{
+    if (!s_queued.on) return;
+    ps4_ime_log.notice("on-screen keyboard: queued %s dialog dropped", kind_name(s_queued.type));
+    drop_queued();
+}
+
 state poll(std::string& out)
 {
     if (!s_active.load(std::memory_order_acquire))
     {
-        return state::idle;
+        return s_queued.on ? open_queued() : state::idle;
     }
 
     const std::int32_t status = s_fn.get_status();
@@ -432,6 +553,7 @@ state poll(std::string& out)
 
     wipe_buffers();
     s_param = {};
+    s_closed_at = sceKernelGetProcessTime(); // a queued dialog waits from here (deferred::gate)
     s_active.store(false, std::memory_order_release);
     ps4_ime_log.notice("on-screen keyboard closed (%s): %s", kind_name(s_kind),
         result == state::done ? "confirmed" : result == state::cancelled ? "cancelled" : "failed");

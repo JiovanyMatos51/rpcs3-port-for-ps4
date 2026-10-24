@@ -12,6 +12,16 @@
 #include <algorithm>
 #include <climits>
 
+#ifdef RPCS3_PS4
+#include "util/ps4_memory_governor.hpp"
+
+#include <atomic>
+
+// Refused demuxer SPU threads of this process: a game may reopen the demuxer at once, so the line goes through
+// governor::media_log_due (the first 8, then one in 100)
+static std::atomic<u32> s_ps4_dmux_spu_failures{0};
+#endif
+
 vm::gvar<CellDmuxCoreOps> g_cell_dmux_core_ops_pamf;
 vm::gvar<CellDmuxCoreOps> g_cell_dmux_core_ops_raw_es;
 
@@ -2077,7 +2087,10 @@ error_code DmuxPamfContext::open(ppu_thread& ppu, const CellDmuxPamfResource& re
 
 	if (_this->hle_spu_thread_id == id_manager::id_traits<dmux_pamf_spu_thread>::invalid)
 	{
-		cellDmuxPamf.error("open(): PS4 refused the HLE PAMF demuxer SPU thread (thread resources exhausted); returning CELL_DMUX_PAMF_ERROR_FATAL");
+		if (u32 number = 0; utils::ps4::governor::media_log_due(s_ps4_dmux_spu_failures, number))
+		{
+			cellDmuxPamf.error("open(): PS4 refused the HLE PAMF demuxer SPU thread (thread resources exhausted); returning CELL_DMUX_PAMF_ERROR_FATAL (failure %u of this process; the first 8, then one in 100 are logged)", number);
+		}
 		ps4_undo_open(false);
 		return CELL_DMUX_PAMF_ERROR_FATAL;
 	}

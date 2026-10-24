@@ -7,7 +7,9 @@
 #include "util/ps4_adapt.hpp"
 #include "util/ps4_gpu_health.hpp"
 #include "util/ps4_memory_governor.hpp"
+#include "util/ps4_policy.hpp"
 #include "util/ps4_rsx_programs.hpp"
+#include "util/ps4_safe_mode.hpp"
 #include "util/ps4_vram_policy.hpp"
 #include "Emu/System.h"
 #include "Emu/Cell/SPUThread.h"
@@ -536,6 +538,7 @@ namespace
 namespace vk
 {
 	ps4_vk_draw_counters_t g_ps4_vk_draw_counters;
+	u64 g_ps4_interpreter_draws_total = 0;
 
 	namespace
 	{
@@ -588,12 +591,22 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	// 0.38: a stop request of the previous game's renderer does not carry over.
 	utils::ps4::vram::reset_stop_request();
 
-	// 0.39: a GPU hang confirmed for 10 s stops the game (vkutils/sync.cpp ps4_request_gpu_hang_stop).
-	utils::ps4::gpu::set_hang_stop(!fs::is_file("/data/rpcs3/no-hang-stop.flag"));
+	// 0.39: a GPU hang confirmed for 10 s stops the game (vkutils/sync.cpp ps4_request_gpu_hang_stop). Feature
+	// hang_stop: off with no-hang-stop.flag or from safe-mode level 2.
+	utils::ps4::gpu::set_hang_stop(utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::hang_stop));
 	ps4_startup_checkpoint(utils::ps4::gpu::hang_stop()
 		? "GPU: a hang confirmed for 10 s (a fence wait, or the oldest submission unfinished with the game in the foreground) stops the game "
-		  "and returns to the XMB; the title's next boots get the gpu_hang adapt key (no-hang-stop.flag keeps waiting)"
-		: "GPU: a hang only waits and reports (no-hang-stop.flag)");
+		  "and returns to the XMB; the title's next boots get the gpu_hang adapt key and one safe-mode level more (no-hang-stop.flag keeps waiting)"
+		: "GPU: a hang only waits and reports (hang_stop off: no-hang-stop.flag or safe-mode level 2)");
+
+	// A device loss of this game in an earlier boot (its cb_split adapt key, decided by the boot policy): command
+	// buffers are submitted in parts, so no single submission grows past what the driver accepts.
+	m_ps4_cb_split_draws = utils::ps4::policy::cb_split_for_title() ? utils::ps4::rsx_programs::cb_split_draws : 0;
+	if (m_ps4_cb_split_draws)
+	{
+		ps4_startup_checkpoint(fmt::format("PS4 RSX: command buffers split every %u draws (adapt cb_split after a device loss of this game; cb-split-off.flag turns it off)",
+			m_ps4_cb_split_draws).c_str());
+	}
 #endif
 	// Initialize dependencies
 	g_fxo->need<rsx::dma_manager>();
@@ -726,8 +739,9 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 
 	// 0.39: adaptive ring growth (ps4_check_ring_heaps): a ring that grew in an earlier session of this title starts at
 	// that size (adapt record "<title>.rings"), never above its maximum: the 0.37 size, 32 MiB for the transform
-	// constants and instancing rings. rings-no-grow.flag turns growth and the record off.
-	m_ps4_ring_growth = !fs::is_file("/data/rpcs3/rings-no-grow.flag");
+	// constants and instancing rings. Feature ring_growth (rings-grow.flag or features.txt); off by default, as 0.38:
+	// boot sizes for the whole session and the record neither read nor written.
+	m_ps4_ring_growth = utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::ring_growth);
 	m_ps4_ring_title = Emu.GetTitleID();
 	const std::string ps4_ring_record = m_ps4_ring_growth && !m_ps4_ring_title.empty()
 		? utils::ps4::adapt::read_record(m_ps4_ring_title, utils::ps4::adapt::rings_suffix) : std::string();
@@ -841,12 +855,12 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	ps4_startup_checkpoint(m_ps4_ring_growth
 		? fmt::format("PS4 RSX: adaptive ring growth on: a ring doubles after a ring hard sync or more than %u reclaims/s for %u s, up to the 0.37 size "
 			"(transform constants and instancing 32 MiB), when the window's largest free range holds it + 16 MiB and the load is below 85%%; "
-			"sizes kept per title (rings-no-grow.flag disables); the auxiliary upload heap doubles up to 64 MiB after %u s of more than %u uploads per "
+			"sizes kept per title (ring_growth on: rings-grow.flag or features.txt); the auxiliary upload heap doubles up to 64 MiB after %u s of more than %u uploads per "
 			"second that did not fit it; from the title record:%s",
 			utils::ps4::vram::ring_busy_reclaims, utils::ps4::vram::ring_busy_seconds,
 			utils::ps4::vram::ring_busy_seconds, utils::ps4::vram::ring_busy_reclaims,
 			ps4_rings_from_record.empty() ? " none" : ps4_rings_from_record.c_str()).c_str()
-		: "PS4 RSX: adaptive ring growth off (rings-no-grow.flag); boot sizes for the whole session");
+		: "PS4 RSX: adaptive ring growth off (0.38 default; rings-grow.flag turns it on); boot sizes for the whole session");
 #endif
 
 	// Initialize optional allocation information with placeholders
@@ -2195,10 +2209,12 @@ void VKGSRender::ps4_check_ring_heaps()
 	const u32 reclaims = ++m_ps4_ring_reclaims;
 	if (!(reclaims & (reclaims - 1)) || (hard_sync && !(m_ps4_ring_hard_syncs & (m_ps4_ring_hard_syncs - 1))))
 	{
-		// The 1st, 2nd, 4th... reclaim and hard sync of this renderer.
-		const std::string line = fmt::format("PS4 RSX: ring '%s' (%u MiB) within its %u MiB guard: %u queued frame(s) retired%s; %s (reclaims %u, hard syncs %u)",
-			name, ring_mib, guard_mib, retired, hard_sync ? ", hard sync" : "", m_ps4_ring_growth ? "adaptive growth on" : "no growth",
-			reclaims, m_ps4_ring_hard_syncs);
+		// The 1st, 2nd, 4th... reclaim and hard sync of this renderer. Without ring_growth the 0.38 text, verbatim.
+		const std::string line = m_ps4_ring_growth
+			? fmt::format("PS4 RSX: ring '%s' (%u MiB) within its %u MiB guard: %u queued frame(s) retired%s; adaptive growth on (reclaims %u, hard syncs %u)",
+				name, ring_mib, guard_mib, retired, hard_sync ? ", hard sync" : "", reclaims, m_ps4_ring_hard_syncs)
+			: fmt::format("PS4 RSX: ring '%s' (%u MiB) within its %u MiB guard: %u queued frame(s) retired%s; no growth (reclaims %u, hard syncs %u)",
+				name, ring_mib, guard_mib, retired, hard_sync ? ", hard sync" : "", reclaims, m_ps4_ring_hard_syncs);
 		rsx_log.warning("%s", line);
 		ps4_startup_checkpoint(line.c_str());
 	}
@@ -2293,11 +2309,13 @@ void VKGSRender::ps4_check_gpu_liveness()
 		return;
 	}
 
-	// 0.39: no scan for 5 s or more (the process was suspended, e.g. rest mode, or this thread was paused with the game
-	// at the home screen): a submission the system held meanwhile is not a hang, so its age and the foreground stretch
-	// start over here.
-	if (m_ps4_next_liveness_scan_us && now - m_ps4_next_liveness_scan_us >= 4'000'000)
+	// The pending table and the foreground stretch start over only when the process really was away (home screen,
+	// overlay, rest mode: the focus epoch of ps4_fatal.cpp changed), since the system may hold its GPU work meanwhile.
+	// A gap between two scans alone is this thread blocked in a wait on the hung GPU: GoW Ascension 0.39 reset the
+	// table on every such gap and never confirmed its hang.
+	if (const u32 epoch = ps4_focus_epoch(); epoch != m_ps4_liveness_epoch)
 	{
+		m_ps4_liveness_epoch = epoch;
 		m_ps4_pending_cbs.fill(ps4_pending_cb_t{});
 		m_ps4_foreground_since_us = 0;
 	}
@@ -2351,6 +2369,23 @@ void VKGSRender::ps4_check_gpu_liveness()
 	if (m_ps4_foreground_since_us && utils::ps4::gpu::hang_confirmed(oldest_us, now - m_ps4_foreground_since_us))
 	{
 		vk::ps4_request_gpu_hang_stop(fmt::format("a command buffer submitted %u ms ago has not finished", age_ms).c_str());
+	}
+}
+
+namespace vk
+{
+	void ps4_gpu_liveness_in_wait() noexcept
+	{
+		// The table belongs to the RSX thread: never scanned from another one.
+		if (!rsx::ps4_is_rsx_thread())
+		{
+			return;
+		}
+
+		if (auto* const renderer = dynamic_cast<VKGSRender*>(rsx::get_current_renderer()); renderer && renderer->is_current_thread())
+		{
+			renderer->ps4_liveness_scan_in_wait();
+		}
 	}
 }
 
@@ -2426,6 +2461,13 @@ void VKGSRender::ps4_report_vk_backend()
 	const u64 av_request = av.request_us.exchange(0), av_drain = av.drain_us.exchange(0);
 	const u64 av_copy = av.copy_us.exchange(0), av_swap = av.swap_us.exchange(0);
 
+	// Game pipeline waits (queue to ready) and the occlusion answers forced visible for skipped draws, per window.
+	u64 wait_counts[utils::ps4::rsx_programs::wait_bucket_count]{};
+	u64 wait_max_us = 0;
+	utils::ps4::rsx_programs::g_pipeline_waits.take(wait_counts, wait_max_us);
+	const u64 forced_queries = pst.queries_forced_visible.exchange(0, std::memory_order_relaxed);
+	const u64 forced_cond = pst.cond_render_forced_visible.exchange(0, std::memory_order_relaxed);
+
 	if (!dc.frames)
 	{
 		// No guest frame drew in this window (loading screens without draws, a stalled game).
@@ -2467,6 +2509,12 @@ void VKGSRender::ps4_report_vk_backend()
 	fmt::append(line, "; interpreter draws/frame=%.1f, variants linked on first use %llu (%llu ms)",
 		dc.interpreter_draws / frames, window_links, window_link_us / 1000);
 
+	fmt::append(line, "; submits/frame=%.1f", dc.submits / frames);
+	if (m_ps4_cb_split_draws)
+	{
+		fmt::append(line, " (%llu split after %u draws)", dc.cb_splits, m_ps4_cb_split_draws);
+	}
+
 	if (av_flushes)
 	{
 		const double n = static_cast<double>(av_flushes) * 1000.;
@@ -2484,6 +2532,23 @@ void VKGSRender::ps4_report_vk_backend()
 	{
 		fmt::append(line, "; draws skipped=%llu not ready, %llu descriptor set refused (%llu sets refused since boot)",
 			dc.skipped_not_ready, dc.skipped_descriptors, vk::ps4_descriptor_sets_refused());
+	}
+
+	u64 waits = 0;
+	for (const u64 count : wait_counts)
+	{
+		waits += count;
+	}
+
+	if (waits)
+	{
+		fmt::append(line, "; pipeline wait p90/max %llu/%llu ms (%llu pipelines)",
+			utils::ps4::rsx_programs::wait_percentile_ms(wait_counts, 90, wait_max_us / 1000), wait_max_us / 1000, waits);
+	}
+
+	if (forced_queries || forced_cond || dc.skipped_not_ready)
+	{
+		fmt::append(line, "; queries forced visible %llu, cond-render forced visible %llu", forced_queries, forced_cond);
 	}
 
 	const auto& ps = utils::ps4::rsx_programs::g_pipeline_stats;
@@ -3888,6 +3953,12 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore 
 {
 	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
 
+#ifdef RPCS3_PS4
+	// Submits per frame in the 10 s line; the command buffer split counts draws from here.
+	vk::g_ps4_vk_draw_counters.submits++;
+	m_ps4_cb_draws = 0;
+#endif
+
 	// Host MM sync before executing anything on the GPU
 	rsx::mm_flush();
 
@@ -4494,6 +4565,40 @@ void VKGSRender::begin_conditional_rendering(const std::vector<rsx::reports::occ
 		dst_stage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
 		dst_access = VK_ACCESS_SHADER_READ_BIT;
 	}
+
+#ifdef RPCS3_PS4
+	// zcull_skip_visible: a source query holding a draw skipped while its program compiled misses samples, and with
+	// no host data at all the predicate would keep a stale value. Both cases draw (visible), the conservative answer.
+	// Without an occlusion query pool (its creation failed) there is never host data: visible too.
+	bool ps4_any_incomplete = false;
+	for (usz i = first; i < last; ++i)
+	{
+		ps4_any_incomplete = ps4_any_incomplete || sources[i]->ps4_incomplete;
+	}
+
+	// A partial evaluation only adds the active query to the value the full one (same sync tag) wrote for every
+	// source: there, only a skipped draw of the active query forces the predicate, an empty active query keeps it.
+	const u32 ps4_host_queries = partial_eval && !num_hw_queries ? 1u : num_hw_queries;
+
+	if (utils::ps4::rsx_programs::cond_render_forced_visible(ps4_skip_visible() || vk::ps4_query_pool_unavailable(), ps4_any_incomplete, ps4_host_queries))
+	{
+		if (vk::is_renderpass_open(*m_current_command_buffer))
+		{
+			// Buffer fills are transfer commands: outside a render pass
+			const utils::ps4::gpu::rp_close_cause_scope ps4_cause(rsx::ps4_rp_close_query);
+			vk::end_renderpass(*m_current_command_buffer);
+		}
+
+		vkCmdFillBuffer(*m_current_command_buffer, m_cond_render_buffer->value, 0, 4, 1u);
+		vk::insert_buffer_memory_barrier(*m_current_command_buffer, m_cond_render_buffer->value, 0, 4,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage,
+			VK_ACCESS_TRANSFER_WRITE_BIT, dst_access);
+
+		utils::ps4::rsx_programs::g_pipeline_stats.cond_render_forced_visible.fetch_add(1, std::memory_order_relaxed);
+		rsx::thread::begin_conditional_rendering(sources);
+		return;
+	}
+#endif
 
 	if (num_hw_queries == 1 && !partial_eval) [[ likely ]]
 	{

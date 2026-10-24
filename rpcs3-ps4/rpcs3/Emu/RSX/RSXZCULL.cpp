@@ -6,6 +6,8 @@
 
 #ifdef RPCS3_PS4
 #include "ps4_launcher.h"
+#include "util/ps4_rsx_programs.hpp"
+#include "util/ps4_safe_mode.hpp"
 #endif
 
 namespace rsx
@@ -20,10 +22,11 @@ namespace rsx
 		static atomic_t<bool> s_ps4_strict_on_read{false};
 		static atomic_t<bool> s_ps4_strict_sync{false};
 
-		// The first CPU fault on a report page with pending reports unprotects every locked page of that location in the
-		// critical section that sets m_pages_accessed (upstream unprotects them later, in disable_optimizations, after
-		// the RSX acks a pause). /data/rpcs3/zcull-av-upstream.flag (read per renderer) restores the upstream order.
-		static atomic_t<bool> s_ps4_av_upstream{false};
+		// With the zcull_av_early feature (zcull-av-early.flag or features.txt; read per renderer), the first CPU fault on
+		// a report page with pending reports unprotects every locked page of that location in the critical section that
+		// sets m_pages_accessed (upstream unprotects them later, in disable_optimizations, after the RSX acks a pause).
+		// Off by default: the upstream fault path, as 0.38.
+		static atomic_t<bool> s_ps4_av_upstream{true};
 
 		static bool ps4_relaxed_zcull_sync()
 		{
@@ -109,9 +112,13 @@ namespace rsx
 			s_ps4_strict_on_read.release(fs::is_file("/data/rpcs3/zcull-strict-on-read.flag"));
 			s_ps4_strict_sync.release(false);
 			ps4_mirror_clear();
-			s_ps4_av_upstream.release(fs::is_file("/data/rpcs3/zcull-av-upstream.flag"));
-			ps4_startup_checkpoint(s_ps4_av_upstream.load() ? "ZCULL: report page faults use the upstream order: pages unprotected after the RSX pause (zcull-av-upstream.flag)"
-				: "ZCULL: the first CPU fault on a report page unprotects the area's pages at once; later faults on them retry (default; zcull-av-upstream.flag restores the upstream order)");
+			s_ps4_av_upstream.release(!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::zcull_av_early));
+			ps4_startup_checkpoint(s_ps4_av_upstream.load() ? "ZCULL: report page faults use the upstream order: pages unprotected after the RSX pause (0.38 default; zcull-av-early.flag: at the first fault)"
+				: "ZCULL: the first CPU fault on a report page unprotects the area's pages at once; later faults on them retry (zcull_av_early on: zcull-av-early.flag or features.txt)");
+
+			m_ps4_skip_visible = utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::zcull_skip_visible);
+			ps4_startup_checkpoint(m_ps4_skip_visible ? "ZCULL: a query holding a draw skipped while its program compiles reports visible when it found no samples (zcull_skip_visible; zcull-skip-upstream.flag: occluded, as upstream)"
+				: "ZCULL: a query holding a skipped draw reports what the host counted, 0 = occluded (upstream: zcull-skip-upstream.flag or safe-mode level 2)");
 #endif
 		}
 
@@ -330,6 +337,9 @@ namespace rsx
 					m_current_task->owned = false;
 					m_current_task->sync_tag = 0;
 					m_current_task->timestamp = 0;
+#ifdef RPCS3_PS4
+					m_current_task->ps4_incomplete = false;
+#endif
 
 					// Flags determine what kind of payload is carried by queries in the 'report'
 					if (zpass_count_enabled) m_current_task->data_type |= CELL_GCM_ZPASS_PIXEL_CNT;
@@ -439,6 +449,30 @@ namespace rsx
 				m_current_task->sync_tag = m_timer++;
 			}
 		}
+
+#ifdef RPCS3_PS4
+		void ZCULL_control::ps4_on_skipped_draw()
+		{
+			if (m_ps4_skip_visible && m_current_task)
+			{
+				m_current_task->ps4_incomplete = true;
+			}
+		}
+
+		// A query read back for a report: its host count, or at least 1 when one of its draws was skipped and the
+		// host counted nothing (a skipped draw wrote no samples, so "0 = occluded" would be false). Counted for the
+		// 10 s 'Vulkan backend' line.
+		static void ps4_add_query_result(query_stat_counter& counter, const occlusion_query_info& query)
+		{
+			const u32 before = counter.result;
+			counter.result = utils::ps4::rsx_programs::report_with_skips(counter.result, query.result, query.ps4_incomplete);
+
+			if (counter.result != before + query.result)
+			{
+				utils::ps4::rsx_programs::g_pipeline_stats.queries_forced_visible.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+#endif
 
 		void ZCULL_control::on_sync_hint(sync_hint_payload_t payload)
 		{
@@ -609,7 +643,11 @@ namespace rsx
 					if (implemented && !have_result && query->num_draws)
 					{
 						get_occlusion_query_result(query);
+#ifdef RPCS3_PS4
+						ps4_add_query_result(counter, *query);
+#else
 						counter.result += query->result;
+#endif
 					}
 					else
 					{
@@ -761,7 +799,11 @@ namespace rsx
 					else if (force_read || check_occlusion_query_status(query))
 					{
 						get_occlusion_query_result(query);
+#ifdef RPCS3_PS4
+						ps4_add_query_result(counter, *query);
+#else
 						counter.result += query->result;
+#endif
 					}
 					else
 					{

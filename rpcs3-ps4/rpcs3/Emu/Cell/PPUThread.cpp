@@ -84,6 +84,13 @@
 #include <llvm/Object/ObjectFile.h>
 #include <zlib.h>
 #endif
+
+// 0.40: true on the main PPU thread while its boot initialize compiles the PPU modules (no game code has run yet), for
+// the opt-in boot compile rule (ps4_boot_ppu_workers)
+static thread_local bool ps4_t_ppu_boot_compile = false;
+
+// The workload compiled under that rule (its workers admit their compiles against the boot budget); nullptr = none
+static std::atomic<const void*> s_ps4_boot_workload{nullptr};
 #endif
 
 extern atomic_t<u64> g_watchdog_hold_ctr;
@@ -157,7 +164,15 @@ void fmt_class_string<typename ppu_thread::syscall_history_t>::format(std::strin
 {
 	const auto& history = get_object(arg);
 
-	for (u64 count = 0, idx = history.index - 1; idx != umax && count < history.data.size(); count++, idx--)
+#ifdef RPCS3_PS4
+	// The PS4 ring keeps ps4_hle_history_size calls for its own diagnostics; without PPU call history only the newest is
+	// printed, as with the upstream one-entry history (the thread-exit notice, the register dump).
+	const u64 shown = history.count_debug_arguments ? history.data.size() : std::min<u64>(history.data.size(), 1);
+#else
+	const u64 shown = history.data.size();
+#endif
+
+	for (u64 count = 0, idx = history.index - 1; idx != umax && count < shown; count++, idx--)
 	{
 		const auto& entry = history.data[idx % history.data.size()];
 		fmt::append(out, "\n(%u) 0x%08x: %s, 0x%x, r3=0x%x, r4=0x%x, r5=0x%x, r6=0x%x", count, entry.cia, entry.func_name, entry.error, entry.args[0], entry.args[1], entry.args[2], entry.args[3]);
@@ -2647,7 +2662,12 @@ void ppu_thread::dump_all(std::string& ret) const
 		fmt::append(ret, "%s", call_history);
 	}
 
+#ifdef RPCS3_PS4
+	// Only with PPU call history on, as upstream (the PS4 ring is longer than one entry either way)
+	if (syscall_history.count_debug_arguments)
+#else
 	if (syscall_history.data.size() > 1)
+#endif
 	{
 		ret +=
 			"\nHLE/LV2 History:"
@@ -2799,7 +2819,20 @@ void ppu_thread::cpu_task()
 		{
 			cmd_pop();
 
+#ifdef RPCS3_PS4
+			// PPU cache load/link and the SPU cache build are one governor compile stage: a warm-cache boot grows the heap
+			// and returns it at the link, and the slope rule of the 0.39 governor rules raised memory level 1 between
+			// the two (Demon's Souls 0.39 then built its SPU cache on 1 worker). No effect with the 0.38 rules.
+			std::optional<utils::ps4::governor::compile_stage> ps4_boot_stage(std::in_place);
+
+			ps4_t_ppu_boot_compile = true;
+#endif
+
 			ppu_initialize();
+
+#ifdef RPCS3_PS4
+			ps4_t_ppu_boot_compile = false;
+#endif
 
 			if (Emu.IsStopped())
 			{
@@ -2807,6 +2840,10 @@ void ppu_thread::cpu_task()
 			}
 
 			spu_cache::initialize();
+
+#ifdef RPCS3_PS4
+			ps4_boot_stage.reset();
+#endif
 
 #ifdef ARCH_ARM64
 			// Flush all cache lines after potentially writing executable code
@@ -3039,7 +3076,13 @@ ppu_thread::ppu_thread(const ppu_thread_params& param, std::string_view name, u3
 	state += cpu_flag::memory;
 
 	call_history.data.resize(g_cfg.core.ppu_call_history ? call_history_max_size : 1);
+#ifdef RPCS3_PS4
+	// A short ring on the PS4 even without PPU call history: the STALL dump, the fatal record and the HLE loop detector
+	// name the last calls (ps4_ppu_recent_calls)
+	syscall_history.data.resize(g_cfg.core.ppu_call_history ? syscall_history_max_size : ps4_hle_history_size);
+#else
 	syscall_history.data.resize(g_cfg.core.ppu_call_history ? syscall_history_max_size : 1);
+#endif
 	syscall_history.count_debug_arguments = static_cast<u32>(g_cfg.core.ppu_call_history ? std::size(syscall_history.data[0].args) : 0);
 
 #ifdef ARCH_ARM64
@@ -3119,7 +3162,13 @@ ppu_thread::ppu_thread(utils::serial& ar)
 	};
 
 	call_history.data.resize(g_cfg.core.ppu_call_history ? call_history_max_size : 1);
+#ifdef RPCS3_PS4
+	// A short ring on the PS4 even without PPU call history: the STALL dump, the fatal record and the HLE loop detector
+	// name the last calls (ps4_ppu_recent_calls)
+	syscall_history.data.resize(g_cfg.core.ppu_call_history ? syscall_history_max_size : ps4_hle_history_size);
+#else
 	syscall_history.data.resize(g_cfg.core.ppu_call_history ? syscall_history_max_size : 1);
+#endif
 	syscall_history.count_debug_arguments = static_cast<u32>(g_cfg.core.ppu_call_history ? std::size(syscall_history.data[0].args) : 0);
 
 	if (version >= 2 && !g_fxo->get<save_lv2_tag>().loaded.exchange(true))
@@ -5347,8 +5396,10 @@ static u32 ps4_optional_ppu_workers(u32 modules, u32 llvm_threads, std::string& 
 	constexpr u64 min_heap_room = 1ull << 30;
 	constexpr u32 max_live_threads = 48;
 
-	// 0.39: thread level 1 (the console's thread cap minus 16) also means no optional workers
-	if (llvm_threads != 2 || modules <= llvm_threads || utils::ps4::governor::heap_pressure() != 0 || utils::ps4::governor::thread_pressure() != 0)
+	// 0.39: thread level 1 (0.39 governor rules: the console's thread cap minus 16; 0.38 rules: 56 registry threads) also
+	// means no optional workers. A guard that only removes threads, on in every mode.
+	if (llvm_threads != 2 || modules <= llvm_threads || utils::ps4::governor::heap_pressure() != 0 ||
+		(utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::optional_ppu_workers_off) && utils::ps4::governor::thread_pressure() != 0))
 	{
 		return 0;
 	}
@@ -5388,6 +5439,50 @@ static u32 ps4_optional_ppu_workers(u32 modules, u32 llvm_threads, std::string& 
 
 	note = fmt::format("heap room %u MiB, %u threads", room >> 20, live);
 	return extra;
+}
+
+// 0.40 opt-in (row ppu_boot_workers; utils::ps4::governor::boot_workers_block): the optional workers of a workload of
+// the main thread's boot compile under the boot rule, or 0 when the rule does not apply (then the normal ones above
+// decide). With the row off nothing is sampled. 'note' receives the startup.log detail, also when the row is on and a
+// condition keeps the normal workers.
+static u32 ps4_boot_ppu_workers(u32 modules, u32 llvm_threads, std::string& note)
+{
+	namespace gov = utils::ps4::governor;
+	gov::boot_workers_state s{};
+	s.row_on = utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::ppu_boot_workers);
+
+	// A module loaded while the game runs keeps the normal workers without a line
+	if (!s.row_on || !ps4_t_ppu_boot_compile)
+	{
+		return 0;
+	}
+
+	// No other guest thread exists yet (the IDM is only looked at on this boot path, where no IDM lock is held)
+	s.boot_stage = idm::select<named_thread<ppu_thread>>([](u32, named_thread<ppu_thread>&) {}) <= 1;
+	s.llvm_threads = llvm_threads;
+	s.modules = modules;
+	s.memory_level = gov::heap_pressure();
+	s.thread_level = gov::thread_pressure();
+	s.threads = gov::live_threads();
+	const auto heap = gov::sample_heap();
+	s.room_known = heap.cap != 0;
+	s.room = static_cast<s64>(gov::heap_room(heap));
+
+	if (const std::string title = Emu.GetTitleID(); !title.empty())
+	{
+		const auto keys = utils::ps4::adapt::keys(title);
+		s.adapt_key = utils::ps4::adapt::has(keys, utils::ps4::adapt::key_llvm_threads_1) || utils::ps4::adapt::has(keys, utils::ps4::adapt::key_threads_low) ||
+			utils::ps4::adapt::has(keys, utils::ps4::adapt::key_heap_cap);
+	}
+
+	if (const char* const why = gov::boot_workers_block(s))
+	{
+		note = fmt::format("boot stage on the normal workers: %s (ppu_boot_workers on)", why);
+		return 0;
+	}
+
+	note = fmt::format("boot stage, ppu_boot_workers on; heap room %u MiB, %u threads", static_cast<u64>(s.room) >> 20, s.threads);
+	return gov::boot_workers_optional(s, jit_core_allocator::ps4_optional_max);
 }
 
 // Working set admitted for the compile of one PPU module: ~1.4 KiB of compiler memory per byte of guest code, as
@@ -6294,20 +6389,41 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		const bool ps4_serialized = utils::ps4::governor::serialize_compiles();
 		const u32 ps4_base_threads = ps4_serialized ? 0 : std::max<u32>(std::min<u32>(::size32(workload), rpcs3::utils::get_max_threads()), 1) - 1;
 
-		// Optional workers come after the base ones in the group below and take ps4_optional_sem permits
+		// Optional workers come after the base ones in the group below and take ps4_optional_sem permits. 0.40 opt-in: in
+		// the boot compile stage both of them under the boot rule (ps4_boot_ppu_workers), whose compiles are admitted
+		// against the boot budget.
 		std::string ps4_optional_note;
-		const u32 ps4_optional = ps4_serialized ? 0 : ps4_optional_ppu_workers(::size32(workload), rpcs3::utils::get_max_threads(), ps4_optional_note);
+		std::string ps4_boot_note;
+		const u32 ps4_boot_optional = ps4_serialized ? 0 : ps4_boot_ppu_workers(::size32(workload), rpcs3::utils::get_max_threads(), ps4_boot_note);
+		const bool ps4_boot_rule = ps4_boot_optional != 0;
+		const u32 ps4_optional = ps4_serialized ? 0 : ps4_boot_rule ? ps4_boot_optional : ps4_optional_ppu_workers(::size32(workload), rpcs3::utils::get_max_threads(), ps4_optional_note);
 		const u32 thread_count = ps4_base_threads + ps4_optional;
+
+		if (ps4_boot_rule)
+		{
+			s_ps4_boot_workload.store(&workload, std::memory_order_release);
+		}
+		else if (!ps4_boot_note.empty())
+		{
+			static atomic_t<u32> s_boot_logged = 0;
+
+			if (s_boot_logged++ < 4)
+			{
+				ps4_startup_checkpoint(fmt::format("PPU compile: %s; %u module(s)", ps4_boot_note, workload.size()).c_str());
+			}
+		}
 
 		if (ps4_serialized && workload.size() > 1)
 		{
-			ppu_log.warning("PS4: memory or thread pressure: %u PPU module(s) compile on this thread only, without PPUW workers", workload.size());
+			// 0.40: the causes behind the decision, so a long single-thread first boot says why it runs that way
+			const std::string reason{utils::ps4::governor::serialize_reason()};
+			ppu_log.warning("PS4: memory or thread pressure: %u PPU module(s) compile on this thread only, without PPUW workers (reason: %s)", workload.size(), reason);
 
 			static atomic_t<u32> s_logged = 0;
 
 			if (s_logged++ < 4)
 			{
-				ps4_startup_checkpoint(fmt::format("PPU compile: %u module(s) on one thread (memory governor: compiles serialized)", workload.size()).c_str());
+				ps4_startup_checkpoint(fmt::format("PPU compile: %u module(s) on one thread (memory governor: compiles serialized; reason: %s)", workload.size(), reason).c_str());
 			}
 		}
 #else
@@ -6371,6 +6487,11 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				auto invocation_lock = std::move(core_lock);
 				// Set low priority
 				thread_ctrl::scoped_priority low_prio(-1);
+
+#ifdef RPCS3_PS4
+				// 0.40 opt-in boot compile rule: this workload's compiles are admitted against the boot budget
+				const utils::ps4::governor::boot_compile_scope ps4_boot_scope(s_ps4_boot_workload.load(std::memory_order_acquire) == &workload);
+#endif
 
 #ifdef __APPLE__
 				pthread_jit_write_protect_np(false);
@@ -6508,8 +6629,10 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		if (ps4_optional)
 		{
 			const u32 started = threads.size() > ps4_base_threads ? threads.size() - ps4_base_threads : 0;
-			const std::string line = fmt::format("PPU compile: %u workers (+%u optional: %s)%s", rpcs3::utils::get_max_threads(), started, ps4_optional_note,
-				started < ps4_optional ? fmt::format("; %u of %u optional not started", ps4_optional - started, ps4_optional) : std::string{});
+			const std::string not_started = started < ps4_optional ? fmt::format("; %u of %u optional not started", ps4_optional - started, ps4_optional) : std::string{};
+			const std::string line = ps4_boot_rule
+				? fmt::format("PPU compile: %u workers (%s)%s", rpcs3::utils::get_max_threads() + started, ps4_boot_note, not_started)
+				: fmt::format("PPU compile: %u workers (+%u optional: %s)%s", rpcs3::utils::get_max_threads(), started, ps4_optional_note, not_started);
 
 			ppu_log.notice("PS4: %s; %u module(s)", line, workload.size());
 
@@ -6541,6 +6664,13 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 		threads.join();
 		
+#ifdef RPCS3_PS4
+		if (ps4_boot_rule)
+		{
+			s_ps4_boot_workload.store(nullptr, std::memory_order_release);
+		}
+
+#endif
 		thread_ctrl::set_name(old_name);
 		g_watchdog_hold_ctr--;
 		if (work_failed)
@@ -7044,3 +7174,31 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 #endif
 #endif // LLVM_AVAILABLE
 }
+
+#ifdef RPCS3_PS4
+u32 ps4_ppu_recent_calls(const ppu_thread& ppu, ps4_hle_call* out, u32 n) noexcept
+{
+	const auto& history = ppu.syscall_history;
+	const u64 size = history.data.size();
+
+	if (!out || !n || !size)
+	{
+		return 0;
+	}
+
+	// The PPU thread itself writes the entry, then moves on; the index is read once (a single aligned load) and only the
+	// entries written before it are copied. The ring is resized only by the thread's constructor.
+	const u64 index = *static_cast<const volatile u64*>(&history.index);
+	const u32 count = static_cast<u32>(std::min<u64>({index, size, n}));
+
+	for (u32 i = 0; i < count; i++)
+	{
+		const auto& entry = history.data[(index - 1 - i) % size];
+		out[i].name = entry.func_name;
+		out[i].ret = entry.error;
+		out[i].cia = static_cast<u32>(entry.cia);
+	}
+
+	return count;
+}
+#endif

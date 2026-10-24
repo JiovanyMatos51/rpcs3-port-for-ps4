@@ -395,6 +395,26 @@ public:
 
 static_assert(ppu_join_status::max <= ppu_join_status{ppu_thread::id_base});
 
+#ifdef RPCS3_PS4
+// 0.40: one recent HLE/LV2 call of a PPU thread, for the STALL dump and the HLE loop detector. 'name' points to a
+// static string (the function name table), so copies need no allocation.
+struct ps4_hle_call
+{
+	const char* name; // nullptr = unknown
+	u64 ret;          // r3 after the call
+	u32 cia;          // address of the call
+};
+
+// 0.40: HLE/LV2 calls each PPU thread keeps (its syscall_history ring) while PPU call history is off; with it on, the
+// upstream syscall_history_max_size.
+inline constexpr u32 ps4_hle_history_size = 32;
+
+// 0.40: copies up to 'n' of the thread's most recent calls into 'out', newest first, and returns how many were
+// copied. No allocation, no lock, async-signal-safe; the caller keeps 'ppu' alive (an IDM lock or a try-lock as the
+// STALL dump does). The thread may be calling meanwhile: an entry can then mix two of its calls (names stay valid).
+u32 ps4_ppu_recent_calls(const ppu_thread& ppu, ps4_hle_call* out, u32 n) noexcept;
+#endif
+
 template <typename T>
 struct ppu_gpr_cast_impl
 {

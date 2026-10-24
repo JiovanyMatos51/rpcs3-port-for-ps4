@@ -11,6 +11,12 @@
 #include "util/simd.hpp"
 #include "util/asm.hpp"
 
+#ifdef RPCS3_PS4
+#include "util/ps4_memory_governor.hpp"
+
+#include <atomic>
+#endif
+
 LOG_CHANNEL(cellAdec);
 
 // These need to be defined somewhere to access the LLE functions
@@ -798,6 +804,10 @@ error_code _CellAdecCoreOpGetMemSize_lpcm(vm::ptr<CellAdecAttr> attr)
 #ifdef RPCS3_PS4
 // sys_io_.cpp: test hook that makes an HLE helper thread fail as if the console had refused it
 extern bool ps4_test_refuse_hle_thread(std::string_view name);
+
+// Refused LPCM decoder threads of this process: a game may reopen the decoder at once, so the line goes through
+// governor::media_log_due (the first 8, then one in 100)
+static std::atomic<u32> s_ps4_lpcm_thread_failures{0};
 #endif
 
 error_code _CellAdecCoreOpOpenExt_lpcm(ppu_thread& ppu, vm::ptr<LpcmDecContext> handle, vm::ptr<AdecNotifyAuDone> notifyAuDone, vm::ptr<void> notifyAuDoneArg, vm::ptr<AdecNotifyPcmOut> notifyPcmOut, vm::ptr<void> notifyPcmOutArg,
@@ -862,7 +872,10 @@ error_code _CellAdecCoreOpOpenExt_lpcm(ppu_thread& ppu, vm::ptr<LpcmDecContext> 
 		// error is returned as before, but the sync objects created above have no other user yet: destroy them so
 		// repeated failed opens do not use up lv2 IDs. Conditions go first so their mutexes are no longer bound;
 		// this is the order _CellAdecCoreOpClose_lpcm uses.
-		cellAdec.error("_CellAdecCoreOpOpenExt_lpcm(): sys_ppu_thread_create() failed (0x%x)", static_cast<u32>(static_cast<s32>(ret)));
+		if (u32 number = 0; utils::ps4::governor::media_log_due(s_ps4_lpcm_thread_failures, number))
+		{
+			cellAdec.error("_CellAdecCoreOpOpenExt_lpcm(): sys_ppu_thread_create() failed (0x%x, failure %u of this process; the first 8, then one in 100 are logged)", static_cast<u32>(static_cast<s32>(ret)), number);
+		}
 		lv2_syscall<sys_cond_destroy>(ppu, handle->queue_size_cond);
 		lv2_syscall<sys_cond_destroy>(ppu, handle->unk_cond);
 		lv2_syscall<sys_cond_destroy>(ppu, handle->output_consumed);

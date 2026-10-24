@@ -220,9 +220,10 @@ namespace rsx
 			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_needs_rehash;
 
 #ifdef RPCS3_PS4
-			// The label page may be one ZCULL keeps without access (see ps4_rsx_label_sudo)
-			const auto& sema = *ps4_label_ptr<RsxSemaphore>(addr);
-			const auto& atomic_sema = *ps4_label_ptr<atomic_t<RsxSemaphore>>(addr);
+			// The label page may be one ZCULL keeps without access (see ps4_rsx_label_sudo); off: the guest view
+			const bool ps4_label_sudo = ps4_rsx_label_sudo();
+			const auto& sema = ps4_label_sudo ? *vm::get_super_ptr<RsxSemaphore>(addr) : vm::_ref<RsxSemaphore>(addr);
+			const auto& atomic_sema = ps4_label_sudo ? *vm::get_super_ptr<atomic_t<RsxSemaphore>>(addr) : vm::_ref<atomic_t<RsxSemaphore>>(addr);
 #else
 			const auto& sema = vm::_ref<RsxSemaphore>(addr);
 			const auto& atomic_sema = vm::_ref<atomic_t<RsxSemaphore>>(addr);

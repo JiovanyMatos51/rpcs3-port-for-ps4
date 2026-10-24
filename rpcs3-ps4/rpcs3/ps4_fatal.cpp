@@ -12,10 +12,14 @@
 #include "util/ps4_adapt.hpp"
 #include "util/ps4_build_version.hpp"
 #include "util/ps4_i18n.hpp" // tr(): constant tables, async-signal-safe
+#include "util/ps4_lifecycle.hpp" // 0.40: session record name
+#include "util/ps4_safe_mode.hpp" // 0.40: note_failure(): allocation-free, async-signal-safe
 #include "util/logs.hpp"
 #include "util/ps4_signal_context.hpp"
+#include "util/ps4_spu_object_cache.hpp" // 0.40: build_stamp_hex(), read once at init
 #include "util/tsc.hpp"
 #include "Utilities/Thread.h" // 0.29: ps4_thread_registry counters (relaxed loads, fatal-path safe)
+#include "Emu/Cell/PPUThread.h" // 0.40: ps4_ppu_recent_calls (no allocation, no lock)
 
 #include <orbis/libkernel.h>
 #include <orbis/Sysmodule.h>
@@ -155,6 +159,7 @@ char s_exhaustion_reason[512];
 std::atomic<bool> s_leaving{false};
 std::atomic<bool> s_background{false};
 std::atomic<bool> s_overlay{false};
+std::atomic<std::uint32_t> s_focus_epoch{0}; // ps4_focus_epoch(): real focus changes and resumes only
 std::atomic<unsigned> s_orbis_lines{0};
 std::atomic<unsigned> s_orbis_fatal_lines{0};
 std::atomic<unsigned> s_orbis_heap_lines{0};           // heap-cap lines (CAP, FALLING BACK, REFUSED), own budget
@@ -234,6 +239,46 @@ void title_text(fixed_text<N>& t) noexcept
 {
     char title[utils::ps4::adapt::title_size];
     if (utils::ps4::adapt::current_title(title)) t.s("\ntitle: ").s(title);
+}
+
+// 0.40: "\n" + the class census of Utilities/Thread.h (guest, emulator registry, outside the registry, unjoined), so a
+// fatal record shows who held the slots of the console's thread cap. Allocation-free and lock-free.
+template <std::size_t N>
+void thread_classes_text(fixed_text<N>& t) noexcept
+{
+    char classes[512];
+    if (ps4_thread_census_line(classes, sizeof(classes))) t.s("\n").s(classes);
+}
+
+// 0.40: a failure of the running game for the per-game safe mode (the next boot of the title runs one level higher)
+// and the end of its session record, so the next start does not take the session for one closed early. Nothing is
+// written outside a game. open/write/fsync only: fatal and signal paths.
+void note_game_failure(utils::ps4::safe_mode::fail_kind kind) noexcept
+{
+    utils::ps4::safe_mode::note_failure(kind);
+    char title[utils::ps4::adapt::title_size];
+    if (utils::ps4::adapt::current_title(title))
+        utils::ps4::adapt::write_record(title, utils::ps4::session_record::suffix, kind == utils::ps4::safe_mode::fail_kind::threads ? "end threads" : "end crash");
+}
+
+// 0.40: "\nlast calls: <name>(<result>)@<address> ..." when the failing thread is a PPU thread: its newest 4 HLE/LV2
+// calls, newest first. The names are static strings; a thread-local read and a copy, no allocation, no lock.
+template <std::size_t N>
+void ppu_calls_text(fixed_text<N>& t) noexcept
+{
+    const ppu_thread* const ppu = cpu_thread::get_current<ppu_thread>();
+    if (!ppu) return;
+    ps4_hle_call calls[4];
+    const u32 n = ps4_ppu_recent_calls(*ppu, calls, 4);
+    if (!n) return;
+    t.s("\nlast calls:");
+    for (u32 i = 0; i < n; i++) t.s(" ").s(calls[i].name ? calls[i].name : "?").s("(").x(calls[i].ret).s(")@").x(calls[i].cia);
+}
+
+// A refused must-succeed thread start fails with this text (Utilities/Thread.cpp): the console ran out of threads.
+bool thread_start_refused(const char* reason) noexcept
+{
+    return reason && std::strstr(reason, "in function 'start'");
 }
 
 template <std::size_t N>
@@ -585,6 +630,40 @@ bool hex_after(std::string_view line, std::string_view key, unsigned long long& 
     return true;
 }
 
+// 0.40: the build stamp of the running ELF (64 hex digits written after linking, util/ps4_spu_object_cache.hpp),
+// copied once by ps4_fatal_init, so a fatal record names the exact ELF its offsets belong to without allocating. Empty
+// for an unstamped build. Written once at the start of main, read-only afterwards.
+char s_build_stamp[65] = "";
+std::atomic<bool> s_build_stamp_read{false};
+
+// "elf: <version> stamp <hex>\n" for a fatal record, right before its offsets.
+template <std::size_t N>
+void build_stamp_text(fixed_text<N>& t) noexcept
+{
+    t.s("elf: RPCS3 PS4 EDITION ").s(ps4_build_version).s(", ");
+    if (!s_build_stamp_read.load(std::memory_order_acquire)) t.s("stamp not read yet (the failure came before main)");
+    else if (s_build_stamp[0]) t.s("stamp ").s(s_build_stamp).s(" (symbolize the offsets below with the rpcs3_ps4.elf archived under this stamp)");
+    else t.s("unstamped build (no archived rpcs3_ps4.elf matches these offsets)");
+    t.s("\n");
+}
+
+// 0.40: the last two lines this process wrote to /data/tempest-vkloader.log (vkloader rewrites it at its first line of
+// a process), for every fatal record: the line before a FATAL one says why an entry point was missing (resolved with
+// no live instance, or not exported by the driver), and nothing else collects that file. Nothing when the file is
+// unchanged since boot. open/fstat/lseek/read into a stack buffer only: fatal and signal paths.
+template <std::size_t N>
+void vkloader_text(fixed_text<N>& t) noexcept
+{
+    char tail[640];
+    const std::size_t n = read_new_tail(vkloader_log_path, s_vkloader_log_boot, false, tail, sizeof(tail));
+    const std::string_view newest = line_from_end(tail, n, 0);
+    if (newest.empty()) return;
+    const std::string_view older = line_from_end(tail, n, 1);
+    t.s("vkloader log of this session (newest last): ");
+    if (!older.empty()) t.s(older.substr(0, 256)).s(" | ");
+    t.s(newest.substr(0, 256)).s("\n");
+}
+
 void abort_signal(int) noexcept
 {
     // Reached from orbis-compat abort() -> raise(SIGABRT) (Mesa, LLVM, libunwind, assert, vkloader).
@@ -633,7 +712,7 @@ unsigned long long ps4_boot_flexible_memory_free() noexcept
     return s_boot_flexible.load(std::memory_order_relaxed);
 }
 
-std::size_t ps4_thread_census_line(char* out, std::size_t size) noexcept
+std::size_t ps4_orbis_census_line(char* out, std::size_t size) noexcept
 {
     if (!out || !size) return 0;
     fixed_text<768> t;
@@ -691,6 +770,20 @@ void ps4_fatal_init() noexcept
     }
     const int32_t system_service = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SYSTEM_SERVICE);
     startup_line(s_coredump_mode ? "fatal policy: record + SIGABRT core dump (coredump.flag)" : "fatal policy: record + park (no CE)");
+    {
+        // 0.40: the ELF stamp, read here once: the fatal records print this copy, and this line ties every log of the
+        // session to the archived release ELF that symbolizes its offsets
+        const std::string stamp = utils::ps4::spu_objcache::build_stamp_hex();
+        const std::size_t n = std::min(stamp.size(), sizeof(s_build_stamp) - 1);
+        std::memcpy(s_build_stamp, stamp.data(), n);
+        s_build_stamp[n] = 0;
+        s_build_stamp_read.store(true, std::memory_order_release);
+        fixed_text<224> t;
+        t.s("build: RPCS3 PS4 EDITION ").s(ps4_build_version).s(" (").s(ps4_build_date).s("), ELF ");
+        if (n) t.s("stamp ").s(s_build_stamp);
+        else t.s("unstamped (no archived release ELF matches it)");
+        startup_line(t.b);
+    }
     if (system_service < 0)
     {
         fixed_text<96> t;
@@ -709,17 +802,21 @@ void ps4_fatal_init() noexcept
      .s("origin: ").s(origin ? origin : "?").s("\nreason: ").s(reason ? reason : "?")
      .s("\nthread: ");
     thread_name(t);
+    ppu_calls_text(t);
     title_text(t);
     t.s("\nkernel internal memory free: ").u(ps4_internal_memory_free()).s(" bytes\n");
     thread_census_text(t); // 0.29: thread census (relaxed loads only, no allocation)
+    thread_classes_text(t);
     t.s("\nuptime_us: ").u(sceKernelGetProcessTime())
      .s("\nfocus: background=").u(s_background.load()).s(" overlay=").u(s_overlay.load()).s("\n");
+    vkloader_text(t);
     if (abi::__cxa_current_exception_type())
     {
         t.s("exception: ");
         describe_exception(t);
         t.s("\n");
     }
+    build_stamp_text(t);
     backtrace_offsets(t);
     frame_chain_offsets(t);
     sceKernelDebugOutText(0, t.b);
@@ -729,6 +826,9 @@ void ps4_fatal_init() noexcept
     // open/write/fsync only; nothing is written while no game title is set.
     if (out_of_memory_fatal(reason) && utils::ps4::adapt::note(utils::ps4::adapt::key_llvm_threads_1))
         startup_line("adapt: out of memory; the next boots of this game compile with one thread (llvm_threads=1)");
+    // 0.40: the next boot of the running game opens one safe-mode level higher; a refused must-succeed thread start is a
+    // thread failure (it replaces a crash noted earlier in the session)
+    note_game_failure(thread_start_refused(reason) ? utils::ps4::safe_mode::fail_kind::threads : utils::ps4::safe_mode::fail_kind::crash);
     // Toast before the logger: the logger (or the heap) may be what failed.
     notify(utils::ps4::i18n::tr(utils::ps4::i18n::str::FATAL_RPCS3_PS4_ERRO_FATAL_REGISTRADO));
     ps4_fatal_log.fatal("%s", static_cast<const char*>(t.b));
@@ -750,12 +850,16 @@ void ps4_note_thread_fatal(const char* reason) noexcept
     t.s("RPCS3 PS4 EDITION ").s(ps4_build_version).s(" thread fatal error\norigin: emergency_exit\nreason: ")
      .s(reason ? reason : "?").s("\nthread: ");
     thread_name(t);
+    ppu_calls_text(t);
     title_text(t);
     t.s("\nuptime_us: ").u(sceKernelGetProcessTime()).s("\nkernel internal memory free: ").u(ps4_internal_memory_free()).s(" bytes\n");
     thread_census_text(t); // 0.29: thread census (relaxed loads only, no allocation)
+    thread_classes_text(t);
     t.s("\n");
     heap_text(t);
     t.s("\n");
+    vkloader_text(t);
+    build_stamp_text(t);
     if (index < 8)
     {
         backtrace_offsets(t);
@@ -763,7 +867,9 @@ void ps4_note_thread_fatal(const char* reason) noexcept
     }
     if (!s_pending.exchange(true)) write_file(fatal_path, t, true);
     if (index < 16) write_file(startup_path, t, false);
-    if (reason && std::strstr(reason, "in function 'start'"))
+    // 0.40: per-game safe mode (one level per session; a thread refusal replaces a crash)
+    note_game_failure(thread_start_refused(reason) ? utils::ps4::safe_mode::fail_kind::threads : utils::ps4::safe_mode::fail_kind::crash);
+    if (thread_start_refused(reason))
     {
         // 0.29: thread resources exhausted (a refused must-succeed thread_base::start, or a refused 'Emulation Join
         // Thread'): its own slot, taken first by ps4_take_thread_fatal, so another pending reason cannot hide it.
@@ -821,6 +927,11 @@ bool ps4_thread_exhaustion_pending() noexcept
 bool ps4_in_background() noexcept
 {
     return s_background.load(std::memory_order_relaxed) || s_overlay.load(std::memory_order_relaxed);
+}
+
+std::uint32_t ps4_focus_epoch() noexcept
+{
+    return s_focus_epoch.load(std::memory_order_relaxed);
 }
 
 bool ps4_try_leave_application(const char* why) noexcept
@@ -968,6 +1079,9 @@ void ps4_poll_system_service() noexcept
     const bool old_overlay = s_overlay.exchange(overlay), old_background = s_background.exchange(background);
     if (overlay != old_overlay || background != old_background)
     {
+        // Watchers of the GPU and the emulation restart their clocks only on a real focus change, never on the
+        // poll-gap detector above: a blocked main thread is not a suspension.
+        s_focus_epoch.fetch_add(1, std::memory_order_relaxed);
         fixed_text<96> t;
         t.s("focus: system_ui_overlay=").u(overlay).s(" background=").u(background);
         startup_line(t.b, nullptr, false);
@@ -988,6 +1102,7 @@ void ps4_poll_system_service() noexcept
         // (lock-free flag). AudioOut errors reach cellAudio through UNSPECIFIED_ERROR and the backend is reopened.
         if (type == 0x10000000u)
         {
+            s_focus_epoch.fetch_add(1, std::memory_order_relaxed);
             ps4_pads::on_resume();
             report_resume_clocks(clocks, s_gap_before, s_gap_after);
         }

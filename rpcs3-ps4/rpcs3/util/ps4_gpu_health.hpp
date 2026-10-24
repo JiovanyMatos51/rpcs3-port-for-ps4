@@ -241,7 +241,8 @@ inline u32 hang_reports() noexcept
 
 // 0.39: a hang confirmed for hang_stop_us stops the game and returns to the XMB instead of waiting forever: an untimed
 // fence wait that long (its clock skips time in the background), or the oldest submission unfinished that long while
-// the game stayed in the foreground. Off with /data/rpcs3/no-hang-stop.flag (read when a renderer starts).
+// the game stayed in the foreground. Off while the hang_stop feature is off (no-hang-stop.flag, safe-mode level 2; set
+// when a renderer starts).
 inline constexpr u64 hang_stop_us = 10'000'000;
 
 namespace detail

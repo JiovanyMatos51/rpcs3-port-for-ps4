@@ -109,6 +109,10 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
 #include "util/sysinfo.hpp"
 #include "Emu/Memory/vm_locking.h"
 
+#ifdef RPCS3_PS4
+#include "util/ps4_safe_mode.hpp" // feature rows (relaxed loads, signal-safe) and the per-game failure notes
+#endif
+
 LOG_CHANNEL(sig_log, "SIG");
 LOG_CHANNEL(sys_log, "SYS");
 LOG_CHANNEL(vm_log, "VM");
@@ -1587,6 +1591,13 @@ namespace
 
 	void ps4_av_livelock_net(u32 addr, bool is_writing) noexcept
 	{
+		// 0.40: row av_livelock_net (no-av-livelock-net.flag, safe-mode level 1: retry forever, as 0.38). One relaxed
+		// load, valid in this signal handler; per fault, so a per-game level switches it.
+		if (!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::av_livelock_net))
+		{
+			return;
+		}
+
 		constexpr u64 host_page = 0x4000; // utils::get_page_size() on the console
 		const u64 page = reinterpret_cast<u64>(vm::base(addr)) & ~(host_page - 1);
 		const u64 now = get_system_time();
@@ -1604,13 +1615,6 @@ namespace
 		const u64 elapsed = now - t_ps4_av_first_us;
 
 		if ((count < 10'000 || elapsed < 100'000) && elapsed < 1'000'000)
-		{
-			return;
-		}
-
-		static const bool s_off = fs::is_file("/data/rpcs3/no-av-livelock-net.flag");
-
-		if (s_off)
 		{
 			return;
 		}
@@ -4372,6 +4376,7 @@ namespace
 {
 	constinit std::atomic<u32> s_ps4_first_refusal{0}; // 0 none, 1 being recorded, 2 recorded
 	constinit ps4_thread_load s_ps4_first_refusal_load{};
+	constinit std::atomic<u32> s_ps4_refusals{0};
 
 	// A create the console refused (not a test refusal): the load right after the first one, for the thread governor
 	void ps4_note_create_refused() noexcept
@@ -4383,6 +4388,40 @@ namespace
 			s_ps4_first_refusal_load = ps4_thread_load_now();
 			s_ps4_first_refusal.store(2, std::memory_order_release);
 		}
+
+		// 0.40: the frontend prints who holds the slots (ps4_thread_census_line) at the 1st, 2nd, 4th, 8th ... refusal,
+		// never this thread (it may hold the locks of a create)
+		if (const u32 n = s_ps4_refusals.fetch_add(1, std::memory_order_relaxed) + 1; (n & (n - 1)) == 0)
+		{
+			ps4_census_request();
+		}
+	}
+}
+
+void ps4_note_guest_thread_refused(const char* what, std::string_view name) noexcept
+{
+	namespace sm = utils::ps4::safe_mode;
+
+	if (!sm::enabled(sm::feature::refusal_notes))
+	{
+		return;
+	}
+
+	// The lighter thread budget for the next boots of this title (ps4_policy.hpp: online skipped, one LLVM and one
+	// pipeline compile worker), and the next safe-mode level. Both notes write once per session and title.
+	const bool noted = utils::ps4::adapt::note(utils::ps4::adapt::key_threads_low);
+	sm::note_failure(sm::fail_kind::threads);
+
+	// One line per session: the adapt title sequence changes at every game boot
+	static constinit std::atomic<u32> s_logged_seq{0};
+	const u32 seq = utils::ps4::adapt::g_title_seq.load(std::memory_order_acquire);
+
+	if (noted && s_logged_seq.exchange(seq, std::memory_order_acq_rel) != seq)
+	{
+		char line[320];
+		std::snprintf(line, sizeof(line), "adapt: %s '%.*s' was refused; the next 3 boots of this game use the lighter thread budget (threads=low) and the next safe-mode level (fail=threads)",
+			what ? what : "a thread", static_cast<int>(std::min<usz>(name.size(), 64)), name.data());
+		ps4_startup_checkpoint(line);
 	}
 }
 
@@ -4408,6 +4447,145 @@ ps4_thread_load ps4_thread_load_now() noexcept
 	result.total = result.live + result.unjoined;
 	result.joined = c.joined;
 	return result;
+}
+
+namespace
+{
+	constinit std::atomic<bool> s_ps4_census_due{false};
+
+	// Guest threads are the PPU/SPU thread_base threads of the registry (named by spu_thread/ppu_thread::thread_name_t)
+	bool ps4_is_guest_thread_name(const char* name) noexcept
+	{
+		for (const char* prefix : {"PPU[", "SPU[", "RawSPU[", "Iso["})
+		{
+			if (std::strncmp(name, prefix, std::strlen(prefix)) == 0)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+}
+
+void ps4_census_request() noexcept
+{
+	s_ps4_census_due.store(true, std::memory_order_release);
+}
+
+bool ps4_census_due() noexcept
+{
+	return s_ps4_census_due.exchange(false, std::memory_order_acq_rel);
+}
+
+std::size_t ps4_thread_census_line(char* out, std::size_t size) noexcept
+{
+	if (!out || !size)
+	{
+		return 0;
+	}
+
+	const ps4_thread_load load = ps4_thread_load_now();
+
+	u32 registry = 0;
+	u32 guest = 0;
+
+	for (u32 i = 0; i < reg::slot_count; i++)
+	{
+		if (s_ps4_live[i].state.load(std::memory_order_relaxed) != reg::slot_live || !reg::pin(i))
+		{
+			continue;
+		}
+
+		char name[reg::name_size];
+		ps4_live_load_name(s_ps4_live[i], name);
+		reg::unpin(i);
+		registry++;
+		guest += ps4_is_guest_thread_name(name);
+	}
+
+	// Hand-formatted (no stdio): the fatal record of a crash signal also prints this line
+	usz len = 0;
+	out[0] = '\0';
+
+	const auto append = [&](const char* text) noexcept
+	{
+		for (usz i = 0; text[i] && len + 1 < size; i++)
+		{
+			out[len++] = text[i];
+		}
+
+		out[len] = '\0';
+	};
+
+	const auto append_u = [&](u32 value) noexcept
+	{
+		char digits[12];
+		usz count = 0;
+
+		do
+		{
+			digits[count++] = static_cast<char>('0' + value % 10);
+			value /= 10;
+		}
+		while (value && count < sizeof(digits));
+
+		char text[sizeof(digits) + 1];
+
+		for (usz i = 0; i < count; i++)
+		{
+			text[i] = digits[count - 1 - i];
+		}
+
+		text[count] = '\0';
+		append(text);
+	};
+
+	append("PS4 threads: census ");
+	append_u(load.total);
+	append(" of the cap count (orbis live ");
+	append_u(load.live);
+	append(" + exited not joined ");
+	append_u(load.unjoined);
+	append("): guest ");
+	append_u(guest);
+	append(", emulator ");
+	append_u(registry - guest);
+	append(", outside the registry ");
+	append_u(load.live > registry ? load.live - registry : 0);
+	append(", unjoined ");
+	append_u(load.unjoined);
+
+	// Names of the thread_base threads that exited without a join yet (the table may drop names; the count is exact)
+	u32 named = 0;
+
+	for (const ps4_unjoined_slot& s : s_ps4_unjoined)
+	{
+		if (s.key.load(std::memory_order_acquire) <= 1)
+		{
+			continue;
+		}
+
+		u64 words[reg::name_size / sizeof(u64)];
+
+		for (usz i = 0; i < std::size(words); i++)
+		{
+			words[i] = s.name[i].load(std::memory_order_relaxed);
+		}
+
+		char name[reg::name_size];
+		std::memcpy(name, words, sizeof(name));
+		name[sizeof(name) - 1] = '\0';
+		append(named++ ? ", " : " (");
+		append(name[0] ? name : "?");
+	}
+
+	if (named)
+	{
+		append(")");
+	}
+
+	return len;
 }
 
 const char* ps4_firmware_key() noexcept
@@ -4474,6 +4652,7 @@ std::string ps4_thread_live_summary() noexcept
 	u32 group_count = 0;
 	u32 other = 0;
 	u32 live = 0;
+	u32 guest = 0;
 
 	for (u32 i = 0; i < reg::slot_count; i++)
 	{
@@ -4486,6 +4665,7 @@ std::string ps4_thread_live_summary() noexcept
 		ps4_live_load_name(s_ps4_live[i], name);
 		reg::unpin(i);
 		live++;
+		guest += ps4_is_guest_thread_name(name);
 
 		char key[reg::name_size];
 		ps4_thread_group_key(name, key);
@@ -4531,6 +4711,13 @@ std::string ps4_thread_live_summary() noexcept
 
 	std::string out = fmt::format("PS4 threads: %u live in the registry (peak %u); thread_base: %u running, %u exited but not joined yet (stack still held), %u started, %u joined",
 		live, s_ps4_live_peak.load(std::memory_order_relaxed), running, unjoined, started, joined);
+
+	// 0.40: the slot classes of the console's cap count, as in ps4_thread_census_line
+	{
+		const ps4_thread_load load = ps4_thread_load_now();
+		fmt::append(out, "; classes: guest %u, emulator %u, outside the registry %u, unjoined %u (cap count %u)", guest, live - guest,
+			load.live > live ? load.live - live : 0, load.unjoined, load.total);
+	}
 
 	if (const u64 failed = s_ps4_join_failed.load(std::memory_order_relaxed))
 	{
@@ -4883,6 +5070,17 @@ void thread_base::start()
 	else
 	{
 		ps4_note_create_refused();
+
+		// 0.40: the fatal below ends the session; the title's next boots get the lighter thread budget and the next
+		// safe-mode level, and startup.log names who held the slots (the fatal report itself is unchanged)
+		ps4_note_guest_thread_refused("a must-succeed thread", ps4_name);
+
+		char census[512];
+
+		if (ps4_thread_census_line(census, sizeof(census)))
+		{
+			ps4_startup_checkpoint(census);
+		}
 	}
 #endif
 
@@ -5043,27 +5241,23 @@ bool thread_base::try_start_native() noexcept
 	return true;
 }
 
-bool ps4_lazy_threads_enabled() noexcept
+bool ps4_lazy_fxo_threads_enabled() noexcept
 {
-	static const bool enabled = []() noexcept
-	{
-		const bool keep = fs::is_file("/data/rpcs3/keep-service-threads.flag");
-		ps4_startup_checkpoint(keep ? "PS4 threads: service threads start at boot (keep-service-threads.flag)"
-		                            : "PS4 threads: service threads start on first use (keep-service-threads.flag starts them at boot)");
-		return !keep;
-	}();
-
-	return enabled;
+	// Read per boot: g_fxo builds the service threads after the boot set this boot's rows (System.cpp fixup_settings)
+	return utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::lazy_services);
 }
 
 bool ps4_service_idle(std::string_view name) noexcept
 {
-	if (!ps4_lazy_threads_enabled())
+	if (!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::idle_services_skip))
 	{
 		return false;
 	}
 
-	// The conditions under which these bodies return at once (cellCamera.cpp, cellMic.cpp, CPUThread.cpp, lv2.cpp)
+	// The conditions under which these bodies return at once (cellCamera.cpp, cellMic.cpp, CPUThread.cpp, lv2.cpp,
+	// cellGem.cpp gem_tracker, sys_rsxaudio.cpp rsxaudio_backend_thread, np_handler.cpp). The triggers of the gem and
+	// rsxaudio threads start them only in the configurations where they work (cellGemInit with a real Move handler,
+	// sys_rsxaudio_initialize with the rsxaudio provider), and push() starts any stand-by thread that gets a task.
 	const char* why = nullptr;
 
 	if (name == "Camera Thread"sv)
@@ -5081,6 +5275,19 @@ bool ps4_service_idle(std::string_view name) noexcept
 	else if (name == "PPU Syscall Usage Thread"sv)
 	{
 		why = "its counters are read without it";
+	}
+	else if (name == "GemUpdateThread"sv)
+	{
+		why = g_cfg.io.move != move_handler::real ? "Move handler not 'real'" : nullptr;
+	}
+	else if (name == "RsxAudio Backend Thread"sv)
+	{
+		why = g_cfg.audio.provider != audio_provider::rsxaudio ? "audio provider not rsxaudio" : nullptr;
+	}
+	else if (name == "NP Handler Thread"sv)
+	{
+		// g_cfg is final when g_fxo builds it, the boot's offline override (psn_status disabled) included
+		why = ps4_np_handler_idle(g_cfg.net.psn_status == np_psn_status::psn_rpcn);
 	}
 
 	if (!why)

@@ -17,6 +17,9 @@
 // 0.37: the package may carry a read-only copy at /app0/config_database.dat. The /data copy (the user's import) is
 // used when it is valid, unless both copies carry a 'timestamp' and the bundled one is newer; without a usable /data
 // copy the bundled one is used. Nothing changes when the package has no copy. file_info says which copy runs.
+//
+// 0.40: the boot policy can skip one title's entry (set_skipped: config-database-off.flag, or the per-game safe mode
+// from level 2); the title then runs as without a database.
 
 #include "Utilities/File.h"
 
@@ -78,8 +81,9 @@ struct entry
 {
     std::string config;    // YAML text, as PC RPCS3 applies it with cfg_root::from_string
     bool rejected = false; // the policy found a key or value this build does not know (see mark_rejected)
+    bool skipped = false;  // 0.40: the boot policy does not apply it for this title (see set_skipped)
 
-    bool usable() const { return !config.empty() && !rejected; }
+    bool usable() const { return !config.empty() && !rejected && !skipped; }
 };
 
 namespace detail
@@ -432,6 +436,8 @@ struct cache
     file_info info;
     game_map games;          // entries of the copy in use
     std::map<std::string, bool, std::less<>> rejected; // titles whose entry failed validation for this file
+    // 0.40: titles whose entry the boot policy skips; not tied to a file, so a re-read keeps them
+    std::map<std::string, bool, std::less<>> skipped;
 };
 
 inline cache& get_cache()
@@ -593,6 +599,7 @@ inline entry lookup(std::string_view title_id)
     {
         out.config = it->second;
         out.rejected = c.rejected.find(title_id) != c.rejected.end();
+        out.skipped = c.skipped.find(title_id) != c.skipped.end();
     }
     return out;
 }
@@ -611,6 +618,18 @@ inline void mark_rejected(std::string_view title_id)
     detail::cache& c = detail::get_cache();
     const std::lock_guard lock(c.mutex);
     if (c.games.find(title_id) != c.games.end()) c.rejected[std::string(title_id)] = true;
+}
+
+// 0.40: the boot policy's decision for one title (config-database-off.flag, or the per-game safe mode from level 2):
+// while skipped, lookup() marks the entry skipped and has_entry() is false, so the title runs as on a console without
+// the database, its fallback rows included. Every policy run of the title sets it again.
+inline void set_skipped(std::string_view title_id, bool skip)
+{
+    if (title_id.empty()) return;
+    detail::cache& c = detail::get_cache();
+    const std::lock_guard lock(c.mutex);
+    if (skip) c.skipped[std::string(title_id)] = true;
+    else if (const auto it = c.skipped.find(title_id); it != c.skipped.end()) c.skipped.erase(it);
 }
 
 // Drops the cached copy, so the next call reads the file again even if its size and time did not change (for an

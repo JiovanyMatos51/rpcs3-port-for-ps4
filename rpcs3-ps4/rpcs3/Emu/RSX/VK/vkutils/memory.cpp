@@ -11,6 +11,7 @@
 #include "ps4_launcher.h"
 #include "util/ps4_gpu_health.hpp"
 #include "util/ps4_i18n.hpp"
+#include "util/ps4_safe_mode.hpp"
 #include "util/ps4_vram_policy.hpp"
 
 #include <array>
@@ -134,9 +135,10 @@ namespace vk
 		std::atomic<u64> s_ps4_window_budget{ ps4_window_budget_default };
 		// pHeapSizeLimit per heap (VK_WHOLE_SIZE = no cap), to tell a VMA cap refusal from a driver failure.
 		std::array<std::atomic<u64>, VK_MAX_MEMORY_HEAPS> s_ps4_heap_limits{};
-		// 0.39: /data/rpcs3/vma-keep-empty.flag (read when the allocator is created): VMA keeps its spare empty block
-		// per memory type as upstream (no release under window pressure, no frame-end release pass).
-		std::atomic<bool> s_ps4_vma_keep_empty{ false };
+		// Feature vma_release off (the default; read when the allocator is created): VMA keeps its spare empty block per
+		// memory type as upstream (no release under window pressure, no release pass at severe or fatal ratings), and the
+		// fatal rating and fatal-trim back-off of VKResourceManager.cpp are the 0.38 ones.
+		std::atomic<bool> s_ps4_vma_keep_empty{ true };
 
 		u64 ps4_vma_total_bytes(VmaAllocator allocator)
 		{
@@ -734,11 +736,11 @@ namespace vk
 #ifdef RPCS3_PS4
 		s_ps4_vma.store(m_allocator);
 
-		s_ps4_vma_keep_empty.store(ps4_flag_present("/data/rpcs3/vma-keep-empty.flag"), std::memory_order_relaxed);
+		s_ps4_vma_keep_empty.store(!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::vma_release), std::memory_order_relaxed);
 		ps4_startup_checkpoint(s_ps4_vma_keep_empty.load(std::memory_order_relaxed)
-			? "PS4 VRAM: VMA keeps one spare empty block per memory type (vma-keep-empty.flag)"
+			? "PS4 VRAM: VMA keeps one spare empty block per memory type; fatal ratings and fatal-trim back-off as 0.38 (0.38 default; vma-release-empty.flag: release empty blocks)"
 			: "PS4 VRAM: VMA releases a block it empties while the window load is 85% or more, and severe or fatal ratings release every empty block "
-			  "(vma-keep-empty.flag keeps one spare per memory type); a fatal rating needs the allocations over 95% or no 64 MiB free range");
+			  "(vma_release on: vma-release-empty.flag or features.txt); a fatal rating needs the allocations over 95% or no 64 MiB free range");
 #endif
 
 		// Allow fastest possible allocation on start
@@ -1224,6 +1226,13 @@ namespace vk
 			vram_policy::vma_release_load_percent;
 	}
 
+	// The vma_release feature of the current allocator (VKResourceManager.cpp picks its fatal rating and back-off from
+	// it). Any thread.
+	bool ps4_vma_release_on() noexcept
+	{
+		return !s_ps4_vma_keep_empty.load(std::memory_order_relaxed);
+	}
+
 	// 0.39: releases every empty VMA block (severe and fatal ratings, VKResourceManager.cpp). Returns the bytes freed.
 	// RSX thread.
 	u64 ps4_vma_free_empty_blocks()
@@ -1391,8 +1400,10 @@ namespace vk
 			return;
 		}
 
-		// Also notes vram=low for the game's next boots (adapt).
+		// Also notes vram=low for the game's next boots (adapt), and one safe-mode level more (fail=gpu): a stop, not the
+		// pressure events that a trim recovers.
 		ps4_note_vram_pressure("a required allocation could not be served");
+		utils::ps4::safe_mode::note_failure(utils::ps4::safe_mode::fail_kind::gpu);
 		ps4_fatal_note("VRAM: graceful stop requested (game stopped, back to the XMB): ", why ? why : "");
 		ps4_notify(utils::ps4::i18n::tr(utils::ps4::i18n::str::TOAST_RPCS3_MEMORIA_VIDEO_ESGOTADA_JOGO));
 

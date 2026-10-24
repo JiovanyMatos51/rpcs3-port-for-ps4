@@ -72,6 +72,7 @@
 #ifdef RPCS3_PS4
 #include "util/asm.hpp"
 #include "util/ps4_host_wait.hpp" // 0.37: lv2-aware host waits of HLE code (lv2_host_lock, lv2_host_wait)
+#include "util/ps4_safe_mode.hpp" // 0.40: row precise_sleep_hr30
 #endif
 
 #if defined(ARCH_X64)
@@ -2571,28 +2572,25 @@ namespace
 	}
 
 	// 0.39: the shortest remainder of a precise sleep that waits on the HR timer (when it is on); shorter remainders
-	// yield. 0.38 started at 40 us, which left the most common 30-39 us guest usleeps (GTA IV: ~32k/s, up to 1.4 cores
-	// of yield loop) spinning. precise-sleep-spin.flag restores 40 us. Read once.
+	// yield. 0.38 starts at 40 us; 30 us also takes the most common 30-39 us guest usleeps (GTA IV: ~32k/s, up to 1.4
+	// cores of yield loop) off the yield loop. 0.40: row precise_sleep_hr30 (opt-in: precise-sleep-hr30.flag or
+	// features.txt; precise-sleep-spin.flag forces 40 us), read per call so a per-game safe-mode level switches it.
+	// Off: 40 us, as in 0.38 (the 'features:' line names the row). On: logged once per process.
 	u64 ps4_precise_hr_min_us() noexcept
 	{
-		static const u64 s_min = []() noexcept -> u64
+		if (!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::precise_sleep_hr30))
 		{
-			bool v038 = false;
+			return 40;
+		}
 
-			try
-			{
-				v038 = fs::is_file("/data/rpcs3/precise-sleep-spin.flag");
-			}
-			catch (...)
-			{
-			}
+		static atomic_t<bool> s_logged{false};
 
-			ps4_startup_checkpoint(v038 ? "guest sleeps: precise usleeps wait on the HR timer from 40 us remaining (precise-sleep-spin.flag)"
-			                            : "guest sleeps: precise usleeps wait on the HR timer from 30 us remaining when it is on (precise-sleep-spin.flag: 40 us)");
-			return v038 ? 40 : 30;
-		}();
+		if (!s_logged.load() && !s_logged.exchange(true))
+		{
+			ps4_startup_checkpoint("guest sleeps: precise usleeps wait on the HR timer from 30 us remaining when it is on (precise_sleep_hr30)");
+		}
 
-		return s_min;
+		return 30;
 	}
 
 	// Why guest usleeps <= ps4_precise_sleep_max_us run the yield loop or not, for the 60 s line.
@@ -2898,7 +2896,7 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
 			{
 				// On by default (no-hr-wait.flag disables): sleep on the HR timer, which ends ~30 us late, instead of
 				// spinning. The wait is bounded by the guest's own <= 100 us request, and the loop top checks state again
-				// after it. 0.39: from 30 us remaining (ps4_precise_hr_min_us).
+				// after it. From 40 us remaining, or 30 us with the row precise_sleep_hr30 (ps4_precise_hr_min_us).
 				const u64 hr_start = get_system_time();
 				ps4_hr_wait(remaining - 20);
 				ps4_hr_us += get_system_time() - hr_start;

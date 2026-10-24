@@ -11,6 +11,7 @@
 #include "ps4_fatal.h"
 #include "util/ps4_adapt.hpp"
 #include "util/ps4_gpu_health.hpp"
+#include "util/ps4_safe_mode.hpp"
 #endif
 
 namespace vk
@@ -30,6 +31,14 @@ namespace vk
 		// instead of waiting forever. The adapt key is only reported by the next boot of this game.
 		ps4_fatal_note("GPU: device lost (VK_ERROR_DEVICE_LOST) in ", where ? where : "?");
 		utils::ps4::adapt::note(utils::ps4::adapt::key_gpu_hang);
+		utils::ps4::safe_mode::note_failure(utils::ps4::safe_mode::fail_kind::gpu);
+
+		// The driver's command submission refuses an oversized flattened buffer and the device is then lost: the next
+		// boots of this game split their command buffers (cb_split_after_loss; kill: cb-split-off.flag).
+		if (utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::cb_split_after_loss))
+		{
+			utils::ps4::adapt::note(utils::ps4::adapt::key_cb_split);
+		}
 
 		// 0.32: if a readback was traced, name the step the GPU finished last.
 		ps4_dma_trace_report("device lost");

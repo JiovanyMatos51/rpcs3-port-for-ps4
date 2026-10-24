@@ -121,6 +121,8 @@ I18N(OVL_HOME_MENU_SETTINGS_ADVANCED, "Avançado", "Advanced", "Avanzado", "مت
 I18N(OVL_HOME_MENU_SETTINGS_OVERLAYS, "Sobreposições", "Overlays", "Superposiciones", "الطبقات")
 I18N(OVL_HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY, "Painel de desempenho", "Performance Overlay", "Panel de rendimiento", "لوحة الأداء")
 I18N(OVL_HOME_MENU_SETTINGS_DEBUG, "Depuração", "Debug", "Depuración", "التصحيح")
+// Suffix of the Enable Buffering row (overlay_home_menu_settings.cpp): what turning it off costs on the PS4
+I18N(OVL_SEM_BUFFER_SUFIXO, "(sem buffer: o som pode pular)", "(no buffering: the sound may skip)", "(sin búfer: el sonido puede saltar)", "(دون تخزين مؤقت: قد يتقطع الصوت)")
 I18N(OVL_HOME_MENU_SCREENSHOT, "Capturar a tela", "Take Screenshot", "Capturar pantalla", "التقاط صورة للشاشة")
 I18N(OVL_HOME_MENU_TROPHIES, "Troféus", "Trophies", "Trofeos", "الكؤوس")
 I18N(OVL_HOME_MENU_TROPHY_LIST_TITLE, "Progresso dos troféus: {0}", "Trophy Progress: {0}", "Progreso de trofeos: {0}", "تقدم الكؤوس: {0}")

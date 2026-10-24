@@ -119,6 +119,11 @@ namespace rsx
 			{
 				const u32 put = read_put();
 
+#ifdef RPCS3_PS4
+				// Dead FIFO reports: the PUT values the puller saw
+				ps4_note_put(put, addr);
+#endif
+
 				if (put == addr)
 				{
 					return {false, FIFO_EMPTY};
@@ -764,6 +769,12 @@ namespace rsx
 					const std::string line = "RSX: FIFO error: " + ps4_fifo_state_text();
 					rsx_log.error("PS4 %s", line);
 					ps4_startup_checkpoint(line.c_str());
+
+					// The first one also dumps the PUT values seen and the command words around GET
+					if (m_ps4_fifo_errors == 1)
+					{
+						ps4_dump_fifo_desync("first FIFO desync", fifo_ctrl->get_pos());
+					}
 				}
 #endif
 				recover_fifo();

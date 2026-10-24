@@ -437,7 +437,13 @@ void main()
 
 	d3.end = false;
 
+#ifdef PS4_INTERP_STEP_LIMIT
+	// The PS4 GPU has no reset: a branch loop without an exit ends after this many steps instead of hanging it
+	uint ps4_steps = 0u;
+	while (current_instruction >= 0 && current_instruction < 544 && ps4_steps++ < PS4_INTERP_STEP_LIMIT) // NOTE: CEX can hold upto 544 instructions
+#else
 	while (current_instruction >= 0 && current_instruction < 544) // NOTE: CEX can hold upto 544 instructions
+#endif
 	{
 		if (d3.end)
 		{

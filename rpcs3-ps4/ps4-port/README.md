@@ -6,7 +6,7 @@ RPCS3, compilado para o PS4 com o toolchain OpenOrbis; o port acrescenta o
 frontend do console, os adaptadores nativos (memória, vídeo, áudio, controles,
 rede, USB) e um launcher no estilo XMB.
 
-Versão atual: **0.39** (TITLE_ID `RPCS30010`).
+Versão atual: **0.40** (TITLE_ID `RPCS30010`).
 
 Projeto não oficial, sem vínculo com a Sony nem com a equipe do RPCS3.
 O pacote não inclui jogos, firmware, chaves ou licenças: use apenas cópias
@@ -53,6 +53,50 @@ dos seus próprios jogos.
   guarda só o que você mudou.
 - Diagnóstico: registros das últimas sessões (`startup.log`, `RPCS3.log`,
   `mesa.log`) e relatório de erro fatal na tela.
+
+## Novidades da 0.40
+
+- **Regra nova**: o que a 0.39 mudou para todos os jogos sem prova nos logs
+  voltou ao jeito da 0.38 (cache de shaders do Mesa, "Áudio contínuo"
+  automático e reserva de 64 ms, novas tentativas de criar threads, regras
+  de memória e de compilação, idioma dos jogos e outras). Cada uma liga de
+  novo com um arquivo em `/data/rpcs3` ou pelo `features.txt`, para testar.
+  Continuam ligadas as correções provadas (como a do crash do intérprete de
+  shaders) e as proteções que só agem quando algo dá errado.
+- **Modo seguro**: um jogo que falha abre da próxima vez no modo seguro (3
+  níveis, com aviso na tela). Também dá para escolher por jogo (Quadrado >
+  "Modo seguro deste jogo") ou ligar para todos os jogos em Configurações do
+  RPCS3 > PS4 > "Modo seguro".
+- **Threads**: as últimas 8 vagas de thread do PS4 ficam para o jogo; as
+  threads de serviço que não faziam nada não são mais criadas; a pausa e o
+  savestate não derrubam mais o emulador quando falta thread; o som não
+  deve mais sumir depois de uma pausa perto do limite.
+- **Online e idioma**: Modo online sem conta RPCN abre o jogo offline; o
+  "Automático" do "Idioma dos jogos" voltou a ser Inglês (EUA), e o idioma
+  do PS4 virou uma opção da linha.
+- **Gráficos**: o intérprete de shaders tem um limite de passos, a GPU
+  travada volta mesmo para a XMB e um desenho pulado nunca conta como
+  "escondido" (Sonic 06).
+- **Configurações**: cada opção roda como você escolheu; só um limite real
+  do PS4 ganha da sua escolha, com o cadeado e o motivo na página (ex.:
+  "Escala de resolução" até 200 %). O `startup.log` diz quais valores rodam
+  diferente dos seus arquivos e por quê.
+- **Discos e ISOs sem internet**: a chave pode vir de um arquivo feito do
+  seu próprio disco (`.dkey`, `.ird` ou lista de chaves) em
+  `/data/rpcs3/keys` ou na pasta `keys` do pendrive, e cada chave que abriu
+  um disco fica guardada no PS4. O pacote continua sem chaves. Para ler o
+  leitor, o PS4 ainda precisa estar em uma rede (o FTP do GoldHEN).
+- **XMB**: o fundo e a música do próprio jogo quando a seleção para nele
+  (só os arquivos do jogo; o pacote não traz imagem nem música), pastas na
+  coluna "Jogo" (Triângulo = Opções) e o segundo teclado seguido (RPCN,
+  cheats) abre.
+- **Ícone novo** do aplicativo.
+- O primeiro boot de cada jogo na 0.40 monta o cache SPU de novo: não
+  feche.
+
+Quase tudo isso ainda precisa ser testado no console: o roteiro está em
+"TESTE NO CONSOLE DA 0.40", no [`TESTAR_NO_PS4.txt`](TESTAR_NO_PS4.txt)
+(mande os logs de cada teste).
 
 ## Novidades da 0.39
 

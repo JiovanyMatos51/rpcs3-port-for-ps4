@@ -18,6 +18,12 @@
 #include <span>
 #include <shared_mutex>
 
+#ifdef RPCS3_PS4
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#endif
+
 LOG_CHANNEL(sys_fs);
 
 #ifdef RPCS3_PS4
@@ -105,13 +111,175 @@ void lv2_fs_ps4_release_stale_mount_locks() noexcept
 	release(g_mp_sys_no_device);
 }
 
+// The movie files the game holds open, for the RPCS3.log heartbeat (ps4_fs_movie_status, read from another thread).
+// Lock-free: an open takes a free slot with a compare-exchange on its fd; the name and the open time are written under
+// a sequence count (odd while written), and a reader retries when the count moved. A slot whose open time is 0 is empty.
+namespace
+{
+	struct ps4_movie_slot
+	{
+		std::atomic<u32> fd{0}; // 0 = free (lv2 fs ids are never 0)
+		std::atomic<u32> seq{0};
+		std::atomic<u64> opened_us{0};
+		std::atomic<u64> name[8]{}; // NUL-terminated file name, at most 63 bytes
+	};
+
+	ps4_movie_slot s_ps4_movie_slots[4];
+
+	u64 ps4_movie_now_us() noexcept
+	{
+		return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	}
+
+	void ps4_movie_track_open(u32 fd, std::string_view vpath) noexcept
+	{
+		const usz slash = vpath.find_last_of('/');
+		const std::string_view name = slash == umax ? vpath : vpath.substr(slash + 1);
+
+		for (ps4_movie_slot& slot : s_ps4_movie_slots)
+		{
+			u32 expected = 0;
+
+			if (!slot.fd.compare_exchange_strong(expected, fd, std::memory_order_acq_rel))
+			{
+				continue;
+			}
+
+			slot.seq.fetch_add(1, std::memory_order_acq_rel);
+
+			for (usz word = 0; word < std::size(slot.name); word++)
+			{
+				u64 value = 0;
+
+				for (usz byte = 0; byte < 8; byte++)
+				{
+					const usz at = word * 8 + byte;
+					const u64 c = at < name.size() && at < 63 ? static_cast<u8>(name[at]) : 0;
+					value |= c << (byte * 8);
+				}
+
+				slot.name[word].store(value, std::memory_order_relaxed);
+			}
+
+			slot.opened_us.store(std::max<u64>(ps4_movie_now_us(), 1), std::memory_order_relaxed);
+			slot.seq.fetch_add(1, std::memory_order_release);
+			return;
+		}
+
+		// More than four movie files open at once: the heartbeat names the ones it has
+	}
+
+	void ps4_movie_release(ps4_movie_slot& slot) noexcept
+	{
+		slot.seq.fetch_add(1, std::memory_order_acq_rel);
+		slot.opened_us.store(0, std::memory_order_relaxed);
+		slot.seq.fetch_add(1, std::memory_order_release);
+		slot.fd.store(0, std::memory_order_release);
+	}
+
+	void ps4_movie_track_close(u32 fd) noexcept
+	{
+		for (ps4_movie_slot& slot : s_ps4_movie_slots)
+		{
+			if (slot.fd.load(std::memory_order_acquire) == fd)
+			{
+				ps4_movie_release(slot);
+			}
+		}
+	}
+}
+
+// The movie file the game holds open now (the most recently opened one among those still open). false: none is open.
+// 'name' receives the file name without folders, NUL-terminated and cut to 'name_size' - 1 bytes (nothing is written
+// when 'name' is null or 'name_size' is 0); 'seconds' (may be null) the whole seconds since it was opened. Any thread,
+// lock-free, allocation-free.
+bool ps4_fs_movie_status(char* name, std::size_t name_size, unsigned* seconds) noexcept
+{
+	u64 best_opened = 0;
+	char best_name[64]{};
+
+	for (const ps4_movie_slot& slot : s_ps4_movie_slots)
+	{
+		for (int attempt = 0; attempt < 8; attempt++)
+		{
+			const u32 before = slot.seq.load(std::memory_order_acquire);
+
+			if (before & 1)
+			{
+				continue;
+			}
+
+			const u64 opened = slot.opened_us.load(std::memory_order_relaxed);
+			char text[64];
+
+			for (usz word = 0; word < std::size(slot.name); word++)
+			{
+				const u64 value = slot.name[word].load(std::memory_order_relaxed);
+
+				for (usz byte = 0; byte < 8; byte++)
+				{
+					text[word * 8 + byte] = static_cast<char>((value >> (byte * 8)) & 0xff);
+				}
+			}
+
+			text[63] = '\0';
+			std::atomic_thread_fence(std::memory_order_acquire);
+
+			if (slot.seq.load(std::memory_order_relaxed) != before)
+			{
+				continue;
+			}
+
+			if (opened && opened > best_opened)
+			{
+				best_opened = opened;
+				std::memcpy(best_name, text, sizeof(best_name));
+			}
+
+			break;
+		}
+	}
+
+	if (!best_opened)
+	{
+		return false;
+	}
+
+	if (name && name_size)
+	{
+		const usz length = std::min<usz>(std::strlen(best_name), name_size - 1);
+		std::memcpy(name, best_name, length);
+		name[length] = '\0';
+	}
+
+	if (seconds)
+	{
+		const u64 now = ps4_movie_now_us();
+		*seconds = static_cast<unsigned>(std::min<u64>(now > best_opened ? (now - best_opened) / 1000000 : 0, 0xffffffffu));
+	}
+
+	return true;
+}
+
 // 0.34: movies played by the game's own decoder (Bink, CRI, PAMF, AVI...) leave no VDEC line, so the RSX and AudioOut
 // lines of a movie could not be matched to it. One startup.log line per movie path and boot (at most 64), written
-// after a successful open. The g_fxo object lives for one boot.
+// after a successful open. The g_fxo object lives for one boot; when it goes, so do the open-movie slots of that boot
+// (the files of a boot are not closed one by one when it stops).
 struct ps4_movie_open_log
 {
 	shared_mutex mutex;
 	std::vector<std::string> seen;
+
+	~ps4_movie_open_log()
+	{
+		for (ps4_movie_slot& slot : s_ps4_movie_slots)
+		{
+			if (slot.fd.load(std::memory_order_acquire))
+			{
+				ps4_movie_release(slot);
+			}
+		}
+	}
 };
 
 static bool ps4_is_movie_path(std::string_view vpath)
@@ -1635,6 +1803,7 @@ error_code sys_fs_open(ppu_thread& ppu, vm::cptr<char> path, s32 flags, vm::ptr<
 		if (ps4_movie_size != umax)
 		{
 			ps4_note_movie_open(ppu, vpath, ps4_movie_size);
+			ps4_movie_track_open(id, vpath);
 		}
 #endif
 
@@ -1895,6 +2064,11 @@ error_code sys_fs_close(ppu_thread& ppu, u32 fd)
 		// Ensure Host file handle won't be kept open after this syscall
 		file->file.close();
 	}
+
+#ifdef RPCS3_PS4
+	// Before the id can be handed out again
+	ps4_movie_track_close(fd);
+#endif
 
 	ensure(idm::withdraw<lv2_fs_object, lv2_file>(fd, [&](lv2_file& _file) -> CellError
 	{

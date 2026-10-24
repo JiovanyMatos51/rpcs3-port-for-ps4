@@ -20,6 +20,7 @@
 #include "util/ps4_adapt.hpp"
 #include "util/ps4_gpu_health.hpp"
 #include "util/ps4_i18n.hpp"
+#include "util/ps4_safe_mode.hpp"
 #include "util/ps4_vram_policy.hpp"
 
 #include <atomic>
@@ -30,11 +31,14 @@
 namespace vk
 {
 #ifdef RPCS3_PS4
+	// VKGSRender.cpp: the GPU liveness scan from a long RSX-thread wait (no-op on other threads).
+	void ps4_gpu_liveness_in_wait() noexcept;
+
 	// 0.39: a confirmed GPU hang (util/ps4_gpu_health.hpp hang_confirmed, or a fence wait of 10 s) stops the game and
 	// returns to the XMB through the stop request of util/ps4_vram_policy.hpp, which the frontend serves as the VRAM
 	// stop (notice in the XMB). The adapt key gpu_hang is noted for the title's next boots. The first request of a game
 	// wins; a thread stuck in the hung wait keeps waiting, and the frontend opens the XMB after its stop timeout.
-	// No-op with /data/rpcs3/no-hang-stop.flag. Any thread.
+	// No-op while the hang_stop feature is off (no-hang-stop.flag, safe-mode level 2). Any thread.
 	void ps4_request_gpu_hang_stop(const char* why) noexcept
 	{
 		if (!utils::ps4::gpu::hang_stop())
@@ -43,6 +47,8 @@ namespace vk
 		}
 
 		utils::ps4::adapt::note(utils::ps4::adapt::key_gpu_hang);
+		// The title's next boot opens one safe-mode level higher (adapt fail=gpu)
+		utils::ps4::safe_mode::note_failure(utils::ps4::safe_mode::fail_kind::gpu);
 
 		if (!utils::ps4::vram::request_stop(utils::ps4::vram::stop_cause::gpu_hang, why))
 		{
@@ -156,8 +162,10 @@ namespace vk
 		// 0.32: if a readback was traced, name the step the GPU finished last.
 		ps4_dma_trace_report("fence watchdog");
 
-		// Recorded for the game; the boot policy only reports this key.
+		// Recorded for the game; the boot policy only reports this key. A fence that stays unsignalled for 10 s is a
+		// GPU failure for the safe mode as well (also with hang_stop off, where the stop below does not run).
 		utils::ps4::adapt::note(utils::ps4::adapt::key_gpu_hang);
+		utils::ps4::safe_mode::note_failure(utils::ps4::safe_mode::fail_kind::gpu);
 
 		const bool raised = utils::ps4::gpu::set_suspect_hang(true);
 
@@ -934,6 +942,7 @@ namespace vk
 		u64 start = 0;
 #ifdef RPCS3_PS4
 		u32 spins = 0;
+		u64 ps4_wait_start_us = 0;
 		// 0.29: STALL dump wait reason (no-op off the RSX thread).
 		const rsx::ps4_rsx_wait_scope ps4_wait(rsx::ps4_wait_vk_event);
 #endif
@@ -974,6 +983,21 @@ namespace vk
 			}
 
 #ifdef RPCS3_PS4
+			// A wait of a second or more runs the GPU liveness scan (RSX thread only, at most once a second), so a hung
+			// submission is confirmed while the RSX thread waits on it.
+			if ((spins & 255) == 0)
+			{
+				const u64 ps4_now = get_system_time();
+				if (!ps4_wait_start_us)
+				{
+					ps4_wait_start_us = ps4_now;
+				}
+				else if (ps4_now - ps4_wait_start_us >= 1'000'000)
+				{
+					ps4_gpu_liveness_in_wait();
+				}
+			}
+
 			// The timeout above is time-based, so backing off does not change it.
 			ps4_gpu_wait_backoff(spins++);
 #else

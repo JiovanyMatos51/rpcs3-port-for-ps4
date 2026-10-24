@@ -898,6 +898,29 @@ namespace gl
 			clear();
 		}
 
+#ifdef RPCS3_PS4
+		// A texture whose storage the driver could not allocate (glutils/image.cpp; Zink has no video memory budget):
+		// frees the invalidated sections not yet released and the unlocked ones, as a severe memory pressure does.
+		// Try-locked: nothing when this thread is inside the cache (the failed texture may be its own). RSX thread.
+		bool ps4_try_release_memory()
+		{
+			std::unique_lock lock(m_cache_mutex, std::defer_lock);
+			if (!lock.try_lock())
+			{
+				return false;
+			}
+
+			bool released = false;
+			if (m_storage.m_unreleased_texture_objects)
+			{
+				m_storage.purge_unreleased_sections();
+				released = true;
+			}
+
+			return m_storage.purge_unlocked_sections() || released;
+		}
+#endif
+
 		bool is_depth_texture(u32 rsx_address, u32 rsx_size) override
 		{
 			reader_lock lock(m_cache_mutex);

@@ -12,6 +12,7 @@
 
 #ifdef RPCS3_PS4
 #include "util/ps4_hle_memory.hpp"
+#include "util/ps4_memory_governor.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -32,6 +33,10 @@ static std::atomic<u64> s_ps4_atx_total_us{0};
 static std::atomic<u64> s_ps4_atx_max_us{0};
 static std::atomic<u64> s_ps4_atx_window_start_us{0};
 static std::atomic<s32> s_ps4_atx_decoders{0};
+
+// Refused decoder threads of this process: a game may reopen the decoder at once, so the line goes through
+// governor::media_log_due (the first 8, then one in 100)
+static std::atomic<u32> s_ps4_atx_thread_failures{0};
 
 static u64 ps4_atx_now_us()
 {
@@ -1008,7 +1013,10 @@ error_code _CellAdecCoreOpOpenExt_atracx(ppu_thread& ppu, vm::ptr<AtracXdecConte
 		// as the LPCM decoder does (cellAdec.cpp, _CellAdecCoreOpOpenExt_lpcm) instead of returning CELL_OK for a
 		// decoder that cannot run (a later close would join a thread id that does not exist). The six sync objects
 		// created above have no other user yet: destroy them so repeated failed opens do not use up lv2 IDs.
-		cellAtracXdec.error("_CellAdecCoreOpOpenExt_atracx(): sys_ppu_thread_create() failed (0x%x)", static_cast<u32>(static_cast<s32>(ret)));
+		if (u32 number = 0; utils::ps4::governor::media_log_due(s_ps4_atx_thread_failures, number))
+		{
+			cellAtracXdec.error("_CellAdecCoreOpOpenExt_atracx(): sys_ppu_thread_create() failed (0x%x, failure %u of this process; the first 8, then one in 100 are logged)", static_cast<u32>(static_cast<s32>(ret)), number);
+		}
 		lv2_syscall<sys_cond_destroy>(ppu, handle->queue_not_empty);
 		lv2_syscall<sys_cond_destroy>(ppu, handle->run_thread_cond);
 		lv2_syscall<sys_cond_destroy>(ppu, handle->output_consumed);

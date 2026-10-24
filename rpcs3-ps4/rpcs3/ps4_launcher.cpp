@@ -3,6 +3,7 @@
 #include "ps4_fatal.h"
 #include "ps4_pads.h"
 #include "ps4_ime.h"
+#include "ps4_xmb_media.h"
 #include "Emu/NP/ps4_rpcn_service.h"
 #include "util/ps4_build_version.hpp"
 #include "Utilities/File.h"
@@ -13,6 +14,7 @@
 #include "util/ps4_settings.hpp"
 #include "util/ps4_cpu_probe.hpp"
 #include "util/ps4_memory_governor.hpp"
+#include "util/ps4_safe_mode.hpp"
 #include "util/ps4_patches.hpp"
 #include "util/ps4_cheats.hpp"
 #include "util/ps4_health.hpp"
@@ -22,6 +24,8 @@
 #include "util/ps4_disc_install.hpp"
 #include "util/ps4_disc_lock.hpp"
 #include "util/ps4_padlock_icon.hpp"
+#include "util/ps4_folder_icon.hpp"
+#include "util/ps4_xmb_folders.hpp"
 #include "util/ps4_pkg_check.hpp"
 #include "util/ps4_fs_repair.hpp"
 #include "util/ps4_i18n.hpp"
@@ -64,6 +68,10 @@
 #include <sys/stat.h>
 
 LOG_CHANNEL(ps4_launcher_log, "PS4 Launcher");
+
+// Loader/ISO.cpp: why the image at 'path' was refused by the header-less probe of its last iso_archive in this process
+// (none: it was read, never looked at, or refused for another reason). Any thread.
+utils::ps4::disc_probe::iso_refusal iso_ps4_refusal(std::string_view path);
 
 // 0.39: every text of the launcher comes from util/ps4_i18n_launcher.inc (and the shared tables) in the interface language
 namespace i18n = utils::ps4::i18n;
@@ -1195,6 +1203,23 @@ void add_padlock(std::map<std::string, xmb_image, std::less<>>& resources)
                                         : "disc lock: padlock icon: firmware image missing; the drawn padlock is used");
 }
 
+// 0.40: the folder of the 'Jogo' column's folders: the firmware's own (item_tex_plain_folder of explore_plugin_full.rco),
+// else an original one drawn once per process (util/ps4_folder_icon.hpp). Added after the firmware cache is written, so
+// a later firmware install brings the real one; the utility rows that use the same image get the drawn folder too.
+void add_folder_icon(std::map<std::string, xmb_image, std::less<>>& resources)
+{
+    const bool firmware = resources.contains("item_tex_plain_folder");
+    if (!firmware)
+    {
+        static const xmb_image drawn = utils::ps4::xmb::folder_icon();
+        if (drawn) resources.emplace("item_tex_plain_folder", drawn);
+    }
+    static int logged = -1;
+    if (std::exchange(logged, firmware ? 1 : 0) != (firmware ? 1 : 0))
+        ps4_startup_checkpoint(firmware ? "XMB folders: folder icon: item_tex_plain_folder from the firmware (explore_plugin_full.rco)"
+                                        : "XMB folders: folder icon: firmware image missing; the drawn folder is used");
+}
+
 // 0.38: the system dialog images (util/ps4_xmb_dialog.hpp: system_plugin.rco) the firmware lacks are drawn once per
 // process, also after the cache is written, so a later firmware install brings the real ones.
 void add_dialog_images(std::map<std::string, xmb_image, std::less<>>& resources)
@@ -1243,6 +1268,7 @@ std::map<std::string, xmb_image, std::less<>> load_xmb_resources(load_context& c
         from_cache = true;
         ps4_startup_checkpoint(fmt::format("XMB: %u firmware images loaded (cache)", resources.size()).c_str());
         add_padlock(resources);
+        add_folder_icon(resources);
         add_dialog_images(resources);
         return resources;
     }
@@ -1258,6 +1284,7 @@ std::map<std::string, xmb_image, std::less<>> load_xmb_resources(load_context& c
     if (!resources.empty() && context.cache_ready()) xmb_cache::write_rco(key, resources);
     ps4_startup_checkpoint(fmt::format("XMB: %u firmware images loaded", resources.size()).c_str());
     add_padlock(resources);
+    add_folder_icon(resources);
     add_dialog_images(resources);
     return resources;
 }
@@ -1494,6 +1521,13 @@ bool iso_sfb_missing(iso_archive& archive, std::string_view category)
     return utils::ps4::disc_image::iso_disc_sfb_missing(category, exists, first) && (!exists || archive.get_key_status() == iso_key_status::OK);
 }
 
+// 0.40: what an image without a PS3 disc header and without PS3_GAME/PARAM.SFO holds instead, as the XMB says it (a PSN
+// game folder, a PS2 or a PSP disc); null for any other image, whose texts stay. Read right after an iso_archive of
+// 'path' came back invalid: building it records the outcome.
+const char* iso_refusal_text(const std::string& path)
+{
+    return utils::ps4::disc_probe::refusal_text(iso_ps4_refusal(path));
+}
 
 // 'iso_icon' (ISO only): the thumbnail is decoded from the same parse of the ISO directory tree; 'icon_known' says
 // whether it may be cached. 'complete' is false when the metadata could not be read (unreadable image or PARAM.SFO,
@@ -1523,6 +1557,7 @@ game_info describe_game(const std::string& path, utils::ps4::game_kind kind, boo
     }
     psf::registry metadata;
     bool no_sfb = false;
+    const char* refused = nullptr;
     utils::ps4::disc_image::completeness iso_size;
     if (kind == utils::ps4::game_kind::iso)
     {
@@ -1538,6 +1573,7 @@ game_info describe_game(const std::string& path, utils::ps4::game_kind kind, boo
             }
             no_sfb = iso_sfb_missing(archive, psf::get_string(metadata, "CATEGORY", ""));
         }
+        else refused = iso_refusal_text(path);
         iso_size = iso_completeness(path);
     }
     else metadata = psf::load_object(metadata_base(path) + "PARAM.SFO");
@@ -1563,6 +1599,8 @@ game_info describe_game(const std::string& path, utils::ps4::game_kind kind, boo
         info.serial = serial;
     }
     if (no_sfb) info.subtitle += std::string(" · ") + i18n::tr(str::LAU_ISO_SEM_SFB_NAO_INICIA);
+    // an incomplete file keeps its own text: a cut copy can lose the folders the probe looks for
+    if (refused && !iso_size.short_file()) info.subtitle += std::string(" · ") + refused;
     for (std::string* field : {&info.title, &info.subtitle, &info.category, &info.app_ver, &info.serial}) one_line(*field);
     return info;
 }
@@ -1772,7 +1810,8 @@ struct disc_key_import
 };
 std::shared_ptr<disc_key_import> start_disc_key_import()
 {
-    if (utils::ps4::governor::thread_pressure() >= 2) return nullptr;
+    // The last slots of the console's thread cap stay free for the game (optional_thread_allowed logs the refusal)
+    if (utils::ps4::governor::thread_pressure() >= 2 || !utils::ps4::governor::optional_thread_allowed("PS4 disc key import", 1)) return nullptr;
     auto job = std::make_shared<disc_key_import>();
     if (!utils::ps4::disc_probe::run_detached([job]
         {
@@ -2045,20 +2084,26 @@ std::vector<xmb_entry> xmb_savedata(load_context& context)
 // usb_poll compares the USB mounts with the last library scan, cache_clear removes one game's cache and
 // config_db_import copies the PC config database. cheat_list reads one game's cheat files, cheat_import validates and
 // copies cheat files from USB and /data/rpcs3/import/cheats.
+// 0.40: media reads, decodes and prepares the selected game's own PIC1/PIC0/PIC2 and SND0 (ps4_xmb_media); media_trim
+// keeps the media cache within its size, once per process.
 enum class load_kind : u8 { none, resources, licenses, library, icon, savedata, patch_list, patch_import, usb_poll, cache_clear, config_db_import,
-    cheat_list, cheat_import };
+    cheat_list, cheat_import, media, media_trim };
 
 // 0.33: hot-plug check, every 2 s while the XMB is shown: the drives that differ from what the last library scan read
 // ("usb1 added, usb0 removed"). Empty when nothing changed, and before the first scan of this XMB (it reads them all).
-std::string usb_changes(const load_context& context)
+// 0.40: 'arrived' is set when a drive came or was replaced (it may hold the player's disc key files).
+std::string usb_changes(const load_context& context, bool& arrived)
 {
+    arrived = false;
     if (!context.usb_known) return {};
     const usb_keys keys = probe_usb_drives();
     std::vector<std::string> changed;
     for (unsigned i = 0; i < keys.size(); ++i)
     {
         const std::string& before = context.usb[i].key;
-        if (keys[i] != before) changed.push_back(fmt::format("usb%u %s", i, before.empty() ? "added" : keys[i].empty() ? "removed" : "replaced"));
+        if (keys[i] == before) continue;
+        changed.push_back(fmt::format("usb%u %s", i, before.empty() ? "added" : keys[i].empty() ? "removed" : "replaced"));
+        if (!keys[i].empty()) arrived = true;
     }
     return fmt::merge(changed, ", ");
 }
@@ -2116,6 +2161,7 @@ struct load_job
     std::string path;
     std::string serial, title; // patch_list, cache_clear, cheat_list; cheat_import: the game ("" = every game)
     std::vector<std::pair<std::string, std::string>> library; // cheat_import: {title, serial} of the library's games
+    std::optional<ps4_xmb_media::media_request> media;         // media: what the media director asked for
 };
 
 struct load_result
@@ -2135,8 +2181,10 @@ struct load_result
     std::string changes, completed;
     std::vector<xmb_entry> storage; // library: 'Armazenamento' column
     std::shared_ptr<const utils::ps4::disc_lock::registry> locks; // library: the disc lock records the rows were bound with
+    std::shared_ptr<ps4_xmb_media::media_payload> media;          // media: null when the selection moved on while it ran
     u32 imported = 0, cached = 0, read = 0;
     bool from_cache = false, partial = false;
+    bool usb_arrived = false; // 0.40 usb_poll: a drive came or was replaced
     u64 cost_us = 0;
 };
 
@@ -2147,6 +2195,7 @@ struct load_queue
     std::deque<load_result> done;
     bool inline_mode = false;
     load_context context;
+    ps4_xmb_media::job_context media_context; // the media jobs of this XMB visit (loader thread)
 
     load_result run(const load_job& job)
     {
@@ -2210,7 +2259,7 @@ struct load_queue
             break;
         }
         case load_kind::usb_poll:
-            result.text = usb_changes(context);
+            result.text = usb_changes(context, result.usb_arrived);
             result.changes = library_changes(context, result.completed);
             break;
         case load_kind::cache_clear:
@@ -2218,6 +2267,12 @@ struct load_queue
             break;
         case load_kind::config_db_import:
             result.text = config_db::import();
+            break;
+        case load_kind::media:
+            if (job.media) result.media = ps4_xmb_media::media_job(*job.media, media_context);
+            break;
+        case load_kind::media_trim:
+            ps4_xmb_media::media_trim(media_context);
             break;
         default:
             break;
@@ -2255,6 +2310,25 @@ struct load_queue
     {
         std::lock_guard lock(mutex);
         std::erase_if(jobs, [](const load_job& job) { return job.kind == load_kind::library; });
+    }
+    // 0.40: removes the media jobs that did not start yet (the selection moved on, or the XMB closes)
+    void drop_media()
+    {
+        std::lock_guard lock(mutex);
+        std::erase_if(jobs, [](const load_job& job) { return job.kind == load_kind::media; });
+    }
+    // 0.40: the media results nobody took (the release before a boot frees them), the other results stay
+    std::vector<std::shared_ptr<ps4_xmb_media::media_payload>> take_media()
+    {
+        std::vector<std::shared_ptr<ps4_xmb_media::media_payload>> out;
+        std::lock_guard lock(mutex);
+        std::erase_if(done, [&](load_result& result)
+        {
+            if (result.kind != load_kind::media) return false;
+            out.push_back(std::move(result.media));
+            return true;
+        });
+        return out;
     }
     bool pop(load_job& job)
     {
@@ -2318,11 +2392,22 @@ struct loader_stats
     u64 patch_us = 0, patch_max_us = 0;
     u32 usb_polls = 0;
     u64 usb_poll_us = 0, usb_poll_max_us = 0;
+    // 0.40: media jobs that produced a payload, those served from the media cache, prepared SND0 tracks
+    u32 media = 0, media_hits = 0, music_prepared = 0;
+    u64 media_us = 0, media_max_us = 0;
 
     void add(const load_result& r)
     {
         switch (r.kind)
         {
+        case load_kind::media:
+            if (!r.media) break;
+            ++media;
+            media_hits += r.media->from_cache ? 1 : 0;
+            music_prepared += r.media->has_music() ? 1 : 0;
+            media_us += r.media->cost_us;
+            media_max_us = std::max(media_max_us, r.media->cost_us);
+            break;
         case load_kind::usb_poll: ++usb_polls; usb_poll_us += r.cost_us; usb_poll_max_us = std::max(usb_poll_max_us, r.cost_us); break;
         case load_kind::patch_list:
         case load_kind::patch_import: ++patch_runs; patch_us += r.cost_us; patch_max_us = std::max(patch_max_us, r.cost_us); break;
@@ -2344,12 +2429,14 @@ struct loader_stats
     {
         return fmt::format("XMB loader (%s): resources %u images in %.1f ms%s; licenses %.1f ms (%u imported); library %u run(s) "
             "%.1f ms, %u rows (%u cached, %u read); icons %u (%u from cache) avg %.1f max %.1f ms; savedata %u run(s) %.1f ms; "
-            "patches %u run(s) %.1f ms (max %.1f); usb polls %u avg %.2f max %.1f ms; join %.1f ms",
+            "patches %u run(s) %.1f ms (max %.1f); usb polls %u avg %.2f max %.1f ms; join %.1f ms; media %u (%u from cache) avg %.1f max %.1f ms, "
+            "music prepared %u",
             inline_mode ? "UI thread" : "thread", resources, double(resources_us) / 1000, resources_cache ? " from cache" : "",
             double(licenses_us) / 1000, imported, library_runs, double(library_us) / 1000, library_rows, library_cached, library_read,
             icons, icon_hits, icons ? double(icon_us) / 1000 / icons : 0., double(icon_max_us) / 1000, savedata_runs,
             double(savedata_us) / 1000, patch_runs, double(patch_us) / 1000, double(patch_max_us) / 1000,
-            usb_polls, usb_polls ? double(usb_poll_us) / 1000 / usb_polls : 0., double(usb_poll_max_us) / 1000, double(join_us) / 1000);
+            usb_polls, usb_polls ? double(usb_poll_us) / 1000 / usb_polls : 0., double(usb_poll_max_us) / 1000, double(join_us) / 1000,
+            media, media_hits, media ? double(media_us) / 1000 / media : 0., double(media_max_us) / 1000, music_prepared);
     }
 };
 
@@ -2777,10 +2864,13 @@ struct memory
     std::string key_id;                // disc of the last finished key search
     bool key_ok = false;               // a verified key is in place, or none is needed
     std::string key_text;              // its result line (interface language)
+    dk::outcome key_what = dk::outcome::disc_unreadable; // its outcome (the offline question variants)
+    std::uint32_t key_tested = 0;      // files of this console and of USB it tested
     u64 rate = 0;                      // copy rate measured by the last install
     std::shared_ptr<di::job> reported; // finished install whose result was shown
-    // Padlock state last logged per TITLE_ID of a game installed from a disc (disc_lock)
-    std::map<std::string, utils::ps4::disc_lock::match, std::less<>> lock_logged;
+    // Padlock state last logged per TITLE_ID of a game installed from a disc (disc_lock): the drive's answer and the
+    // offline grace verdict
+    std::map<std::string, std::pair<utils::ps4::disc_lock::match, utils::ps4::disc_lock::offline_verdict>, std::less<>> lock_logged;
 };
 
 memory& remembered()
@@ -2807,6 +2897,16 @@ key_state key_of(const ds::disc_status& disc)
     const memory& m = remembered();
     if (!m.key_id.empty() && m.key_id == disc_id(disc)) return m.key_ok ? key_state::ready : key_state::failed;
     return disc.key_present ? key_state::ready : key_state::unknown;
+}
+
+// The key search of 'disc' failed for want of a network or for a wrong console clock while the offline search (the
+// player's own key files, lists and IRDs) was on: the install question says so and offers Triangle "Procurar de novo"
+bool offline_failure(const ds::disc_status& disc)
+{
+    if (key_of(disc) != key_state::failed) return false;
+    const memory& m = remembered();
+    return (m.key_what == dk::outcome::no_internet || m.key_what == dk::outcome::clock_wrong) &&
+        utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::disc_keys_offline);
 }
 
 // "FIFA 14 (BLES01876)"
@@ -2927,10 +3027,24 @@ xmb_dialog question_dialog(const ds::disc_status& disc, const question& q, key_s
     const u64 left = disc.size - copied;
     const u64 need = left + (1ull << 30); // what the install asks for (the disc install's free margin)
     const bool waiting = q.want && key == key_state::searching;
+    // 0.40: no network, or a console clock no server certificate is valid at: what is missing and the three ways on
+    // (the internet once, the player's own key file on USB with Triangle, the install without the key)
+    const bool offline = offline_failure(disc);
+    const memory& known = remembered();
     xmb_dialog d;
     d.icon = icon;
     d.title = shorten(disc_name(disc), 70);
     d.lines.emplace_back(i18n::tr(resume ? str::LAU_DISC_Q_CONTINUAR : q.again ? str::LAU_DISC_Q_DE_NOVO : str::LAU_DISC_Q_INSTALAR));
+    if (offline && known.key_what == dk::outcome::clock_wrong)
+    {
+        d.lines.emplace_back(i18n::tr(str::LAU_DISC_Q_CHAVE_NAO_ENCONTRADA));
+        d.lines.emplace_back(i18n::tr(str::DKEY_RELOGIO_ERRADO));
+    }
+    else if (offline)
+    {
+        d.lines.emplace_back(i18n::tr(str::DOFF_Q_SEM_INTERNET));
+        if (known.key_tested) d.lines.push_back(i18n::trf(str::DOFF_Q_TESTADOS, {known.key_tested}));
+    }
     d.notes.push_back(resume ? i18n::trf(str::LAU_DISC_Q_FALTAM, {di::size_text(left), di::size_text(disc.size), minutes_for(left, rate)})
                              : i18n::trf(str::LAU_DISC_Q_TAMANHO, {di::size_text(disc.size), minutes_for(left, rate)}));
     d.notes.emplace_back(i18n::tr(str::LAU_DISC_Q_DESTINO));
@@ -2945,6 +3059,13 @@ xmb_dialog question_dialog(const ds::disc_status& disc, const question& q, key_s
     case key_state::searching: d.notes.emplace_back(i18n::tr(str::LAU_DISC_Q_CHAVE_PROCURANDO)); break;
     case key_state::ready: d.notes.push_back(key_text.empty() ? std::string(i18n::tr(str::LAU_DISC_Q_CHAVE_PRONTA)) : key_text); break;
     case key_state::failed:
+        if (offline)
+        {
+            if (known.key_what == dk::outcome::no_internet) d.notes.emplace_back(i18n::tr(str::DOFF_Q_NOTA_INTERNET_UMA_VEZ));
+            d.notes.emplace_back(i18n::tr(str::DOFF_Q_NOTA_PENDRIVE));
+            d.notes.emplace_back(i18n::tr(str::DOFF_Q_NOTA_SEM_CHAVE));
+            break;
+        }
         d.notes.push_back(key_text.empty() ? std::string(i18n::tr(str::LAU_DISC_Q_CHAVE_NAO_ENCONTRADA)) : key_text);
         d.notes.emplace_back(i18n::tr(str::LAU_DISC_Q_SEM_CHAVE_NOTA));
         break;
@@ -2957,9 +3078,20 @@ xmb_dialog question_dialog(const ds::disc_status& disc, const question& q, key_s
     }
     if (q.discard_asked) d.lines.push_back(i18n::trf(str::LAU_DISC_Q_APAGAR_COPIADOS, {di::size_text(copied)}));
     if (!waiting) d.buttons.push_back(xmb::cross_button(i18n::tr(key == key_state::failed ? str::LAU_DISC_Q_INSTALAR_SEM_CHAVE : resume ? str::COM_CONTINUAR : str::COM_INSTALAR)));
+    if (offline && !waiting) d.buttons.push_back(xmb::triangle_button(i18n::tr(str::DKEY_PROCURAR_DE_NOVO)));
     if (resume) d.buttons.push_back(xmb::square_button(i18n::tr(q.discard_asked ? str::COM_APAGAR : str::LAU_DISC_Q_APAGAR_COPIA)));
     d.buttons.push_back(xmb::circle_button(i18n::tr(str::COM_VOLTAR)));
     return d;
+}
+
+// 0.40: the XMB's game media around the modal dialogs of ask(), set by ps4_select_game: the game's music fades out when
+// a dialog opens (begin) and may start again after it (end); 'frame' keeps the background's fades going under it.
+enum class modal_event : u8 { begin, frame, end };
+
+std::function<void(modal_event)>& modal_hook()
+{
+    static std::function<void(modal_event)> hook;
+    return hook;
 }
 
 // A system dialog on the whole screen until 'step' answers. 'step' gets the buttons pressed since its last call (none
@@ -2968,6 +3100,14 @@ xmb_dialog question_dialog(const ds::disc_status& disc, const question& q, key_s
 answer ask(launcher_display& display, utils::ps4::xmb::scene& backdrop, u64 waves_since, launcher_input& input,
     const std::function<std::optional<answer>(u32 pressed, xmb_dialog& shown)>& step)
 {
+    // Every way out of the dialog ends the modal (also the shutdown)
+    struct modal_scope
+    {
+        modal_scope() { if (modal_hook()) modal_hook()(modal_event::begin); }
+        ~modal_scope() { if (modal_hook()) modal_hook()(modal_event::end); }
+        modal_scope(const modal_scope&) = delete;
+        modal_scope& operator=(const modal_scope&) = delete;
+    } const modal;
     const u64 start = sceKernelGetProcessTime();
     bool background = false;
     for (;;)
@@ -2986,6 +3126,7 @@ answer ask(launcher_display& display, utils::ps4::xmb::scene& backdrop, u64 wave
         if (now - start < 400'000) pressed = 0;
         xmb_dialog shown;
         if (const std::optional<answer> done = step(pressed, shown)) return *done;
+        if (modal_hook()) modal_hook()(modal_event::frame);
         draw_dialog_frame(display, backdrop, shown, double(now - waves_since) / 1'000'000, now - start);
         display.present();
         sceKernelUsleep(dialog_frame_us);
@@ -3252,7 +3393,12 @@ void ps4_repair_data_permissions()
 void ps4_prepare_game_directories()
 {
     // 0.37: data/disc-lock holds the lock records of games installed from a PS3 disc (disc_lock)
-    static constexpr const char* folders[] = {"games", "pkgs", "raps", "import", "patches", "custom_configs", "data", "data/redump", "data/disc-lock", "exdata"};
+    // 0.40: keys is the player's inbox of disc key files, IRDs and key lists (read only by the key search)
+    static constexpr const char* folders[] = {"games", "pkgs", "raps", "import", "patches", "custom_configs", "data", "data/redump", "data/disc-lock", "exdata",
+        "keys"};
+    // 0.40: the disc lines support needs (drive state changes, key search results, disc lock decisions) also go to
+    // RPCS3.log, the log testers send most; any thread, and the lines never hold a key
+    utils::ps4::disc_stream::log_mirror.store([](std::string_view line) { ps4_launcher_log.notice("%s", line); }, std::memory_order_release);
     std::vector<std::string> ready, problems;
     std::string first_closed;
     for (const char* name : folders)
@@ -4226,6 +4372,282 @@ public:
 // The dynamic settings as the in-game home menu (Options+Touchpad) opened them; its Salvar compares against this
 std::mutex s_home_menu_lock;
 std::string s_home_menu_snapshot;
+
+// 0.40: a settings change or save (the settings menu, the PSN switches, the home menu's Salvar) goes to startup.log
+// and to RPCS3.log: a tester often sends RPCS3.log alone, and it holds the boot that used those settings
+void record_settings_line(const std::string& line)
+{
+    ps4_startup_checkpoint(line.c_str());
+    ps4_launcher_log.notice("%s", line);
+}
+
+// 0.40: folders of the XMB 'Jogo' column (util/ps4_xmb_folders.hpp): their rows, the PS3 option list Triangle opens and
+// its questions, as ps4_select_game shows them. Texts and lists only: the model and its file belong to the store.
+namespace folder_ui
+{
+namespace xf = utils::ps4::xmb_folders;
+using popup = utils::ps4::xmb::page_popup;
+
+// What the option list of the selected row offers
+enum class action : std::uint8_t { refresh, open, add, rename, position, remove, forget, create, move, take_out };
+// The folder list or question over the column; while one is shown it takes every press
+enum class mode : std::uint8_t { none, options, move_to, checklist, position, ask_delete, ask_forget };
+// The keyboard of a folder name: one keyboard per action, never opened again by itself (a keyboard opened from the
+// close of another one is refused by the system)
+enum class form : std::uint8_t { none, create, create_and_move, rename };
+// The selected row as the option list sees it
+enum class row_kind : std::uint8_t { folder, game_top, game_inside, empty_folder, other };
+
+// A name or title the player chose, as a text argument: Arabic stays as it is (no left-to-right isolation)
+inline i18n::arg name_arg(std::string_view text)
+{
+    return utils::ps4::arabic::has_arabic(text) ? i18n::raw(text) : i18n::arg(text);
+}
+
+// A game title cut to 'bytes' (on a code point boundary), with "…" when it was longer: the sentence or the folder name
+// around it stays readable
+inline std::string cut_title(std::string_view title, std::size_t bytes)
+{
+    return title.size() <= bytes ? std::string(title) : xf::clip(title, bytes) + "\xE2\x80\xA6";
+}
+
+// A game title on the message line, next to a folder name and the sentence (the line holds 1160 px)
+inline std::string short_title(std::string_view title)
+{
+    return cut_title(title, 48);
+}
+
+// How many of the folder's games are in the library now, and how many are not; only "Pasta" before the library was
+// read (no scan and no cache yet: every game would count as missing)
+inline std::string folder_subtitle(std::size_t present, std::size_t missing, bool library_known)
+{
+    if (!library_known) return i18n::tr(str::FLD_PASTA);
+    std::string text = present == 0 ? std::string(i18n::tr(missing ? str::FLD_PASTA : str::FLD_PASTA_SUB_0))
+        : present == 1 ? std::string(i18n::tr(str::FLD_PASTA_SUB_1)) : i18n::trf(str::FLD_PASTA_SUB_N, {present});
+    if (missing) text += i18n::trf(str::FLD_AUSENTES_SUFIXO, {missing});
+    return text;
+}
+
+// A folder at the top level of the column; X opens it. No thumbnail job: its path starts with '@'.
+inline xmb_entry folder_entry(const xf::folder& f, std::size_t present, std::size_t missing, bool library_known)
+{
+    return {xf::folder_row_path(f.id), f.name, folder_subtitle(present, missing, library_known), "item_tex_plain_folder", {}};
+}
+
+// The only row of an open folder that has no game in the library now; X shows its help on the message line. Before
+// the library was read it is the 'Carregando' row (its games may well be there).
+inline xmb_entry empty_entry(std::uint32_t id, std::size_t missing, bool library_known)
+{
+    if (!library_known) return {xf::empty_row_path(id), i18n::tr(str::LAU_CARREGANDO_BIBLIOTECA), i18n::tr(str::LAU_LENDO_GAMES_USB), "item_tex_ps3game_folder", {}};
+    return {xf::empty_row_path(id), i18n::tr(missing ? str::FLD_AUSENTES_TITULO : str::FLD_VAZIA),
+        i18n::tr(missing ? str::FLD_AUSENTES_HELP : str::FLD_VAZIA_HELP), "item_tex_plain_folder", {}};
+}
+
+struct option_list
+{
+    popup list;
+    std::vector<action> actions; // per choice
+};
+
+// The option list of the selected row. Refreshing the library comes first: it was what Triangle did before, so
+// Triangle then X still does it. 'movable': there is another row to change places with; 'missing': games of the
+// folder that are not in the library now (only then it can forget them).
+inline option_list options_for(row_kind kind, std::string title, std::size_t missing, bool movable)
+{
+    option_list out;
+    out.list.title = std::move(title);
+    out.list.radio = false;
+    const auto add = [&](action what, std::string label)
+    {
+        out.list.choices.push_back({std::move(label), false, false});
+        out.actions.push_back(what);
+    };
+    add(action::refresh, i18n::tr(str::LAU_ATUALIZAR_BIBLIOTECA));
+    switch (kind)
+    {
+    case row_kind::folder:
+        add(action::open, i18n::tr(str::FLD_ABRIR));
+        add(action::add, i18n::tr(str::FLD_ADICIONAR));
+        add(action::rename, i18n::tr(str::FLD_RENOMEAR));
+        if (movable) add(action::position, i18n::tr(str::FLD_POSICAO));
+        add(action::remove, i18n::tr(str::FLD_APAGAR));
+        if (missing) add(action::forget, i18n::trf(str::FLD_ESQUECER, {missing}));
+        add(action::create, i18n::tr(str::FLD_CRIAR));
+        break;
+    case row_kind::game_top:
+        add(action::move, i18n::tr(str::FLD_MOVER));
+        add(action::create, i18n::tr(str::FLD_CRIAR));
+        break;
+    case row_kind::game_inside:
+        add(action::take_out, i18n::tr(str::FLD_TIRAR));
+        add(action::move, i18n::tr(str::FLD_MOVER));
+        if (movable) add(action::position, i18n::tr(str::FLD_POSICAO));
+        break;
+    case row_kind::empty_folder:
+        add(action::add, i18n::tr(str::FLD_ADICIONAR));
+        add(action::rename, i18n::tr(str::FLD_RENOMEAR));
+        add(action::remove, i18n::tr(str::FLD_APAGAR));
+        if (missing) add(action::forget, i18n::trf(str::FLD_ESQUECER, {missing}));
+        break;
+    case row_kind::other:
+        add(action::create, i18n::tr(str::FLD_CRIAR));
+        break;
+    }
+    return out;
+}
+
+struct target_list
+{
+    popup list;
+    std::vector<std::uint32_t> ids; // per choice: the folder, 0 for a new one
+};
+
+// 'Mover para uma pasta': every folder except the one the game is in, then 'Nova pasta...'
+inline target_list move_targets(const xf::model& m, std::string_view title, std::optional<std::uint32_t> current)
+{
+    target_list out;
+    // the heading holds 480 px at 18 px with its sentence
+    out.list.title = i18n::trf(str::FLD_MOVER_TITULO, {name_arg(cut_title(title, 28))});
+    out.list.radio = false;
+    for (const xf::folder& f : m.folders)
+    {
+        if (current && f.id == *current) continue;
+        out.list.choices.push_back({f.name, false, false});
+        out.ids.push_back(f.id);
+    }
+    out.list.choices.push_back({i18n::tr(str::FLD_NOVA_PASTA_ITEM), false, false});
+    out.ids.push_back(0);
+    return out;
+}
+
+struct check_list
+{
+    popup list;
+    std::vector<xf::row> rows; // per choice
+};
+
+// 'Adicionar jogos' of folder 'id': every game of the library in its order, checked when it is in this folder; a game
+// of another folder names that folder after its title (checking it moves the game here)
+inline check_list checklist(const xf::model& m, std::uint32_t id, std::span<const xmb_entry> library)
+{
+    check_list out;
+    const auto at = xf::find_folder(m, id);
+    out.list.title = i18n::trf(str::FLD_ADICIONAR_TITULO, {name_arg(at ? std::string_view(m.folders[*at].name) : std::string_view())});
+    out.list.radio = false;
+    out.list.checks = true;
+    for (const xmb_entry& entry : library)
+    {
+        xf::row r = xf::make_row(entry.path, entry.serial, entry.title);
+        if (!xf::can_be_member(r)) continue;
+        const auto in = xf::folder_of(m, xf::portable_path(entry.path));
+        const bool here = in && m.folders[*in].id == id;
+        // a label holds about 460 px at 21 px: a long title is cut so the folder's name shows after it
+        std::string label = in && !here ? cut_title(entry.title, 24) + " (" + m.folders[*in].name + ")" : entry.title;
+        out.list.choices.push_back({std::move(label), false, here});
+        out.rows.push_back(std::move(r));
+    }
+    return out;
+}
+
+// 'Apagar pasta': only the folder goes, its games go back to the game list
+inline xmb_dialog delete_dialog(const xf::folder& f, const xmb_image* icon)
+{
+    xmb_dialog d;
+    d.icon = icon;
+    d.title = f.name;
+    d.lines.push_back(i18n::trf(str::FLD_APAGAR_PERGUNTA, {name_arg(f.name)}));
+    d.notes.emplace_back(i18n::tr(str::FLD_APAGAR_NOTA));
+    d.buttons = {utils::ps4::xmb::cross_button(i18n::tr(str::COM_SIM)), utils::ps4::xmb::circle_button(i18n::tr(str::COM_NAO))};
+    return d;
+}
+
+// 'Esquecer jogos fora da biblioteca': the members 'gone' lists (portable paths), up to five of them by their last
+// known titles
+inline xmb_dialog forget_dialog(const xf::folder& f, const std::vector<std::string>& gone, const xmb_image* icon)
+{
+    xmb_dialog d;
+    d.icon = icon;
+    d.title = f.name;
+    d.lines.push_back(i18n::trf(str::FLD_ESQUECER_PERGUNTA, {gone.size()}));
+    std::string names;
+    for (std::size_t i = 0; i < gone.size() && i < 5; ++i)
+    {
+        std::string title;
+        for (const xf::member& x : f.members)
+            if (x.path == gone[i]) title = x.title;
+        if (title.empty()) title = gone[i].substr(gone[i].find_last_of('/') + 1);
+        names += (i ? ", " : "") + xf::clip(title, 32);
+    }
+    if (gone.size() > 5) names += " (+" + std::to_string(gone.size() - 5) + ")";
+    if (!names.empty()) d.notes.push_back(std::move(names));
+    d.notes.emplace_back(i18n::tr(str::FLD_ESQUECER_NOTA));
+    d.buttons = {utils::ps4::xmb::cross_button(i18n::tr(str::COM_SIM)), utils::ps4::xmb::circle_button(i18n::tr(str::COM_NAO))};
+    return d;
+}
+
+// The message line when the store refused a change; empty where no text names the reason (the log line does)
+inline std::string refusal_text(xf::refusal why)
+{
+    switch (why)
+    {
+    case xf::refusal::read_only: return i18n::tr(str::FLD_SO_LEITURA);
+    case xf::refusal::folder_limit: return i18n::trf(str::FLD_LIMITE, {xf::max_folders});
+    case xf::refusal::empty_name: return i18n::tr(str::FLD_NOME_VAZIO);
+    default: return {};
+    }
+}
+} // namespace folder_ui
+
+// 0.40: the folder files through the file system, for xmb_folders::store (which passes only xmb-folders.txt, its .bak
+// and xmb-folders.damaged.txt, all in /data/rpcs3). 'error' keeps the last failure for the log line.
+struct folder_files
+{
+    std::string error;
+
+    utils::ps4::xmb_folders::file_read read(std::string_view path, std::size_t limit)
+    {
+        namespace xf = utils::ps4::xmb_folders;
+        xf::file_read out;
+        const std::string name(path);
+        fs::stat_t info{};
+        if (!fs::get_stat(name, info))
+        {
+            out.status = fs::g_tls_error == fs::error::noent ? xf::read_status::absent : xf::read_status::unreadable;
+            if (out.status == xf::read_status::unreadable) error = fmt::format("%s", fs::g_tls_error);
+            return out;
+        }
+        out.at = {true, info.size, info.mtime};
+        std::vector<uint8_t> bytes;
+        if (info.is_directory || !read_whole(fs::file(name), limit, bytes))
+        {
+            out.status = xf::read_status::unreadable;
+            error = info.is_directory ? std::string("a folder") : fmt::format("%s", fs::g_tls_error);
+            return out;
+        }
+        out.text.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        out.status = xf::read_status::ok;
+        return out;
+    }
+    utils::ps4::xmb_folders::stamp stat(std::string_view path)
+    {
+        fs::stat_t info{};
+        if (!fs::get_stat(std::string(path), info)) return {};
+        return {true, info.size, info.mtime};
+    }
+    bool write(std::string_view path, std::string_view text)
+    {
+        fs::pending_file file(path);
+        if (file.file && (text.empty() || file.file.write(text.data(), text.size()) == text.size()) && file.commit()) return true;
+        error = fmt::format("%s", fs::g_tls_error);
+        return false;
+    }
+    bool rename(std::string_view from, std::string_view to)
+    {
+        if (fs::rename(std::string(from), std::string(to), true)) return true;
+        error = fmt::format("%s", fs::g_tls_error);
+        return false;
+    }
+};
 } // namespace
 
 // Input/pad_thread.cpp, pad thread: the home menu opens
@@ -4271,7 +4693,7 @@ void ps4_home_menu_save()
     };
     if (keys.empty())
     {
-        ps4_startup_checkpoint(fmt::format("home menu: Salvar for %s: no live setting changed since the menu opened; nothing written", who).c_str());
+        record_settings_line(fmt::format("home menu: Salvar for %s: no live setting changed since the menu opened; nothing written", who));
         finish();
         return;
     }
@@ -4319,12 +4741,12 @@ void ps4_home_menu_save()
     fs::pending_file output(path);
     if (!output.file || output.file.write(text.data(), text.size()) != text.size() || !output.commit())
     {
-        ps4_startup_checkpoint(fmt::format("home menu: could not save %u live setting(s) for %s to '%s' (%s): %s", keys.size(), who, path, fs::g_tls_error, listed).c_str());
+        record_settings_line(fmt::format("home menu: could not save %u live setting(s) for %s to '%s' (%s): %s", keys.size(), who, path, fs::g_tls_error, listed));
         ps4_notify((i18n::tr(str::COM_ERRO_GRAVAR) + path).c_str());
         return;
     }
-    ps4_startup_checkpoint(fmt::format("home menu: saved %u live setting(s) for %s (%s, %s): %s", keys.size(), who, path,
-        format2 ? fmt::format("settings format 2, %u pin(s)", pins.size()) : std::string("settings format 1, full dump"), listed).c_str());
+    record_settings_line(fmt::format("home menu: saved %u live setting(s) for %s (%s, %s): %s", keys.size(), who, path,
+        format2 ? fmt::format("settings format 2, %u pin(s)", pins.size()) : std::string("settings format 1, full dump"), listed));
     ps4_notify(i18n::trf(str::CFGU_HOME_SAVED, {game ? title : std::string(i18n::tr(str::SET_TODOS_JOGOS)), keys.size()}).c_str());
     finish();
 }
@@ -4376,7 +4798,17 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         return preferred;
     }
     const u64 started = sceKernelGetProcessTime();
+    // 0.40: NetCtl's state and the console clock at each XMB visit (startup.log and RPCS3.log): a console without an IP
+    // address does not see the drive, and a clock before this build's date breaks every certificate check
+    {
+        const std::string network = utils::ps4::disc_stream::sys::network_line_now();
+        ps4_startup_checkpoint(network.c_str());
+        utils::ps4::disc_stream::mirror(network);
+    }
     utils::ps4::xmb::scene menu;
+    // 0.40: the two switches of the selected game's own background and music (xmb-media-off.flag, xmb-music.txt),
+    // read at the XMB open and after a change of their rows
+    ps4_xmb_media::settings media_settings = ps4_xmb_media::read_settings();
     utils::ps4::settings_menu settings;
     settings_page_view page_view; // the browser tabs of the menu as PS3 settings pages
     bool settings_open = false;
@@ -4395,6 +4827,12 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             // 0.39: interface language (ui-language.txt); its title reads the same in every language
             {"@ui-language", i18n::tr(str::LANG_ROW_TITLE), i18n::trf(str::LANG_ROW_HELP, {i18n::raw(i18n::setting_label(i18n::current_setting()))}),
                 "tex_sysconf", {}},
+            // 0.40: the selected game's own background (PIC1) and music (SND0) in the XMB, as on the PS3; X changes them
+            {"@xmb-media", i18n::trf(str::LAU_XMED_ROW, {media_settings.media ? str::COM_LIGADO : str::COM_DESLIGADO}), i18n::tr(str::LAU_XMED_ROW_HELP),
+                "tex_sysconf", {}},
+            {"@xmb-music", i18n::trf(str::LAU_XMED_MUSICA_ROW, {media_settings.music == ps4_xmb_media::music_level::low ? str::LAU_XMED_BAIXA
+                    : media_settings.music == ps4_xmb_media::music_level::off ? str::LAU_XMED_DESLIGADA : str::LAU_XMED_LIGADA}),
+                i18n::tr(media_settings.media ? str::LAU_XMED_MUSICA_HELP : str::LAU_XMED_MUSICA_HELP_SEM_FUNDO), "tex_sysconf", {}},
             {"@refresh", i18n::tr(str::LAU_ATUALIZAR_BIBLIOTECA), "", "item_tex_plain_folder", {}},
             // 0.33: patch files for every game; R1 on a game lists and switches its patches
             // 0.37: the R1 hint stays on the download row (the import sources fill this subtitle)
@@ -4418,6 +4856,37 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
     columns[7] = {{"@storage", i18n::tr(str::COM_ARMAZENAMENTO_JOGOS), storage_help(), "item_tex_plain_folder", {}}, disc_drive_row(), disc_probe_row()};
     columns[8] = {{"", "PlayStation Network", "", "tex_psn", {}}}; // filled when the column is first shown
     std::array<std::size_t, 10> selections{};
+    // 0.40: folders of the 'Jogo' column (util/ps4_xmb_folders.hpp, /data/rpcs3/xmb-folders.txt). columns[6] shows a
+    // projection of library_rows (the column as game_column() built it, without thumbnails): the folder rows and the
+    // games in no folder, or the games of the open folder. Folders hold references only: no file of a game is touched.
+    namespace xf = utils::ps4::xmb_folders;
+    std::vector<xmb_entry> library_rows;
+    bool library_known = false;               // library_rows come from a scan or the cache, not the 'Carregando' row
+    xf::store folder_store;
+    xf::assignment folder_assigned;           // of library_rows, from the last projection
+    std::optional<std::uint32_t> folder_open; // the folder the column shows
+    folder_ui::mode folder_asking = folder_ui::mode::none;
+    folder_ui::popup folder_popup;            // the option list, the folder targets or the checklist
+    std::vector<folder_ui::action> folder_actions;
+    std::vector<std::uint32_t> folder_targets;
+    std::vector<xf::row> folder_checks;
+    std::string folder_subject;               // the row the option list was opened on (by path)
+    std::uint32_t folder_subject_id = 0;      // the folder its actions are about
+    std::optional<xmb_dialog> folder_dialog;  // the delete or forget question
+    std::vector<std::string> folder_order, folder_order_start; // 'Mudar posição': the rows in their new and old order
+    std::string folder_lifted;                // the row being moved
+    folder_ui::form folder_keyboard = folder_ui::form::none;
+    std::string folder_form_game;             // the game a new folder takes in ('Nova pasta...')
+    std::uint32_t folder_form_id = 0;         // the folder being renamed
+    bool folders_logged = false;
+    // A game's row by path: the column shown first (it has the thumbnail), else the whole library (a game in a closed
+    // folder); null when neither lists it
+    const auto game_row = [&](const std::string& path) -> const xmb_entry*
+    {
+        if (const std::size_t row = find_path(columns[6], path); row != no_row) return &columns[6][row];
+        if (const std::size_t row = find_path(library_rows, path); row != no_row) return &library_rows[row];
+        return nullptr;
+    };
 
     // The library of the previous scan is shown at once; the loader re-checks it and replaces it.
     load_queue loader;
@@ -4452,10 +4921,13 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
     // While the list is loading the cursor rests on the 'Carregando' row.
     if (const std::size_t row = find_path(columns[6], preferred); row != no_row) selections[6] = row;
     else selections[6] = library_cached ? default_game_row(columns[6]) : 2;
+    // 0.40: the folders project this list once the folder file is read (below)
+    library_rows = columns[6];
+    library_known = library_cached;
 
     // Declared after the queue, so the thread is joined before the queue goes away.
     std::optional<named_thread<load_worker>> loader_thread;
-    if (utils::ps4::governor::thread_pressure() >= 2)
+    if (utils::ps4::governor::thread_pressure() >= 2 || !utils::ps4::governor::optional_thread_allowed("PS4 XMB Loader", 1))
     {
         loader.inline_mode = true;
         ps4_startup_checkpoint("XMB loader: close to the thread limit; loading on the UI thread");
@@ -4477,6 +4949,14 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
     loader.post({load_kind::resources});
     loader.post({load_kind::licenses});
     loader.post({load_kind::library, generation});
+    // 0.40: the selected game's own media (ps4_xmb_media): the director turns the selection into loader jobs and the
+    // shown media into strengths and music commands; the music has an AudioOut port of its own, opened at the first
+    // track under the optional-thread rule. Without a loader thread only cached backgrounds are shown, without music.
+    ps4_xmb_media::director media_director;
+    ps4_xmb_media::xmb_music media_music;
+    ps4_xmb_media::log_open(media_settings, loader.inline_mode);
+    media_director.configure(media_settings, loader.inline_mode);
+    if (!loader.inline_mode) loader.post({load_kind::media_trim});
     wake_loader();
     loader_stats stats;
 
@@ -4508,6 +4988,14 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
     }
     // 0.33: the firmware was put back or checked just now: that line says which firmware is installed.
     if (!firmware_notice.empty()) message = firmware_notice;
+    // 0.40: the global safe mode (PS4 tab row, safe-mode.flag) runs every game at safe level 1, so it is said once per
+    // XMB open; a notice of the last game keeps the line (the boot's 'features:' line names the safe mode as well)
+    if (utils::ps4::safe_mode::global_on())
+    {
+        ps4_startup_checkpoint(message.empty() ? "XMB: global safe mode on (safe-mode.flag): every game boots at safe level 1; said on the message line"
+                                               : "XMB: global safe mode on (safe-mode.flag): every game boots at safe level 1; the message line keeps a notice");
+        if (message.empty()) message = i18n::tr(str::LAU_MODO_SEGURO_LIGADO);
+    }
     launcher_input input;
     input.poll(started, false); // presses buffered during the game are not menu input
     u64 last_frame = sceKernelGetProcessTime();
@@ -4716,8 +5204,14 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
 
     const auto finish = [&](const char* why)
     {
+        // 0.40: the game media goes first, before anything else of the exit: the music (its AudioOut port closed and its
+        // output thread joined), the media jobs that did not start and the director's payloads; the results nobody
+        // took once the loader is joined, then the scene's images; one line, before the boot
+        ps4_xmb_media::media_release media_released(why, media_music, media_director, [&] { loader.drop_media(); });
+        disc_ui::modal_hook() = nullptr;
         const u64 at = sceKernelGetProcessTime();
         perf.report(at, why);
+        ps4_ime::cancel_request(); // a keyboard queued for a form never opens over a boot
         if (download_thread)
         {
             // The transfer stops at its next progress callback (about once per second, also while connecting).
@@ -4750,6 +5244,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             loader_thread.reset(); // at most the job in progress (one ISO parse, or the directory a drive walk is in) is waited for
             join_us = sceKernelGetProcessTime() - join_start;
         }
+        for (std::shared_ptr<ps4_xmb_media::media_payload>& payload : loader.take_media()) media_released.dropped(std::move(payload));
+        media_released.end(menu.clear_media());
         ps4_startup_checkpoint(stats.line(loader.inline_mode, join_us).c_str());
     };
 
@@ -4860,7 +5356,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             message = utils::ps4::disc_probe::confirm_text();
             return;
         }
-        if (utils::ps4::governor::thread_pressure() >= 2)
+        if (utils::ps4::governor::thread_pressure() >= 2 || !utils::ps4::governor::optional_thread_allowed("PS4 disc probe", 1))
         {
             message = i18n::tr(str::LAU_PROBE_SEM_RECURSOS_THREADS);
             ps4_startup_checkpoint("disc probe: refused: close to the thread limit; nothing probed");
@@ -4893,8 +5389,91 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
     std::string disc_progress; // install progress line last shown
     u64 next_disc_poll = 0;
     bool copy_screen_open = false; // 0.38: the copy dialog (show_copy) is on screen and shows the result itself
+
+    // 0.40: one step of the selected game's media (ps4_xmb_media). The media source is the selected row of the Jogo
+    // column (a game folder, an EBOOT.BIN or an ISO; the drive row: the image installed from its disc); '@' rows, PKGs
+    // and the other columns have none. A list, keyboard or dialog of that game holds what is shown; the music stops
+    // behind the system UI, while the previous game still stops and during a modal dialog (disc_ui::ask), and starts
+    // again from the beginning afterwards. Every drawn frame, every frame of a modal dialog, and while the system UI is
+    // in front.
+    bool media_animating = false; // a fade runs: the XMB keeps at least 30 fps
+    int media_modal = 0;          // disc_ui::ask dialogs open (they may nest)
+    const auto media_tick = [&](u64 now_us, bool system_ui, bool dialog_shown)
+    {
+        namespace xm = utils::ps4::xmb_media;
+        std::string_view row, serial;
+        std::string disc_serial;
+        if (category == 6 && !columns[6].empty())
+        {
+            const xmb_entry& chosen = columns[6][std::min(selections[6], columns[6].size() - 1)];
+            if (chosen.path == disc_row_path)
+            {
+                if (disc_now.state == ds::disc_state::ps3_disc && !disc_now.installed.empty() && !disc_ui::running(disc_job))
+                {
+                    disc_serial = disc_ui::disc_id(disc_now);
+                    row = disc_now.installed;
+                    serial = disc_serial;
+                }
+            }
+            else if (xm::source_of(chosen.path) != xm::source_kind::none)
+            {
+                row = chosen.path;
+                serial = chosen.serial;
+            }
+        }
+        ps4_xmb_media::director_input in;
+        in.row = row;
+        in.serial = serial;
+        in.visible = category == 6 && !settings_open && !savedata_open;
+        in.hold = media_modal > 0 || dialog_shown || patches_open || cheats_open || ps4_ime::active() || ps4_ime::pending() ||
+            folder_asking != folder_ui::mode::none;
+        in.system_ui = system_ui;
+        in.music_gate = media_modal == 0 && Emu.IsStopped(true);
+        const ps4_xmb_media::director::output out = media_director.tick(now_us, in);
+        if (out.drop) loader.drop_media();
+        if (out.post)
+        {
+            load_job job;
+            job.kind = load_kind::media;
+            job.generation = generation;
+            job.media = *out.post;
+            loader.post(std::move(job));
+            wake_loader();
+        }
+        // The images first: the same payload may also hold the track that starts now
+        if (out.present) menu.set_media(std::move(out.present->background), std::move(out.present->overlay), out.present->overlay_x, out.present->overlay_y);
+        if (out.stop_music) media_music.fade_out(out.stop_us);
+        if (out.play) media_music.play(*out.play, media_director.current_settings().music);
+        if (out.clear) menu.clear_media();
+        menu.set_media_alpha(out.background_alpha, 0, out.overlay_alpha);
+        media_animating = out.animating;
+        media_music.tick(now_us);
+    };
+    // The modal dialogs of disc_ui::ask() step the media too (the hook is cleared in finish() and when this function
+    // returns, before its locals go)
+    disc_ui::modal_hook() = [&](disc_ui::modal_event event)
+    {
+        if (event == disc_ui::modal_event::begin) ++media_modal;
+        media_tick(sceKernelGetProcessTime(), false, true);
+        if (event == disc_ui::modal_event::end && media_modal > 0) --media_modal;
+    };
+    struct modal_hook_reset
+    {
+        modal_hook_reset() = default;
+        modal_hook_reset(const modal_hook_reset&) = delete;
+        modal_hook_reset& operator=(const modal_hook_reset&) = delete;
+        ~modal_hook_reset() { disc_ui::modal_hook() = nullptr; }
+    } media_hook_reset;
     const auto disc_rows = [&]
     {
+        // 0.40: inside a folder the drive row stays at the top level: only the storage column carries it
+        if (folder_open)
+        {
+            std::vector<xmb_entry> none;
+            std::size_t unused = 0;
+            disc_ui::apply_rows(none, unused, columns[7], disc_ui::texts(disc_now, disc_job));
+            return;
+        }
         if (disc_ui::apply_rows(columns[6], selections[6], columns[7], disc_ui::texts(disc_now, disc_job))) icon_anchor = no_row;
     };
     // 0.37: padlocks (disc_lock). A game installed from a PS3 disc is unlocked while the drive's last check, at most two
@@ -4917,12 +5496,19 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 continue;
             }
             const dl::match m = dl::classify(*found, disc_now, now_ms);
-            row.locked = !dl::unlocks(m);
-            if (m == dl::match::unknown || m == dl::match::stale) continue; // nothing new about the drive yet
-            if (const auto [it, added] = logged.try_emplace(found->title_id, m); added || it->second != m)
+            const bool unlocked = dl::unlocks(m);
+            // 0.40: a disc of the game unlocking it is its last sighting (written at most once an hour); without a
+            // network the drive cannot be seen, and the offline grace (off unless turned on) may open the game
+            if (unlocked) dl::sys::note_seen(found->title_id);
+            const dl::offline_decision offline = unlocked ? dl::offline_decision{} : dl::sys::decide_offline(*found, m, disc_now);
+            row.locked = !unlocked && offline.verdict != dl::offline_verdict::grace;
+            if ((m == dl::match::unknown || m == dl::match::stale) && !offline.offline) continue; // nothing new about the drive yet
+            // An old check whose last answer was the missing network is the same state as a new one
+            const std::pair state{offline.offline ? dl::match::no_server : m, offline.verdict};
+            if (const auto [it, added] = logged.try_emplace(found->title_id, state); added || it->second != state)
             {
-                it->second = m;
-                ps4_startup_checkpoint(("disc lock: " + dl::row_log_line(*found, m, disc_now)).c_str());
+                it->second = state;
+                dl::sys::decision(offline.offline ? dl::offline_log_line(*found, offline) : dl::row_log_line(*found, m, disc_now));
             }
         }
         if (category != 6 || settings_open || savedata_open || patches_open || cheats_open || columns[6].empty()) return;
@@ -4938,6 +5524,147 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             ds::service::instance().request_check();
         }
     };
+    // 0.40: 'Mudar posição': the rows being ordered (the folder rows at the top level, the games inside a folder) take
+    // the places of the working order in columns[6]; the cursor follows the row being moved
+    const auto show_position = [&]
+    {
+        std::vector<std::size_t> places;
+        std::map<std::string, xmb_entry, std::less<>> moving;
+        for (std::size_t i = 0; i < columns[6].size(); ++i)
+        {
+            const std::string path = columns[6][i].path;
+            if (std::find(folder_order.begin(), folder_order.end(), path) != folder_order.end() &&
+                moving.try_emplace(path, std::move(columns[6][i])).second)
+                places.push_back(i);
+        }
+        std::size_t next = 0;
+        for (const std::string& path : folder_order)
+            if (const auto it = moving.find(path); it != moving.end() && next < places.size()) columns[6][places[next++]] = std::move(it->second);
+        if (const std::size_t row = find_path(columns[6], folder_lifted); row != no_row) selections[6] = row;
+    };
+    // 0.40: columns[6] from library_rows and the folders. Thumbnails of the rows that stay shown stay with them ('carry':
+    // every row, only rows stored on the PS4, or none); the others load again through the icon cache when their row
+    // shows. Then the drive row (top level) and the padlocks; the cursor stays on its row (by path), else at its place.
+    enum class art_carry : u8 { all, internal, none };
+    const auto project = [&](art_carry carry)
+    {
+        const std::string keep = columns[6].empty() ? std::string{} : columns[6][std::min(selections[6], columns[6].size() - 1)].path;
+        const std::size_t keep_index = selections[6];
+        std::vector<xmb_entry> before = std::move(columns[6]);
+        std::vector<xf::row> rows;
+        rows.reserve(library_rows.size());
+        for (const xmb_entry& entry : library_rows) rows.push_back(xf::make_row(entry.path, entry.serial, entry.title));
+        // A member whose game is not at its path any more follows the one row of its TITLE_ID only when the old place is
+        // readable and empty (an internal file is gone; a USB drive is connected and has nothing there): read-only
+        // checks, made only for such a member
+        std::optional<usb_keys> drives;
+        folder_assigned = xf::assign(folder_store.m, rows, [&](std::string_view portable) -> bool
+        {
+            if (!xf::on_usb(portable))
+            {
+                fs::stat_t info{};
+                return !fs::get_stat(std::string(portable), info) && fs::g_tls_error == fs::error::noent;
+            }
+            if (!drives) drives = probe_usb_drives();
+            bool connected = false;
+            for (unsigned drive = 0; drive < drives->size(); ++drive)
+            {
+                if ((*drives)[drive].empty()) continue;
+                connected = true;
+                if (fs::exists(xf::drive_path(portable, drive))) return false;
+            }
+            return connected;
+        });
+        if (folder_assigned.adopted || folder_assigned.duplicates)
+            ps4_startup_checkpoint(fmt::format("XMB folders: %u game(s) followed to a new path, %u line(s) of a game listed twice dropped "
+                "(written with the next change)", folder_assigned.adopted, folder_assigned.duplicates).c_str());
+        std::optional<std::size_t> open_index;
+        if (folder_open && !(open_index = xf::find_folder(folder_store.m, *folder_open))) folder_open.reset();
+        const std::vector<xf::slot> slots = xf::project(folder_assigned, rows, open_index);
+        std::vector<xmb_entry> shown;
+        shown.reserve(slots.size());
+        for (const xf::slot s : slots)
+        {
+            if (s.is_row()) shown.push_back(library_rows[s.row_index()]);
+            else if (s.is_folder())
+            {
+                const std::size_t k = s.folder_index();
+                shown.push_back(folder_ui::folder_entry(folder_store.m.folders[k], folder_assigned.rows_of[k].size(), folder_assigned.missing[k],
+                    library_known));
+            }
+            else shown.push_back(folder_ui::empty_entry(*folder_open, folder_assigned.missing[*open_index], library_known));
+        }
+        if (carry != art_carry::none)
+        {
+            std::map<std::string_view, xmb_image*, std::less<>> art;
+            for (xmb_entry& entry : before)
+                if (entry.artwork && !entry.path.empty() && entry.path.front() != '@') art.emplace(entry.path, &entry.artwork);
+            for (xmb_entry& entry : shown)
+                if (const auto it = art.find(entry.path); it != art.end() && (carry == art_carry::all || utils::ps4::usb_drive_of(entry.path) < 0))
+                    entry.artwork = std::move(*it->second);
+        }
+        columns[6] = std::move(shown);
+        if (carry != art_carry::all) artwork_attempted.clear();
+        else
+        {
+            // Rows that are not shown now ask for their thumbnail again when they are
+            std::set<std::string_view, std::less<>> paths;
+            for (const xmb_entry& entry : columns[6]) paths.insert(entry.path);
+            if (std::any_of(artwork_attempted.begin(), artwork_attempted.end(), [&](const std::string& path) { return !paths.contains(path); }))
+            {
+                for (const auto& dropped : loader.drop_icons()) artwork_attempted.erase(dropped);
+                for (auto it = artwork_attempted.begin(); it != artwork_attempted.end();) it = paths.contains(*it) ? std::next(it) : artwork_attempted.erase(it);
+            }
+        }
+        icon_anchor = no_row;
+        disc_rows();
+        std::size_t row = no_row;
+        if (!keep.empty()) row = find_path(columns[6], keep);
+        else
+            for (std::size_t i = 0; i < columns[6].size() && row == no_row; ++i)
+                if (columns[6][i].path.empty()) row = i; // the 'Carregando' or 'Nenhum jogo' row
+        selections[6] = row != no_row ? row : std::min(keep_index, columns[6].empty() ? std::size_t{0} : columns[6].size() - 1);
+        if (folder_asking == folder_ui::mode::position) show_position();
+        lock_rows(sceKernelGetProcessTime());
+        if (!folders_logged && library_known && folder_store.status != xf::load_status::absent)
+        {
+            folders_logged = true;
+            ps4_startup_checkpoint(fmt::format("XMB folders: loaded %u folder(s), %u game(s) (%u not in the library now)%s", folder_store.m.folders.size(),
+                xf::member_count(folder_store.m), xf::missing_count(folder_assigned), folder_store.m.read_only ? "; read only" : "").c_str());
+        }
+    };
+    // The first row of an open folder; at the top level the first game, as before folders
+    const auto default_row = [&]() -> std::size_t { return folder_open ? 0 : default_game_row(columns[6]); };
+    const auto select_path = [&](const std::string& path)
+    {
+        if (const std::size_t row = find_path(columns[6], path); row != no_row) selections[6] = row;
+    };
+    // The folder holding the game at 'path' opens when the library lists that game: back from a game started inside a
+    // folder, the XMB shows that folder, as the PS3 does
+    const auto reveal = [&](const std::string& path)
+    {
+        if (path.empty() || find_path(library_rows, path) == no_row) return;
+        if (const auto k = xf::folder_of(folder_store.m, xf::portable_path(path))) folder_open = folder_store.m.folders[*k].id;
+    };
+    // The folders file at every XMB visit: one failed read for a player who never made a folder. A damaged file shows
+    // the backup's folders; one written by a newer version is shown read only and never written.
+    {
+        folder_files io;
+        folder_store.load(io);
+        const std::string dropped = folder_store.dropped ? fmt::format(" (%u line(s) left out, first: %s)", folder_store.dropped, folder_store.first_problem)
+                                                         : std::string{};
+        if (folder_store.status == xf::load_status::damaged)
+        {
+            ps4_startup_checkpoint(fmt::format("XMB folders: file damaged (%s)%s; %s", folder_store.first_problem, io.error.empty() ? "" : " " + io.error,
+                folder_store.from_backup ? "the backup was used" : "no usable backup: no folders shown (the file is kept as xmb-folders.damaged.txt at the next save)").c_str());
+            if (folder_store.from_backup && message.empty()) message = i18n::tr(str::FLD_ARQUIVO_DANIFICADO);
+        }
+        else if (folder_store.status == xf::load_status::newer) ps4_startup_checkpoint(("XMB folders: file written by a newer version; read only" + dropped).c_str());
+        else if (!dropped.empty()) ps4_startup_checkpoint(("XMB folders: file read" + dropped).c_str());
+        reveal(preferred);
+        project(art_carry::none);
+        if (const std::size_t row = find_path(columns[6], preferred); row != no_row) selections[6] = row;
+    }
     const auto disc_refresh = [&](u64 now)
     {
         if (now < next_disc_poll) return;
@@ -4957,6 +5684,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 memory.key_id = found_id.empty() ? memory.asked_id : found_id;
                 memory.key_ok = found->ok;
                 memory.key_text = found->text;
+                memory.key_what = found->what;
+                memory.key_tested = found->local_tested;
                 if ((!found->ok || found->changed) && (message.empty() || message == disc_progress)) message = found->text;
             }
         }
@@ -5061,7 +5790,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             return {};
         case ds::disc_state::no_server:
             ds::service::instance().request_check();
-            message = i18n::tr(str::LAU_DISC_LIGUE_FTP);
+            // 0.40: without an IP address GoldHEN's FTP server does not listen: the network is missing, not the setting
+            message = i18n::tr(ds::no_network(disc_now) ? str::DOFF_ROW_SEM_REDE_HELP : str::LAU_DISC_LIGUE_FTP);
             return {};
         case ds::disc_state::no_disc:
             ds::service::instance().request_check();
@@ -5107,6 +5837,19 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             const u64 at = sceKernelGetProcessTime();
             disc_refresh(at);
             if (disc_now.state != ds::disc_state::ps3_disc || disc_now.generation != generation) return disc_ui::answer::gone;
+            // 0.40: Triangle on the offline question: the key is searched again now (a USB drive with the player's key
+            // file, the network or the clock may be there now); the question shows the search
+            if ((pressed & ORBIS_PAD_BUTTON_TRIANGLE) && !(pressed & ORBIS_PAD_BUTTON_CIRCLE) && disc_ui::offline_failure(disc_now))
+            {
+                keys.forget();
+                if (keys.request(disc_now))
+                {
+                    memory.asked_id = id;
+                    ps4_startup_checkpoint(fmt::format("XMB: PS3 disc %s: key search started again with Triangle (last search: %s)", id,
+                        dk::to_string(memory.key_what)).c_str());
+                }
+                pressed &= ~static_cast<u32>(ORBIS_PAD_BUTTON_CROSS);
+            }
             const disc_ui::key_state key = disc_ui::key_of(disc_now);
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) return disc_ui::answer::back;
             if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && !disc_now.partial.empty())
@@ -5197,11 +5940,12 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         const ds::disc_status before = ds::service::instance().last();
         ps4_startup_checkpoint(fmt::format("disc lock: X on '%s' (%s): checking the drive (last check %s)", path, record->title_id,
             before.checked_ms > 0 ? fmt::format("%d ms ago", pressed_ms - before.checked_ms) : std::string("never")).c_str());
-        dl::gate gate(*record, path, pressed_ms);
+        // 0.40: with the offline grace of this console (the feature row, the last sighting of the disc, the clock)
+        dl::gate gate(*record, path, pressed_ms, dl::sys::gate_settings(*record));
         next_disc_poll = 0;
         // 0.38: the game's own icon above the message (a copy: the drive row may move the game rows while it is shown)
         xmb_image game_icon;
-        if (const std::size_t row = find_path(columns[6], path); row != no_row) game_icon = columns[6][row].artwork;
+        if (const xmb_entry* row = game_row(path)) game_icon = row->artwork;
         const std::string game = shorten(dl::game_name(*record), 70);
         const std::int64_t slow_ms = dl::gate_config{}.slow_ms;
         const disc_ui::answer answer = disc_ui::ask(display, menu, started, input, [&](u32 pressed, xmb_dialog& shown) -> std::optional<disc_ui::answer>
@@ -5213,7 +5957,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             const dl::step step = gate.update(ds::service::instance().last(), now_ms, (pressed & ORBIS_PAD_BUTTON_CROSS) != 0,
                 (pressed & ORBIS_PAD_BUTTON_CIRCLE) != 0, dk::service::instance().busy());
             if (gate.want_check()) ds::service::instance().request_check();
-            if (const std::string line = gate.take_log(); !line.empty()) ps4_startup_checkpoint(("disc lock: " + line).c_str());
+            if (const std::string line = gate.take_log(); !line.empty()) dl::sys::decision(line);
             if (step == dl::step::boot) return disc_ui::answer::play;
             if (step == dl::step::back) return disc_ui::answer::back;
             // The PS3's "insert the disc" dialog: the gate's state, its reason lines as one note
@@ -5240,8 +5984,11 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 break;
             default:
                 shown.lines.emplace_back(i18n::tr(str::COM_VERIFICANDO_DISCO));
-                shown.notes.emplace_back(i18n::tr(now_ms - pressed_ms >= slow_ms ? str::COM_LEITOR_ESTA_DEMORANDO_RESPONDER_AGUARDE
-                                                                                 : str::COM_PROCURANDO_DISCO_DESTE_JOGO_LEITOR));
+                // 0.40: the offline grace says for about 2 s why the game opens without its disc being checked
+                if (std::string grace = gate.grace_note(); !grace.empty()) shown.notes.push_back(std::move(grace));
+                else
+                    shown.notes.emplace_back(i18n::tr(now_ms - pressed_ms >= slow_ms ? str::COM_LEITOR_ESTA_DEMORANDO_RESPONDER_AGUARDE
+                                                                                     : str::COM_PROCURANDO_DISCO_DESTE_JOGO_LEITOR));
                 shown.busy = true;
                 shown.buttons = {xmb::circle_button(i18n::tr(str::COM_VOLTAR))};
                 break;
@@ -5256,20 +6003,57 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         input.flush();
         if (answer == disc_ui::answer::play)
         {
+            // A boot through the offline grace is no sighting of the disc
+            if (dl::unlocks(gate.last_match())) dl::sys::note_seen(record->title_id);
             dl::sys::remember_verified(path);
             return true;
         }
         if (answer == disc_ui::answer::back) message = dl::message_text(*record);
         return false;
     };
+    // 0.40: a boot check the player may pass: a system dialog with the game's icon and name, 'line' and 'notes', X
+    // "Iniciar mesmo assim" (true) and Circle "Voltar" (false, also when the application is closing). The check
+    // stays a warning: a copy cut short or a folder made over FTP is usually the cause, but a game may still run.
+    const auto confirm_boot_anyway = [&](const std::string& path, const std::string& line, const std::vector<std::string>& notes) -> bool
+    {
+        xmb_image game_icon;
+        std::string title = file_name_of(path);
+        if (const xmb_entry* row = game_row(path))
+        {
+            game_icon = row->artwork;
+            if (!row->title.empty()) title = row->title;
+        }
+        title = shorten(title, 70);
+        const disc_ui::answer answer = disc_ui::ask(display, menu, started, input, [&](u32 pressed, xmb_dialog& shown) -> std::optional<disc_ui::answer>
+        {
+            if (pressed & ORBIS_PAD_BUTTON_CROSS) return disc_ui::answer::play;
+            if (pressed & ORBIS_PAD_BUTTON_CIRCLE) return disc_ui::answer::back;
+            namespace xmb = utils::ps4::xmb;
+            shown.icon = game_icon ? &game_icon : xmb_resource("item_tex_ps3game_folder");
+            shown.title = title;
+            shown.lines.push_back(line);
+            shown.notes = notes;
+            shown.buttons = {xmb::cross_button(i18n::tr(str::LAU_INICIAR_MESMO_ASSIM)), xmb::circle_button(i18n::tr(str::COM_VOLTAR))};
+            return std::nullopt;
+        });
+        // Back on the XMB (or on the way to the game): no animation jump, no press carried over
+        last_frame = sceKernelGetProcessTime();
+        last_present = 0;
+        last_activity = last_frame;
+        wait_for_button_release = true;
+        input.flush();
+        return answer == disc_ui::answer::play;
+    };
     // 0.39: X on a game: dev_hdd0/game and the user's folder must take writes (a game creates its data and reads its user
     // name there; folders made over FTP refuse them and the game shows a black screen). A refusing folder is opened at
-    // once (fs_repair: the app's chmod or SITE CHMOD through the FTP server); one that stays closed refuses the boot,
-    // unless dev-hdd0-gate-off.flag. Two file operations per folder (create and remove a probe file). True: boot.
+    // once (fs_repair: the app's chmod or SITE CHMOD through the FTP server). 0.40: the folders that stay closed are
+    // named on a system dialog; X boots anyway, Circle stays in the menu (both logged). dev-hdd0-gate-off.flag boots
+    // without asking. Two file operations per folder (create and remove a probe file). True: boot.
     const auto dev_hdd0_ready = [&](const std::string& path) -> bool
     {
         namespace fr = utils::ps4::fs_repair;
         const fr::fs_ops calls = fr::sys::fs();
+        std::vector<std::pair<const char*, int>> closed; // folder, errno of its probe
         for (const char* folder : {"/data/rpcs3/dev_hdd0/game", "/data/rpcs3/dev_hdd0/home/00000001"})
         {
             std::uint32_t owner = 0;
@@ -5286,11 +6070,45 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 ps4_startup_checkpoint(fmt::format("XMB: '%s': %s refuses writes (errno %d): booting anyway (dev-hdd0-gate-off.flag)", path, folder, error).c_str());
                 continue;
             }
-            message = i18n::tr(str::LAU_DEV_HDD0_SEM_GRAVACAO);
-            ps4_startup_checkpoint(fmt::format("XMB: '%s' not booted: %s refuses writes (errno %d); the game could not create its data", path, folder, error).c_str());
-            return false;
+            closed.emplace_back(folder, error);
         }
-        return true;
+        if (closed.empty()) return true;
+        std::vector<std::string> notes;
+        for (const auto& [folder, error] : closed) notes.push_back(i18n::trf(str::LAU_DEV_HDD0_PASTA, {std::string(folder)}));
+        notes.emplace_back(i18n::tr(str::LAU_DEV_HDD0_RISCO));
+        const bool anyway = confirm_boot_anyway(path, i18n::tr(str::LAU_DEV_HDD0_SEM_GRAVACAO), notes);
+        for (const auto& [folder, error] : closed)
+        {
+            ps4_startup_checkpoint((anyway ? fmt::format("XMB: '%s': %s refuses writes (errno %d): started anyway (X)", path, folder, error)
+                : fmt::format("XMB: '%s' not booted: %s refuses writes (errno %d); the game could not create its data", path, folder, error)).c_str());
+        }
+        if (!anyway) message = i18n::tr(str::LAU_DEV_HDD0_SEM_GRAVACAO);
+        return anyway;
+    };
+    // 0.40: X on an ISO shorter than the image its header describes (a copy cut short, or an image trimmed on purpose
+    // that still runs): the system dialog says how much is missing; X boots anyway (a read past the end of the file
+    // then stops the game with the incomplete-ISO notice, Loader/ISO.cpp), Circle stays in the menu. Both choices are
+    // logged. iso-size-gate-off.flag boots without asking. True: boot.
+    const auto short_iso_ready = [&](const std::string& path, const utils::ps4::disc_image::completeness& size) -> bool
+    {
+        namespace dimg = utils::ps4::disc_image;
+        if (fs::is_file("/data/rpcs3/iso-size-gate-off.flag"))
+        {
+            ps4_startup_checkpoint(fmt::format("XMB: '%s' incomplete: started anyway (iso-size-gate-off.flag); file %llu bytes, image %llu bytes", path,
+                size.file, size.image).c_str());
+            return true;
+        }
+        const bool anyway = confirm_boot_anyway(path, i18n::trf(str::LAU_ISO_MENOR_DECLARADO, {dimg::size_text(size.missing())}),
+            {i18n::tr(str::LAU_ISO_MENOR_NOTA), i18n::tr(str::LAU_ISO_MENOR_RISCO)});
+        if (anyway)
+        {
+            ps4_startup_checkpoint(fmt::format("XMB: '%s' incomplete: started anyway (X); file %llu bytes, image %llu bytes", path, size.file, size.image).c_str());
+            return true;
+        }
+        message = dimg::incomplete_text(size);
+        ps4_startup_checkpoint(fmt::format("XMB: '%s' not booted: the image is incomplete (file %llu bytes, image %llu bytes)", path, size.file,
+            size.image).c_str());
+        return false;
     };
     // 0.39: X on an encrypted ISO without a key that decrypts it: the key is searched now on the image's own sectors
     // (as for a disc in the drive: key files, IRDs next to the image, the IRD database), on a worker with a dialog that
@@ -5306,16 +6124,20 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         if (status == iso_key_status::OK) return true;
         ps4_startup_checkpoint(fmt::format("XMB: '%s' is an encrypted ISO %s: searching for its key", path,
             status == iso_key_status::MISSING ? "without a key" : "with a key file that does not decrypt it").c_str());
-        const std::shared_ptr<dk::image_search> job = utils::ps4::governor::thread_pressure() < 2 ? dk::start_image_search(path) : nullptr;
+        const bool thread_free = utils::ps4::governor::thread_pressure() < 2 && utils::ps4::governor::optional_thread_allowed("PS4 ISO key search", 1);
+        const std::shared_ptr<dk::image_search> job = thread_free ? dk::start_image_search(path) : nullptr;
         if (!job)
         {
             ps4_startup_checkpoint(fmt::format("XMB: '%s': no thread for the key search (close to the thread limit): booting without it", path).c_str());
             return true;
         }
         xmb_image game_icon;
-        if (const std::size_t row = find_path(columns[6], path); row != no_row) game_icon = columns[6][row].artwork;
         std::string title = file_name_of(path);
-        if (const std::size_t row = find_path(columns[6], path); row != no_row && !columns[6][row].title.empty()) title = columns[6][row].title;
+        if (const xmb_entry* row = game_row(path))
+        {
+            game_icon = row->artwork;
+            if (!row->title.empty()) title = row->title;
+        }
         title = shorten(title, 70);
         const disc_ui::answer answer = disc_ui::ask(display, menu, started, input, [&](u32 pressed, xmb_dialog& shown) -> std::optional<disc_ui::answer>
         {
@@ -5357,7 +6179,12 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         {
         case dk::outcome::not_in_database:
         case dk::outcome::no_matching_key: message = i18n::trf(str::LAU_ISOKEY_NAO_ESTA_BASE, {id}); break;
-        case dk::outcome::no_internet: message = i18n::tr(str::LAU_ISOKEY_SEM_INTERNET); break;
+        // 0.40: the offline search also reads USB:/keys and /data/rpcs3/keys: the line names them
+        case dk::outcome::no_internet:
+            message = i18n::tr(utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::disc_keys_offline) ? str::LAU_ISOKEY_SEM_INTERNET_LOCAL
+                                                                                                                  : str::LAU_ISOKEY_SEM_INTERNET);
+            break;
+        case dk::outcome::clock_wrong: message = found.text; break;
         case dk::outcome::disc_unreadable:
         case dk::outcome::cannot_verify: message = i18n::tr(str::LAU_ISOKEY_NAO_LEU); break;
         case dk::outcome::write_failed: message = found.text; break;
@@ -5385,7 +6212,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
     {
         firmware_job = std::move(job);
         const char* refusal = "close to the thread limit";
-        if (utils::ps4::governor::thread_pressure() < 2)
+        // Two slots: the installer thread and the extract helper TAR.cpp starts for a large file
+        if (utils::ps4::governor::thread_pressure() < 2 && utils::ps4::governor::optional_thread_allowed("PS4 Firmware Installer", 2))
         {
             firmware_thread.emplace(stx::try_launch, "PS4 Firmware Installer", firmware_worker{firmware_job.get()});
             if (firmware_thread->ps4_try_start())
@@ -5642,7 +6470,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             const u64 left = *boot_next_until > at ? std::min(*boot_next_until - at, total) : 0;
             xmb_dialog d;
             d.title = boot_next_name;
-            if (const std::size_t row = find_path(columns[6], preferred); row != no_row && columns[6][row].artwork) d.icon = &columns[6][row].artwork;
+            if (const xmb_entry* row = game_row(preferred); row && row->artwork) d.icon = &row->artwork;
             d.lines.emplace_back(i18n::tr(str::LAU_BOOT_NEXT_REABERTO));
             d.notes.emplace_back(i18n::tr(str::LAU_BOOT_NEXT_BARRA));
             d.progress = static_cast<int>(1000 - left * 1000 / total);
@@ -5653,18 +6481,25 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         if (notice && !game_dialog_line.empty() && !game_dialog_icon && !notice->lines.empty() && notice->lines.front() == game_dialog_line)
         {
             // The disc-removed or boot failure notice: the game's row (name, then its artwork when the loader has brought it)
-            const std::size_t row = find_path(columns[6], preferred);
-            if (row != no_row)
+            const xmb_entry* row = game_row(preferred);
+            if (row)
             {
-                const xmb_entry& game = columns[6][row];
+                const xmb_entry& game = *row;
                 if (notice->title.empty())
                     notice->title = shorten(game.serial.empty() ? game.title : fmt::format("%s (%s)", game.title, game.serial), 70);
                 if (game.artwork) game_dialog_icon = game.artwork;
             }
             // Taken again every frame until the artwork is copied: a reload of the firmware images moves the folder icon
-            notice->icon = game_dialog_icon ? &game_dialog_icon : (row != no_row || notice->icon) ? xmb_resource("item_tex_ps3game_folder") : nullptr;
+            notice->icon = game_dialog_icon ? &game_dialog_icon : (row || notice->icon) ? xmb_resource("item_tex_ps3game_folder") : nullptr;
         }
         if (notice) return notice;
+        // 0.40: the delete or forget question of a folder (its icon taken every frame: a firmware reload replaces it)
+        if (folder_dialog)
+        {
+            xmb_dialog d = *folder_dialog;
+            d.icon = xmb_resource("item_tex_plain_folder");
+            return d;
+        }
         // the cheat list's delete question or a page of 'Ver linhas'
         if (cheats_open && cheat_dialog) return cheat_dialog;
         // the settings pages' questions (a warned value, leaving with edits not saved, the full help)
@@ -5730,10 +6565,12 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         form_email.clear();
         message = why;
     };
-    // 0.39: titles and prompts in the interface language; the system keyboard gets the logical text (it shapes Arabic itself)
+    // 0.39: titles and prompts in the interface language; the system keyboard gets the logical text (it shapes Arabic itself).
+    // 0.40: queued (ps4_ime::request): the next field of a form is asked for from the close of the previous keyboard,
+    // which the system refuses while that one is still closing; the main loop opens it, or ends the form when it cannot
     const auto open_keyboard = [&](ps4_ime::kind kind, str title, rpcn_form next, str prompt)
     {
-        if (!ps4_ime::open(kind, i18n::tr(title), 0))
+        if (!ps4_ime::request(kind, i18n::tr(title), 0))
         {
             cancel_form(i18n::tr(str::LAU_RPCN_TECLADO_NAO_ABRIU));
             return;
@@ -5746,7 +6583,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         const rpcn_form step = std::exchange(form, rpcn_form::none);
         if (state != ps4_ime::state::done || text.empty())
         {
-            cancel_form(i18n::tr(state == ps4_ime::state::failed ? str::LAU_RPCN_TECLADO_FALHOU : str::COM_OPERACAO_RPCN_CANCELADA));
+            cancel_form(i18n::tr(state == ps4_ime::state::failed ? str::LAU_RPCN_TECLADO_FALHOU
+                    : state == ps4_ime::state::not_opened ? str::LAU_RPCN_TECLADO_NAO_ABRIU : str::COM_OPERACAO_RPCN_CANCELADA));
             return;
         }
         switch (step)
@@ -5794,7 +6632,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         {
             std::string event;
             message = path == "@rpcn:online" ? utils::ps4::online_rows::toggle_online(event) : utils::ps4::online_rows::toggle_upnp(event);
-            if (!event.empty()) ps4_startup_checkpoint(event.c_str());
+            if (!event.empty()) record_settings_line(event);
             psn_dirty = true;
             settings_dirty = true;
         }
@@ -5941,6 +6779,11 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             return;
         }
         if (patch_import_busy) { message = i18n::tr(str::LAU_PATCH_AGUARDE_IMPORTACAO); return; }
+        if (!utils::ps4::governor::optional_thread_allowed("PS4 Patch Download", 1))
+        {
+            message = i18n::tr(str::LAU_PATCH_THREAD_RECUSADA);
+            return;
+        }
         download = std::make_unique<utils::ps4::patches::download_state>();
         download_thread.emplace(stx::try_launch, "PS4 Patch Download", patch_download_worker{download.get()});
         if (!download_thread->ps4_try_start())
@@ -6024,10 +6867,11 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         else cheat_option_selection = std::min(cheat_option_selection, cheat_option_rows.size() - 1);
     };
     // The system keyboard for a cheat form: 'title' is the prompt, or why the text typed before was refused (it is the
-    // message line too, under the keyboard)
+    // message line too, under the keyboard). 0.40: queued (ps4_ime::request), as the name -> codes step and the typing
+    // error retries ask for it from the close of the previous keyboard, which the system refuses while that one closes
     const auto open_cheat_keyboard = [&](cheat_form next, ps4_ime::kind kind, const std::string& title, unsigned limit, std::string_view initial)
     {
-        if (!ps4_ime::open(kind, title, limit, initial))
+        if (!ps4_ime::request(kind, title, limit, initial))
         {
             cheat_keyboard = cheat_form::none;
             message = first_part(i18n::tr(str::LAU_RPCN_TECLADO_NAO_ABRIU)).first; // startup.log has the reason
@@ -6269,6 +7113,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         const cheat_form step = std::exchange(cheat_keyboard, cheat_form::none);
         if (state == ps4_ime::state::done && cheat_list) cheat_form_done(step, typed);
         else if (state == ps4_ime::state::failed) message = first_part(i18n::tr(str::LAU_RPCN_TECLADO_FALHOU)).first;
+        else if (state == ps4_ime::state::not_opened) message = first_part(i18n::tr(str::LAU_RPCN_TECLADO_NAO_ABRIU)).first; // startup.log has the reason
         else message.clear();
         // an import that finished meanwhile is read now (the typed text was not lost)
         if (cheat_keyboard == cheat_form::none && std::exchange(cheat_reload_due, false) && cheats_open) request_cheats(cheat_selection, false);
@@ -6284,7 +7129,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         }
         load_job job{load_kind::cheat_import, generation};
         if (this_game) job.serial = cheat_game.serial;
-        for (const xmb_entry& row : columns[6])
+        // 0.40: the whole library, also the games of closed folders
+        for (const xmb_entry& row : library_rows)
             if (!row.path.empty() && row.path.front() != '@' && !row.serial.empty()) job.library.emplace_back(row.title, row.serial);
         cheat_import_busy = true;
         loader.post(std::move(job));
@@ -6310,9 +7156,534 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         settings_dirty = true;
         if (patches_open) patch_rows = patch_entries(patch_list.get(), switch_icons, patch_cheats_on);
         if (cheats_open) cheats_changed(no_row);
-        disc_rows();
+        // 0.40: the folder rows' texts (their names are the player's and stay as typed)
+        project(art_carry::all);
         refresh_library(true);
         message = saved ? i18n::trf(str::LANG_CHANGED, {i18n::raw(i18n::setting_label(next))}) : std::string(i18n::tr(str::LANG_SAVE_FAILED));
+    };
+
+    // 0.40: Configurações > 'Fundo e música do jogo' (X: on/off) and 'Música do jogo' (X and Left/Right: on, low, off).
+    // Applied at once (off fades the media out; the level ramps); the file and one startup.log line come from
+    // ps4_xmb_media. A refused write keeps the old value and names the file.
+    const auto change_media = [&](bool media_switch, int music_step)
+    {
+        namespace xm = utils::ps4::xmb_media;
+        const bool saved = media_switch ? ps4_xmb_media::set_media_switch(!media_settings.media)
+                                        : ps4_xmb_media::set_music_level(xm::step_music_level(media_settings.music, music_step));
+        if (!saved)
+        {
+            message = i18n::tr(str::COM_ERRO_GRAVAR) + std::string(media_switch ? xm::media_off_flag : xm::music_level_file);
+            return;
+        }
+        media_settings = ps4_xmb_media::read_settings();
+        media_director.configure(media_settings, loader.inline_mode);
+        media_music.set_level(media_settings.music);
+        columns[1] = settings_column();
+        if (media_switch) message = i18n::tr(media_settings.media ? str::LAU_XMED_LIGADO_MSG : str::LAU_XMED_DESLIGADO_MSG);
+        else message.clear();
+    };
+
+    // 0.40: folders of the 'Jogo' column. X opens a folder and Circle closes it; Triangle opens the PS3 option list of the
+    // selected row (refresh the library, open, add games, rename, change position, delete, forget the games that are
+    // gone, create, move a game in or out). Each change is written at once through the store (the backup first); a name
+    // comes from one system keyboard per action. Deleting a folder or taking a game out never touches a game's files.
+    const auto open_folder = [&](std::uint32_t id)
+    {
+        folder_open = id;
+        project(art_carry::all);
+        if (folder_open) selections[6] = 0;
+    };
+    const auto close_folder = [&]
+    {
+        const std::optional<std::uint32_t> id = std::exchange(folder_open, std::nullopt);
+        project(art_carry::all);
+        if (id) select_path(xf::folder_row_path(*id));
+    };
+    const auto folder_named = [&](std::uint32_t id) -> const xf::folder*
+    {
+        const auto k = xf::find_folder(folder_store.m, id);
+        return k ? &folder_store.m.folders[*k] : nullptr;
+    };
+    // Games of folder 'id' in the library now (the assignment of the last projection)
+    const auto folder_present = [&](std::uint32_t id) -> std::size_t
+    {
+        const auto k = xf::find_folder(folder_store.m, id);
+        return k && *k < folder_assigned.rows_of.size() ? folder_assigned.rows_of[*k].size() : 0;
+    };
+    // A file written by a newer version is shown, never changed: said before a list or a keyboard opens for nothing
+    const auto folders_writable = [&]
+    {
+        if (!folder_store.m.read_only) return true;
+        message = i18n::tr(str::FLD_SO_LEITURA);
+        return false;
+    };
+    const auto close_folder_list = [&]
+    {
+        folder_asking = folder_ui::mode::none;
+        folder_popup = {};
+        folder_actions.clear();
+        folder_targets.clear();
+        folder_checks.clear();
+    };
+    // One change through the store (backup, the damaged file kept aside, then the file; a file changed outside since it
+    // was read is read again first) and the column again. 'what' names the change for the log line. A failed write keeps
+    // the change for this session and says so; a refusal says why (when a text names it).
+    const auto folder_apply = [&](auto&& op, auto&& what) -> xf::save_status
+    {
+        folder_files io;
+        const u64 start = sceKernelGetProcessTime();
+        const xf::save_result r = folder_store.apply(io, op);
+        const double ms = double(sceKernelGetProcessTime() - start) / 1000;
+        if (r.reloaded) ps4_startup_checkpoint("XMB folders: file changed outside the emulator; reloaded before saving");
+        switch (r.status)
+        {
+        case xf::save_status::saved:
+            ps4_startup_checkpoint(fmt::format("XMB folders: %s; saved (%u folders, %u games, %u bytes, %.1f ms)", what(), folder_store.m.folders.size(),
+                xf::member_count(folder_store.m), r.bytes, ms).c_str());
+            break;
+        case xf::save_status::failed:
+        {
+            ps4_startup_checkpoint(fmt::format("XMB folders: %s; save FAILED (%s: %s); the change lasts until the application closes", what(), r.failed_step,
+                io.error).c_str());
+            namespace fr = utils::ps4::fs_repair;
+            std::uint32_t owner = 0;
+            message = fr::permission_error(fr::sys::fs().probe("/data/rpcs3", owner)) ? fr::no_write_text("/data/rpcs3") : std::string(i18n::tr(str::FLD_SALVAR_FALHOU));
+            break;
+        }
+        case xf::save_status::refused:
+            ps4_startup_checkpoint(fmt::format("XMB folders: %s refused (%s)", what(), xf::refusal_text(r.why)).c_str());
+            message = folder_ui::refusal_text(r.why);
+            break;
+        case xf::save_status::unchanged:
+            break;
+        }
+        project(art_carry::all);
+        return r.status;
+    };
+    // A typed name the XMB font cannot draw whole is kept as typed (the file is UTF-8): the message says it shows '?'
+    const auto name_message = [&](const std::string& name, std::string done)
+    {
+        message = display.typeface.missing_glyphs(name) ? std::string(i18n::tr(str::FLD_NOME_CARACTERES)) : std::move(done);
+    };
+    // A new folder after the last one ('name' is cleaned and made unique by the model); 'game': the game it takes in
+    // ('Nova pasta...'). 'typed': the name came from the keyboard, else it is the default one (rename it later).
+    const auto create_folder = [&](const std::string& name, const std::string& game, bool typed)
+    {
+        std::optional<xf::row> member;
+        std::string title;
+        if (const xmb_entry* row = game.empty() ? nullptr : game_row(game))
+        {
+            member = xf::make_row(row->path, row->serial, row->title);
+            title = row->title;
+        }
+        std::uint32_t id = 0;
+        const xf::save_status status = folder_apply([&](xf::model& m, xf::refusal& why)
+        {
+            if (!xf::create(m, name, id, &why)) return false;
+            return !member || xf::move_to(m, *member, id, &why) || why == xf::refusal::none;
+        }, [&]
+        {
+            const xf::folder* made = folder_named(id);
+            return fmt::format("created '%s' (id %u%s)%s", xf::clip(made ? made->name : name, 64), id, typed ? "" : ", default name: no keyboard",
+                member ? fmt::format(" with '%s' ('%s')", xf::clip(title, 64), member->path) : std::string{});
+        });
+        if (status != xf::save_status::saved) return;
+        const xf::folder* made = folder_named(id);
+        const std::string shown = made ? made->name : name;
+        if (!typed) message = i18n::trf(str::FLD_SEM_TECLADO, {folder_ui::name_arg(shown)});
+        else name_message(shown, member ? i18n::trf(str::FLD_MOVIDO, {folder_ui::name_arg(folder_ui::short_title(title)), folder_ui::name_arg(shown)})
+                                        : i18n::trf(str::FLD_CRIADA, {folder_ui::name_arg(shown)}));
+        if (!member) select_path(xf::folder_row_path(id));
+    };
+    const auto rename_folder = [&](std::uint32_t id, const std::string& name)
+    {
+        const xf::folder* f = folder_named(id);
+        if (!f) return;
+        const std::string old = f->name;
+        const xf::save_status status = folder_apply([&](xf::model& m, xf::refusal& why) { return xf::rename(m, id, name, &why); }, [&]
+        {
+            const xf::folder* now = folder_named(id);
+            return fmt::format("renamed '%s' to '%s' (id %u)", xf::clip(old, 64), xf::clip(now ? now->name : name, 64), id);
+        });
+        if (status == xf::save_status::unchanged) message.clear();
+        if (status != xf::save_status::saved) return;
+        const xf::folder* now = folder_named(id);
+        const std::string shown = now ? now->name : name;
+        name_message(shown, i18n::trf(str::FLD_RENOMEADA, {folder_ui::name_arg(shown)}));
+    };
+    // The game at 'path' into folder 'id' (at its end), or out of every folder (nullopt). The cursor stays where the game
+    // was, on the row that takes its place, so many games are sorted quickly.
+    const auto move_game = [&](const std::string& path, std::optional<std::uint32_t> id)
+    {
+        const xmb_entry* row = game_row(path);
+        if (!row) return;
+        const xf::row member = xf::make_row(row->path, row->serial, row->title);
+        const std::string title = row->title;
+        const xf::folder* to = id ? folder_named(*id) : nullptr;
+        const std::string target = to ? to->name : std::string{};
+        const xf::save_status status = folder_apply([&](xf::model& m, xf::refusal& why) { return xf::move_to(m, member, id, &why); }, [&]
+        {
+            return id ? fmt::format("moved '%s' to '%s' (id %u; '%s')", xf::clip(title, 64), xf::clip(target, 64), *id, path)
+                      : fmt::format("took '%s' out of its folder ('%s')", xf::clip(title, 64), path);
+        });
+        if (status == xf::save_status::unchanged) message.clear();
+        if (status != xf::save_status::saved) return;
+        message = id ? i18n::trf(str::FLD_MOVIDO, {folder_ui::name_arg(folder_ui::short_title(title)), folder_ui::name_arg(target)})
+                     : i18n::trf(str::FLD_TIRADO, {folder_ui::name_arg(folder_ui::short_title(title))});
+    };
+    const auto delete_folder = [&](std::uint32_t id)
+    {
+        const xf::folder* f = folder_named(id);
+        if (!f) return;
+        const std::string name = f->name;
+        const std::size_t back = folder_present(id);
+        const bool inside = folder_open == id;
+        const xf::save_status status = folder_apply([&](xf::model& m, xf::refusal& why)
+        {
+            xf::remove_folder(m, id, &why);
+            return why == xf::refusal::none;
+        }, [&] { return fmt::format("deleted '%s' (id %u; %u game(s) back to the game list; no file of a game touched)", xf::clip(name, 64), id, back); });
+        if (inside && !folder_open) selections[6] = default_row(); // it was the open folder: back at the top level
+        if (status == xf::save_status::saved) message = i18n::trf(str::FLD_APAGADA, {folder_ui::name_arg(name), back});
+    };
+    const auto forget_folder_games = [&](std::uint32_t id)
+    {
+        const xf::folder* f = folder_named(id);
+        if (!f) return;
+        const std::string name = f->name;
+        std::size_t forgotten = 0;
+        const xf::save_status status = folder_apply([&](xf::model& m, xf::refusal& why)
+        {
+            forgotten = xf::forget_missing(m, id, folder_assigned, &why);
+            return forgotten > 0;
+        }, [&] { return fmt::format("forgot %u game(s) of '%s' (id %u) that were not in the library", forgotten, xf::clip(name, 64), id); });
+        if (status == xf::save_status::saved) message = i18n::trf(str::FLD_MEMBROS, {folder_ui::name_arg(name), folder_present(id)});
+    };
+    // One system keyboard for a folder name, queued (it may follow the option list's X within a moment)
+    const auto folder_keyboard_open = [&](folder_ui::form step, std::string_view initial) -> bool
+    {
+        if (!ps4_ime::request(ps4_ime::kind::text, i18n::tr(str::FLD_TECLADO_NOME), static_cast<unsigned>(xf::max_name_chars), initial)) return false;
+        folder_keyboard = step;
+        message = i18n::tr(str::FLD_TECLADO_NOME);
+        return true;
+    };
+    // 'Criar pasta', or 'Nova pasta...' of the folder targets of 'game'. Without a keyboard the folder is made with the
+    // default name, which the message says to change later.
+    const auto start_create = [&](const std::string& game)
+    {
+        if (!folders_writable()) return;
+        if (folder_store.m.folders.size() >= xf::max_folders)
+        {
+            message = i18n::trf(str::FLD_LIMITE, {xf::max_folders});
+            return;
+        }
+        folder_form_game = game;
+        if (folder_keyboard_open(game.empty() ? folder_ui::form::create : folder_ui::form::create_and_move, i18n::tr(str::FLD_NOVA_PASTA_NOME))) return;
+        folder_form_game.clear();
+        create_folder(i18n::tr(str::FLD_NOVA_PASTA_NOME), game, false);
+    };
+    const auto start_rename = [&](std::uint32_t id)
+    {
+        const xf::folder* f = folder_named(id);
+        if (!f || !folders_writable()) return;
+        folder_form_id = id;
+        if (!folder_keyboard_open(folder_ui::form::rename, f->name)) message = first_part(i18n::tr(str::LAU_RPCN_TECLADO_NAO_ABRIU)).first;
+    };
+    // The keyboard of a folder form closed. Cancel changes nothing; a keyboard that could not open still makes a new
+    // folder (with the default name), never opens again by itself.
+    const auto folder_keyboard_result = [&](ps4_ime::state state, const std::string& typed)
+    {
+        const folder_ui::form step = std::exchange(folder_keyboard, folder_ui::form::none);
+        const std::string game = std::exchange(folder_form_game, std::string{});
+        if (state == ps4_ime::state::cancelled)
+        {
+            message.clear();
+            return;
+        }
+        if (state != ps4_ime::state::done)
+        {
+            if (step != folder_ui::form::rename) create_folder(i18n::tr(str::FLD_NOVA_PASTA_NOME), game, false);
+            else message = first_part(i18n::tr(state == ps4_ime::state::failed ? str::LAU_RPCN_TECLADO_FALHOU : str::LAU_RPCN_TECLADO_NAO_ABRIU)).first;
+            return;
+        }
+        const std::string name = xf::clean_name(typed);
+        if (name.empty())
+        {
+            message = i18n::tr(str::FLD_NOME_VAZIO);
+            return;
+        }
+        if (step == folder_ui::form::rename) rename_folder(folder_form_id, name);
+        else create_folder(name, game, true);
+    };
+    // 'Mudar posição': the folder rows (top level) or the folder's games take Up/Down; X keeps the new place (one save),
+    // Circle the old one
+    const auto start_position = [&](const std::string& path)
+    {
+        if (!folders_writable()) return;
+        const bool top = path.starts_with(xf::folder_row_prefix);
+        folder_order.clear();
+        for (const xmb_entry& row : columns[6])
+            if (top ? row.path.starts_with(xf::folder_row_prefix) : !row.path.empty() && row.path.front() != '@') folder_order.push_back(row.path);
+        if (folder_order.size() < 2 || std::find(folder_order.begin(), folder_order.end(), path) == folder_order.end())
+        {
+            folder_order.clear();
+            return;
+        }
+        folder_order_start = folder_order;
+        folder_lifted = path;
+        folder_asking = folder_ui::mode::position;
+        select_path(path);
+    };
+    const auto step_position = [&](int step)
+    {
+        const auto at = std::find(folder_order.begin(), folder_order.end(), folder_lifted);
+        if (at == folder_order.end()) return;
+        const std::ptrdiff_t from = at - folder_order.begin(), to = from + step;
+        if (to < 0 || to >= static_cast<std::ptrdiff_t>(folder_order.size())) return;
+        std::swap(folder_order[static_cast<std::size_t>(from)], folder_order[static_cast<std::size_t>(to)]);
+        show_position();
+    };
+    const auto finish_position = [&](bool keep)
+    {
+        const std::string lifted = std::exchange(folder_lifted, std::string{});
+        const std::vector<std::string> order = std::exchange(folder_order, {}), start = std::exchange(folder_order_start, {});
+        folder_asking = folder_ui::mode::none;
+        const auto to = std::find(order.begin(), order.end(), lifted);
+        const auto from = std::find(start.begin(), start.end(), lifted);
+        if (!keep || to == order.end() || from == start.end() || to - order.begin() == from - start.begin())
+        {
+            project(art_carry::all);
+            select_path(lifted);
+            return;
+        }
+        // The row moves to the place of the row that was there (by id or path: valid in a file read again meanwhile)
+        const std::string target = start[static_cast<std::size_t>(to - order.begin())];
+        const std::size_t old_place = static_cast<std::size_t>(from - start.begin()) + 1, new_place = static_cast<std::size_t>(to - order.begin()) + 1;
+        if (const auto id = xf::folder_row_id(lifted))
+        {
+            const auto there = xf::folder_row_id(target);
+            folder_apply([&](xf::model& m, xf::refusal& why)
+            {
+                const auto a = xf::find_folder(m, *id), b = there ? xf::find_folder(m, *there) : std::nullopt;
+                if (!a || !b)
+                {
+                    why = xf::refusal::unknown_folder;
+                    return false;
+                }
+                return xf::move_folder(m, *a, static_cast<int>(*b) - static_cast<int>(*a), &why);
+            }, [&]
+            {
+                const xf::folder* f = folder_named(*id);
+                return fmt::format("folder '%s' moved from place %u to %u", xf::clip(f ? f->name : std::string{}, 64), old_place, new_place);
+            });
+        }
+        else if (folder_open)
+        {
+            const std::uint32_t open_id = *folder_open;
+            const std::string game = xf::portable_path(lifted), place = xf::portable_path(target);
+            folder_apply([&](xf::model& m, xf::refusal& why)
+            {
+                const auto k = xf::find_folder(m, open_id);
+                std::optional<std::size_t> a, b;
+                if (k)
+                    for (std::size_t i = 0; i < m.folders[*k].members.size(); ++i)
+                    {
+                        if (!a && m.folders[*k].members[i].path == game) a = i;
+                        if (!b && m.folders[*k].members[i].path == place) b = i;
+                    }
+                if (!a || !b)
+                {
+                    why = xf::refusal::unknown_folder;
+                    return false;
+                }
+                return xf::move_member(m, open_id, *a, static_cast<int>(*b) - static_cast<int>(*a), &why);
+            }, [&]
+            {
+                const xf::folder* f = folder_named(open_id);
+                return fmt::format("game '%s' moved from place %u to %u in '%s'", lifted, old_place, new_place, xf::clip(f ? f->name : std::string{}, 64));
+            });
+        }
+        select_path(lifted);
+    };
+    // 'Adicionar jogos': the library as a checklist; Triangle keeps the marks (one save), Circle drops them
+    const auto open_checklist = [&](std::uint32_t id)
+    {
+        if (!folder_named(id) || !folders_writable()) return;
+        folder_ui::check_list list = folder_ui::checklist(folder_store.m, id, library_rows);
+        if (list.rows.empty())
+        {
+            message = i18n::tr(library_known ? str::LAU_NENHUM_JOGO_ENCONTRADO : str::LAU_CARREGANDO_BIBLIOTECA);
+            return;
+        }
+        folder_popup = std::move(list.list);
+        folder_checks = std::move(list.rows);
+        folder_subject_id = id;
+        folder_asking = folder_ui::mode::checklist;
+    };
+    const auto apply_checklist = [&]
+    {
+        const std::uint32_t id = folder_subject_id;
+        std::vector<xf::row> checked;
+        for (std::size_t i = 0; i < folder_checks.size() && i < folder_popup.choices.size(); ++i)
+            if (folder_popup.choices[i].current) checked.push_back(folder_checks[i]);
+        const std::vector<xf::row> listed = std::exchange(folder_checks, {});
+        close_folder_list();
+        const xf::folder* f = folder_named(id);
+        const std::string name = f ? f->name : std::string{};
+        const xf::save_status status = folder_apply([&](xf::model& m, xf::refusal& why) { return xf::set_members(m, id, checked, listed, &why); },
+            [&] { return fmt::format("games of '%s' (id %u) chosen: %u of the %u listed", xf::clip(name, 64), id, checked.size(), listed.size()); });
+        if (status == xf::save_status::saved || status == xf::save_status::unchanged)
+            message = i18n::trf(str::FLD_MEMBROS, {folder_ui::name_arg(name), folder_present(id)});
+    };
+    // Triangle on the selected row of the 'Jogo' column: the option list that row has (refreshing the library first)
+    const auto open_folder_options = [&](const xmb_entry& row)
+    {
+        folder_ui::row_kind kind = folder_ui::row_kind::other;
+        std::size_t missing = 0;
+        bool movable = false;
+        std::string title = row.title;
+        folder_subject_id = 0;
+        // Before the library was read every game would count as missing: nothing is offered to forget then
+        const auto missing_of = [&](std::uint32_t id) -> std::size_t
+        {
+            const auto k = xf::find_folder(folder_store.m, id);
+            return library_known && k && *k < folder_assigned.missing.size() ? folder_assigned.missing[*k] : 0;
+        };
+        if (const auto folder_id = xf::folder_row_id(row.path))
+        {
+            kind = folder_ui::row_kind::folder;
+            folder_subject_id = *folder_id;
+            missing = missing_of(*folder_id);
+            movable = folder_store.m.folders.size() >= 2;
+        }
+        else if (const auto empty_id = xf::empty_row_id(row.path))
+        {
+            kind = folder_ui::row_kind::empty_folder;
+            folder_subject_id = *empty_id;
+            missing = missing_of(*empty_id);
+            if (const xf::folder* f = folder_named(*empty_id)) title = f->name;
+        }
+        else if (xf::can_be_member(xf::make_row(row.path, row.serial, row.title)))
+        {
+            kind = folder_open ? folder_ui::row_kind::game_inside : folder_ui::row_kind::game_top;
+            if (folder_open)
+            {
+                folder_subject_id = *folder_open;
+                movable = folder_present(*folder_open) >= 2;
+            }
+        }
+        else title = i18n::tr(str::FLD_OPCOES);
+        folder_ui::option_list list = folder_ui::options_for(kind, std::move(title), missing, movable);
+        folder_popup = std::move(list.list);
+        folder_actions = std::move(list.actions);
+        folder_subject = row.path;
+        folder_asking = folder_ui::mode::options;
+        message.clear();
+    };
+    const auto run_folder_option = [&](folder_ui::action what)
+    {
+        using folder_ui::action;
+        const std::string subject = folder_subject;
+        const std::uint32_t id = folder_subject_id;
+        close_folder_list();
+        message.clear();
+        switch (what)
+        {
+        case action::refresh: refresh_library(true); break;
+        case action::open: open_folder(id); break;
+        case action::add: open_checklist(id); break;
+        case action::rename: start_rename(id); break;
+        case action::position: start_position(subject); break;
+        case action::create: start_create({}); break;
+        case action::take_out: move_game(subject, std::nullopt); break;
+        case action::remove:
+            if (const xf::folder* f = folder_named(id); f && folders_writable())
+            {
+                folder_dialog = folder_ui::delete_dialog(*f, nullptr);
+                folder_subject_id = id;
+                folder_asking = folder_ui::mode::ask_delete;
+            }
+            break;
+        case action::forget:
+            if (const auto k = xf::find_folder(folder_store.m, id); library_known && k && *k < folder_assigned.missing_paths.size() && folders_writable())
+            {
+                folder_dialog = folder_ui::forget_dialog(folder_store.m.folders[*k], folder_assigned.missing_paths[*k], nullptr);
+                folder_subject_id = id;
+                folder_asking = folder_ui::mode::ask_forget;
+            }
+            break;
+        case action::move:
+            if (const xmb_entry* row = game_row(subject); row && folders_writable())
+            {
+                std::optional<std::uint32_t> current;
+                if (const auto k = xf::folder_of(folder_store.m, xf::portable_path(subject))) current = folder_store.m.folders[*k].id;
+                folder_ui::target_list list = folder_ui::move_targets(folder_store.m, row->title, current);
+                folder_popup = std::move(list.list);
+                folder_targets = std::move(list.ids);
+                folder_subject = subject;
+                folder_asking = folder_ui::mode::move_to;
+            }
+            break;
+        }
+    };
+    // The presses while a folder list, the position mode or a folder question is shown: they take every button
+    const auto folder_press = [&](u32 pressed)
+    {
+        using folder_ui::mode;
+        const mode shown = folder_asking;
+        if (shown == mode::ask_delete || shown == mode::ask_forget)
+        {
+            if (!(pressed & (ORBIS_PAD_BUTTON_CROSS | ORBIS_PAD_BUTTON_CIRCLE))) return;
+            folder_dialog.reset();
+            folder_asking = mode::none;
+            if (!(pressed & ORBIS_PAD_BUTTON_CROSS)) message.clear();
+            else if (shown == mode::ask_delete) delete_folder(folder_subject_id);
+            else forget_folder_games(folder_subject_id);
+            return;
+        }
+        if (shown == mode::position)
+        {
+            if (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN)) step_position((pressed & ORBIS_PAD_BUTTON_UP) ? -1 : 1);
+            else if (pressed & ORBIS_PAD_BUTTON_CROSS) finish_position(true);
+            else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) finish_position(false);
+            return;
+        }
+        // The option list, the folder targets or the checklist (Up/Down, L1/R1 a page of the checklist)
+        const std::size_t count = folder_popup.choices.size();
+        if (!count)
+        {
+            close_folder_list();
+            return;
+        }
+        std::size_t& at = folder_popup.selected;
+        at = std::min(at, count - 1);
+        if (pressed & ORBIS_PAD_BUTTON_UP) at = at ? at - 1 : 0;
+        if (pressed & ORBIS_PAD_BUTTON_DOWN) at = std::min(at + 1, count - 1);
+        if (shown == mode::checklist && (pressed & ORBIS_PAD_BUTTON_L1)) at = at >= 10 ? at - 10 : 0;
+        if (shown == mode::checklist && (pressed & ORBIS_PAD_BUTTON_R1)) at = std::min(at + 10, count - 1);
+        if (pressed & ORBIS_PAD_BUTTON_CIRCLE)
+        {
+            close_folder_list();
+            message.clear();
+            return;
+        }
+        if (pressed & ORBIS_PAD_BUTTON_TRIANGLE)
+        {
+            if (shown == mode::checklist) apply_checklist();
+            else close_folder_list();
+            return;
+        }
+        if (!(pressed & ORBIS_PAD_BUTTON_CROSS)) return;
+        if (shown == mode::checklist) folder_popup.choices[at].current = !folder_popup.choices[at].current;
+        else if (shown == mode::options && at < folder_actions.size()) run_folder_option(folder_actions[at]);
+        else if (shown == mode::move_to && at < folder_targets.size())
+        {
+            const std::uint32_t target = folder_targets[at];
+            const std::string game = folder_subject;
+            close_folder_list();
+            if (target) move_game(game, target);
+            else start_create(game);
+        }
     };
 
     // Applies one frame of menu input. Returns the path to boot when a game was chosen.
@@ -6340,6 +7711,12 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         if (notice)
         {
             if (pressed & (ORBIS_PAD_BUTTON_CROSS | ORBIS_PAD_BUTTON_CIRCLE)) notice.reset();
+            return std::nullopt;
+        }
+        // 0.40: a folder list, the position mode or a folder question takes every press while it is shown
+        if (folder_asking != folder_ui::mode::none)
+        {
+            folder_press(pressed);
             return std::nullopt;
         }
         // The cheat delete question (X deletes) or a page of 'Ver linhas' (X pages on): X or Circle answer, other
@@ -6497,9 +7874,9 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             {
                 settings_open = false;
                 message = i18n::tr(str::LAU_SETTINGS_EDICAO_ENCERRADA);
-                ps4_startup_checkpoint(fmt::format("settings: left without saving (%u pending change(s) dropped)", settings.pending()).c_str());
+                record_settings_line(fmt::format("settings: left without saving (%u pending change(s) dropped)", settings.pending()));
             }
-            if (const std::string event = settings.take_event(); !event.empty()) ps4_startup_checkpoint(event.c_str());
+            if (const std::string event = settings.take_event(); !event.empty()) record_settings_line(event);
             settings_dirty = true;
             psn_dirty = true;
             return std::nullopt;
@@ -6519,6 +7896,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             }
             // From a cheat's options back to its list; from the list back to the patch list it was opened from (or
             // to the games)
+            const bool left_list = cheats_open || patches_open || savedata_open;
             if (cheats_open)
             {
                 message.clear();
@@ -6533,6 +7911,9 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 if (to_patches) return std::nullopt;
             }
             if (patches_open) close_patches();
+            // 0.40: in the Jogo column with no list of a game open, Circle closes the open folder (the cursor on its row);
+            // a list opened from a game inside a folder goes back to that folder
+            if (!left_list && category == 6 && folder_open) close_folder();
             savedata_open = false; category = 6; message.clear();
             return std::nullopt;
         }
@@ -6566,7 +7947,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 }
                 // 0.29: the automatic-configuration switch and 'Voltar para automático' change files without
                 // closing the menu; record them too.
-                if (const std::string event = settings.take_event(); !event.empty()) ps4_startup_checkpoint(event.c_str());
+                if (const std::string event = settings.take_event(); !event.empty()) record_settings_line(event);
                 settings_dirty = true;
                 psn_dirty = true; // the menu has the same online switches as the PlayStation Network column
             }
@@ -6660,13 +8041,22 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         }
         if (pressed & ORBIS_PAD_BUTTON_TRIANGLE)
         {
-            refresh_library(true);
+            // 0.40: in the Jogo column Triangle opens the option list of the selected row (as on the PS3), whose first
+            // option refreshes the library; elsewhere it refreshes at once as before
+            if (category == 6 && !savedata_open && !patches_open && !cheats_open) open_folder_options(choice);
+            else refresh_library(true);
             return std::nullopt;
         }
         // 0.39: on the language row Left/Right change the value (X too, below); Up/Down leave the row
         if ((pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT)) && !savedata_open && !patches_open && choice.path == "@ui-language")
         {
             change_language((pressed & ORBIS_PAD_BUTTON_RIGHT) ? 1 : -1);
+            return std::nullopt;
+        }
+        // 0.40: the game music row takes Left/Right the same way (X below as well)
+        if ((pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT)) && !savedata_open && !patches_open && choice.path == "@xmb-music")
+        {
+            change_media(false, (pressed & ORBIS_PAD_BUTTON_RIGHT) ? 1 : -1);
             return std::nullopt;
         }
         if ((pressed & ORBIS_PAD_BUTTON_LEFT) && category > 0)
@@ -6706,13 +8096,39 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 return std::nullopt;
             }
             perf.report(now, "exit item");
+            // 0.40: the game's music must not play on while the shell closes the application (up to 5 s): the media is
+            // released as before a boot, and comes back when the application stays open
+            {
+                ps4_xmb_media::media_release released("exit item", media_music, media_director, [&] { loader.drop_media(); });
+                released.end(menu.clear_media());
+            }
             if (!ps4_try_leave_application("XMB exit item"))
+            {
                 message = i18n::tr(str::LAU_USE_BOTAO_PS_SAIR);
+                media_director.configure(media_settings, loader.inline_mode);
+            }
             return std::nullopt;
         }
         if (path == "@ui-language")
         {
             change_language(1);
+            return std::nullopt;
+        }
+        if (path == "@xmb-media" || path == "@xmb-music")
+        {
+            change_media(path == "@xmb-media", 1);
+            return std::nullopt;
+        }
+        // 0.40: X on a folder opens it; on the row of a folder without a game in the library, its help
+        if (const auto id = xf::folder_row_id(path))
+        {
+            open_folder(*id);
+            message.clear();
+            return std::nullopt;
+        }
+        if (path.starts_with(xf::empty_row_prefix))
+        {
+            message = entries[selected].subtitle;
             return std::nullopt;
         }
         // A running RPCN job holds the account file and a server connection: no game boot, no package install
@@ -6877,22 +8293,26 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 ps4_startup_checkpoint(fmt::format("XMB: '%s' not installed: %s", path, check.log).c_str());
                 return std::nullopt;
             }
-        // 0.39: an ISO shorter than the image it describes boots into a fatal error, and a disc image without a valid
-        // PS3_DISC.SFB can only fail as an invalid file or folder: say why and stay in the menu (also for a row of a
-        // library cache written before these checks)
+        // 0.39: a disc image without a valid PS3_DISC.SFB can only fail as an invalid file or folder: say why and stay in
+        // the menu (also for a row of a library cache written before these checks). 0.40: an ISO shorter than the image
+        // it describes asks first (short_iso_ready)
         if (iso_file_on_disk(path))
         {
-            if (const auto size = iso_completeness(path); size.short_file())
-            {
-                message = utils::ps4::disc_image::incomplete_text(size);
-                ps4_startup_checkpoint(fmt::format("XMB: '%s' not booted: the image is incomplete (file %llu bytes, image %llu bytes)", path, size.file,
-                    size.image).c_str());
-                return std::nullopt;
-            }
+            if (const auto size = iso_completeness(path); size.short_file() && !short_iso_ready(path, size)) return std::nullopt;
             if (ps4_iso_without_sfb(path))
             {
                 message = i18n::tr(str::LAU_ISO_SEM_SFB_PSN_CONVERTIDO);
                 ps4_startup_checkpoint(fmt::format("XMB: '%s' not booted: ISO without a valid PS3_DISC.SFB (CATEGORY DG)", path).c_str());
+                return std::nullopt;
+            }
+            // 0.40: an image that holds a PSN game folder, a PS2 or a PSP disc instead of a PS3 game can only fail to boot:
+            // say what it is and stay in the menu (the iso_archive just built for the check above recorded the outcome;
+            // RPCS3.log has the image's root listing)
+            if (const auto refusal = iso_ps4_refusal(path); const char* why = utils::ps4::disc_probe::refusal_text(refusal))
+            {
+                message = shorten(why, line_bytes(116));
+                ps4_startup_checkpoint(fmt::format("XMB: '%s' not booted: no PS3 disc header and no PS3_GAME/PARAM.SFO: %s", path,
+                    utils::ps4::disc_probe::refusal_name(refusal)).c_str());
                 return std::nullopt;
             }
         }
@@ -6902,7 +8322,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         if (utils::ps4::file_kind(path) == utils::ps4::game_kind::iso)
         {
             std::string serial;
-            if (const std::size_t row = find_path(columns[6], path); row != no_row) serial = columns[6][row].serial;
+            if (const xmb_entry* row = game_row(path)) serial = row->serial;
             if (serial.empty() && path == disc_now.installed) serial = disc_ui::disc_id(disc_now);
             // A row without a TITLE_ID (its scan could not read PARAM.SFO): the image's own, which the check before BootGame
             // reads as well, so that check never refuses a game the XMB let through (three refusals end the application)
@@ -6946,6 +8366,9 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 background_since = now;
                 ps4_startup_checkpoint("XMB: paused while the system UI is in front");
             }
+            // 0.40: the game's music fades out behind the system UI and its port closes after the linger; the images
+            // stay for the return (nothing is drawn meanwhile)
+            media_tick(now, true, false);
             sceKernelUsleep(50'000);
             last_frame = sceKernelGetProcessTime(); // no animation jump on return
             continue;
@@ -7004,25 +8427,19 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 // 0.33: a hot-plug refresh keeps the thumbnails of games stored on the PS4 (no flicker when a drive comes or
                 // goes); rows of USB drives load theirs again, as a drive may have been swapped.
                 const bool carry_internal = !carry && result.generation == hotplug_generation;
-                if (carry || carry_internal)
-                    for (auto& entry : result.entries)
-                        if (carry || utils::ps4::usb_drive_of(entry.path) < 0)
-                            if (const std::size_t row = find_path(games, entry.path); row != no_row && games[row].artwork) entry.artwork = std::move(games[row].artwork);
-                games = std::move(result.entries);
-                // 0.37: the PS3 disc row stays ahead of the games (and its storage row keeps the drive's state)
-                {
-                    std::size_t unused = 0;
-                    disc_ui::apply_rows(games, unused, columns[7], disc_ui::texts(disc_now, disc_job));
-                }
-                // 0.37: the padlocks of the new rows, with the lock records they were bound with
+                // 0.40: the scan's rows are the library; the column shows them through the folders (with the PS3 disc row
+                // ahead of the games at the top level, its storage row keeping the drive's state, and the padlocks of the new
+                // rows with the lock records they were bound with)
+                library_rows = std::move(result.entries);
+                library_known = true;
                 if (result.locks) lock_registry = *result.locks;
-                lock_rows(now);
+                // The first list of this visit, with the cursor still on 'Carregando': the folder of the game that just ran
+                if (library_first && keep.empty() && !folder_open) reveal(preferred);
+                project(carry ? art_carry::all : carry_internal ? art_carry::internal : art_carry::none);
                 shown_generation = result.generation;
                 std::size_t row = find_path(games, keep);
                 if (row == no_row && library_first) row = find_path(games, preferred);
-                selections[6] = row != no_row ? row : default_game_row(games);
-                if (!carry) artwork_attempted.clear();
-                icon_anchor = no_row;
+                selections[6] = row != no_row ? row : default_row();
                 if (message == refreshing_text()) message.clear();
                 ps4_startup_checkpoint(fmt::format("XMB: library %s (%u rows in %.1f ms; %u unchanged, %u read)", library_first ? "ready" : "refreshed",
                     games.size(), double(result.cost_us) / 1000, result.cached, result.read).c_str());
@@ -7092,6 +8509,13 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             case load_kind::usb_poll:
             {
                 usb_poll_pending = false;
+                // 0.40: a USB drive came: a PS3 disc in the drive whose last key search found nothing is searched again
+                // (the stick may hold the player's key file); nothing for a found key, a running search or no PS3 disc
+                if (result.usb_arrived && disc_now.state == ds::disc_state::ps3_disc && dk::service::instance().forget_if_failed())
+                {
+                    ps4_startup_checkpoint(fmt::format("XMB: USB drive arrived (%s): the key of the disc in the drive is searched again", result.text).c_str());
+                    next_disc_poll = 0;
+                }
                 // A library scan queued after this probe (Triangle) probes the drives itself; a hot-plug refresh here
                 // would replace it and turn a full re-read of every drive into one of the changed drives only.
                 if ((result.text.empty() && result.changes.empty()) || library_busy) break;
@@ -7119,6 +8543,10 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 message = result.text;
                 if (const std::size_t row = find_path(columns[1], "@configdb:import"); row != no_row) columns[1][row].subtitle = config_db::row_help();
                 break;
+            // 0.40: the media of a game: the director keeps it when it is still wanted; a stale or empty one is freed here
+            case load_kind::media:
+                if (!media_director.arrived(result.media)) result.media.reset();
+                break;
             default:
                 break;
             }
@@ -7138,12 +8566,15 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             }
         }
 
-        // On-screen keyboard and RPCN jobs.
-        if (keyboard)
+        // On-screen keyboard and RPCN jobs. 0.40: poll() also opens a queued keyboard (ps4_ime::request) once the system
+        // allows it, or reports not_opened.
+        const bool keyboard_due = keyboard || ps4_ime::pending();
+        if (keyboard_due)
         {
             std::string text;
             const auto state = ps4_ime::poll(text);
-            if (state == ps4_ime::state::done || state == ps4_ime::state::cancelled || state == ps4_ime::state::failed)
+            if (state == ps4_ime::state::done || state == ps4_ime::state::cancelled || state == ps4_ime::state::failed ||
+                state == ps4_ime::state::not_opened)
             {
                 // a settings value typed for a page row or a matrix cell, a cheat form step, else an RPCN form step
                 if (page_view.keyboard_open())
@@ -7152,6 +8583,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                     settings_dirty = true;
                 }
                 else if (cheat_keyboard != cheat_form::none) cheat_keyboard_result(state, text);
+                else if (folder_keyboard != folder_ui::form::none) folder_keyboard_result(state, text);
                 else keyboard_result(state, text);
                 wait_for_button_release = true;
                 input.flush();
@@ -7163,7 +8595,13 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             cancel_form(i18n::tr(str::COM_OPERACAO_RPCN_CANCELADA)); // the keyboard closed without reporting a result
         }
         // a cheat form whose keyboard closed without reporting a result
-        if (!keyboard && !ps4_ime::active() && cheat_keyboard != cheat_form::none) cheat_keyboard = cheat_form::none;
+        if (!keyboard_due && !ps4_ime::active() && !ps4_ime::pending() && cheat_keyboard != cheat_form::none) cheat_keyboard = cheat_form::none;
+        // 0.40: the same for a folder name
+        if (!keyboard_due && !ps4_ime::active() && !ps4_ime::pending() && folder_keyboard != folder_ui::form::none)
+        {
+            folder_keyboard = folder_ui::form::none;
+            folder_form_game.clear();
+        }
         if (rpcn_busy)
         {
             const auto status = ps4_rpcn::poll();
@@ -7286,7 +8724,7 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
 
         // Input before drawing, so a press shows in the frame drawn right after it.
         uint32_t pressed = input.poll(now, category == 6 && !settings_open && !savedata_open);
-        if (pressed || input.buttons || keyboard) last_activity = now;
+        if (pressed || input.buttons || keyboard || ps4_ime::pending()) last_activity = now;
         if (wait_for_button_release)
         {
             // A return-to-XMB chord includes Options. Consume its held buttons
@@ -7294,7 +8732,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             if (input.buttons) pressed = 0;
             else wait_for_button_release = false;
         }
-        if (keyboard || ps4_ime::active()) pressed = 0; // the system keyboard has the controllers
+        // the system keyboard has the controllers; a queued one opens within moments, so its form is not left meanwhile
+        if (keyboard || ps4_ime::active() || ps4_ime::pending()) pressed = 0;
         if (pressed)
         {
             if (auto path = handle(pressed, input.buttons, now))
@@ -7370,6 +8809,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
         // 0.38: a dialog with a bar or the busy clock keeps at least 30 fps.
         unsigned tier = xmb_idle_tier(now - last_activity);
         if (overlay && (overlay->busy || overlay->progress >= 0)) tier = std::min(tier, 1u);
+        // 0.40: so does a fade of the game's background or overlay
+        if (media_animating) tier = std::min(tier, 1u);
         // 0.39: an XMB left alone at 2 fps checks a drive without a PS3 disc every 30 s instead of every 5 s
         if (const bool idle = tier >= 3; idle != drive_idle)
         {
@@ -7383,6 +8824,8 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             continue;
         }
 
+        // 0.40: the selected game's media for this frame (jobs, images, strengths, music)
+        media_tick(now, false, overlay.has_value());
         const view_t current = view();
         if (const std::time_t second = std::time(nullptr); second != clock_second)
         {
@@ -7405,10 +8848,18 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
                 if (!cheat_options_open && row.path.starts_with("@cheat:")) shown = i18n::tr(str::CHT_DICA_LISTA);
             }
             else if (patches_open && row.path.starts_with("@patch:")) shown = i18n::tr(str::LAU_HINT_PATCH_ROW);
+            // 0.40: the buttons of 'Mudar posição' and of the checklist (no game hint under a folder list); a folder row
+            // names its options
+            else if (!patches_open && category == 6 && folder_asking != folder_ui::mode::none)
+            {
+                if (folder_asking == folder_ui::mode::position) shown = i18n::tr(str::FLD_POSICAO_DICA);
+                else if (folder_asking == folder_ui::mode::checklist) shown = i18n::tr(str::FLD_ADICIONAR_DICA);
+            }
+            else if (!patches_open && category == 6 && row.path.starts_with(xf::folder_row_prefix)) shown = i18n::tr(str::FLD_DICA_PASTA);
             else if (!patches_open && category == 6 && !row.path.empty() && row.path.front() != '@' && !row.serial.empty())
             {
                 // R2 (cheats) follows the game row's other buttons
-                if (row.locked) shown = utils::ps4::disc_lock::row_hint();
+                if (row.locked) shown = utils::ps4::disc_lock::row_hint(disc_now);
                 else shown = game_hint = std::string(i18n::tr(str::LAU_HINT_GAME_ROW)) + i18n::tr(str::CHT_DICA_JOGO);
             }
         }
@@ -7429,8 +8880,26 @@ std::string ps4_select_game(const std::string& preferred, const std::string& err
             overlay_since = 0;
             // A settings list: the PS4 tab names its tab keys (L2/R2), the top level has none
             const std::string_view settings_help = settings_open && settings.current_tab() ? i18n::tr(str::CFGU_FOOTER_TABS) : "";
+            // 0.40: the folders of the Jogo column: the open folder's icon and name in the bar, the option list or
+            // checklist over the right half, Triangle named 'Opções', the row 'Mudar posição' moves
+            const bool folder_view = category == 6 && !settings_open && !savedata_open && !patches_open && !cheats_open;
+            utils::ps4::xmb::folder_header folder_head;
+            utils::ps4::xmb::column_extras folder_extras;
+            if (folder_view)
+            {
+                if (const xf::folder* open = folder_open ? folder_named(*folder_open) : nullptr)
+                {
+                    folder_head.icon = xmb_resource("item_tex_plain_folder");
+                    folder_head.title = open->name;
+                    folder_extras.header = &folder_head;
+                }
+                using folder_ui::mode;
+                if (folder_asking == mode::options || folder_asking == mode::move_to || folder_asking == mode::checklist) folder_extras.popup = &folder_popup;
+                folder_extras.triangle_hint = i18n::tr(str::FLD_OPCOES);
+                if (folder_asking == mode::position) folder_extras.lifted = *current.selected;
+            }
             menu.draw(display.pixels(), display.typeface, category, *current.selected, *current.entries, double(draw_start - started) / 1'000'000,
-                float(draw_start - last_frame) / 1'000'000, clock, shown, settings_open, settings_help);
+                float(draw_start - last_frame) / 1'000'000, clock, shown, settings_open, settings_help, folder_view ? &folder_extras : nullptr);
         }
         last_frame = draw_start;
         last_draw_start = draw_start;
@@ -8179,12 +9648,21 @@ std::string ps4_disc_lock_boot_check(const std::string& path)
     const ds::disc_status status = ds::service::instance().check_now();
     const std::int64_t now_ms = ds::detail::now_ms();
     const dl::match m = dl::classify(*record, status, now_ms);
+    // 0.40: these decisions also go to RPCS3.log; a disc that unlocks is the game's last sighting, and without a network
+    // the offline grace (off unless turned on) may open the game
     if (dl::unlocks(m))
     {
-        ps4_startup_checkpoint(fmt::format("disc lock: '%s': disc %s present (%s, checked in %d ms): booting", path, record->title_id, dl::to_string(m),
-            now_ms - started).c_str());
+        dl::sys::note_seen(record->title_id);
+        dl::sys::decision(fmt::format("'%s': disc %s present (%s, checked in %d ms): booting", path, record->title_id, dl::to_string(m), now_ms - started));
         return {};
     }
-    ps4_startup_checkpoint(fmt::format("disc lock: '%s' not booted: %s (checked in %d ms)", path, dl::describe(m, *record, status), now_ms - started).c_str());
+    const dl::offline_decision offline = dl::sys::decide_offline(*record, m, status);
+    if (offline.verdict == dl::offline_verdict::grace)
+    {
+        dl::sys::decision(fmt::format("'%s': %s (checked in %d ms): booting", path, dl::offline_log_line(*record, offline), now_ms - started));
+        return {};
+    }
+    dl::sys::decision(fmt::format("'%s' not booted: %s (checked in %d ms)%s", path, dl::describe(m, *record, status), now_ms - started,
+        offline.offline ? "; " + offline.why : std::string{}));
     return dl::message_text(*record);
 }

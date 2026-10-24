@@ -1393,7 +1393,10 @@ inline row_text drive_row(const ds::disc_status& s, const job* active)
     switch (s.state)
     {
     case ds::disc_state::unknown: return {i18n::tr(str::DINST_DISCO_PS3_2), i18n::tr(str::COM_VERIFICANDO_LEITOR_DISCOS)};
-    case ds::disc_state::no_server: return {i18n::tr(str::DINST_DISCO_PS3_LIGUE_FTP), i18n::tr(str::DINST_APP_LE_LEITOR_SERVIDOR_FTP)};
+    case ds::disc_state::no_server:
+        // Without an IP address GoldHEN's FTP server does not listen: the cause is the missing network, not the setting
+        if (ds::no_network(s)) return {i18n::tr(str::DOFF_ROW_SEM_REDE), i18n::tr(str::DOFF_ROW_SEM_REDE_HELP)};
+        return {i18n::tr(str::DINST_DISCO_PS3_LIGUE_FTP), i18n::tr(str::DINST_APP_LE_LEITOR_SERVIDOR_FTP)};
     case ds::disc_state::no_disc: return {i18n::tr(str::DINST_DISCO_PS3_LEITOR_VAZIO), i18n::tr(str::DINST_COLOQUE_DISCO_JOGO_PS3_LEITOR)};
     case ds::disc_state::not_ps3: return {i18n::tr(str::DINST_DISCO_LEITOR_NAO_PS3), i18n::tr(str::DINST_SO_DISCOS_JOGOS_PS3_PODEM)};
     case ds::disc_state::ps3_disc: break;

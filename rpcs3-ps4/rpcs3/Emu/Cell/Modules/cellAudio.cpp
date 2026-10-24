@@ -23,6 +23,7 @@
 #include "Emu/Audio/PS4/PS4AudioBackend.h"
 #include "util/ps4_audio_policy.hpp"
 #include "util/ps4_hr_wait.hpp"
+#include "util/ps4_safe_mode.hpp"
 
 #include <orbis/libkernel.h>
 
@@ -54,6 +55,7 @@ namespace
 		std::atomic<u64> max_wake_late_us{0};
 		std::atomic<u64> in_progress_waits{0};
 		std::atomic<u64> silent{0};
+		std::atomic<u64> fill_silent{0}; // of 'silent': for ports the game wrote within the last 100 ms
 		std::atomic<u64> untouched_waits{0};
 		std::atomic<u64> wait_us{0};
 		std::atomic<u64> drops{0};
@@ -81,6 +83,10 @@ namespace
 
 	// Port start lines copied to startup.log in this boot (the first few are enough to classify the game).
 	std::atomic<u32> s_ps4_port_lines{0};
+
+	// Set by the cellAudio thread around a rebuild of a backend that keeps failing whose lines are not due (see the
+	// main loop): cell_audio_config::reset() then skips its open lines.
+	std::atomic<bool> s_ps4_quiet_rebuild{false};
 
 	void ps4_audio_count(std::atomic<u64>& counter)
 	{
@@ -143,6 +149,7 @@ ps4_cell_audio_window ps4_cell_audio_take_window() noexcept
 	w.max_wake_late_us = c.max_wake_late_us.exchange(0, std::memory_order_relaxed);
 	w.in_progress_waits = c.in_progress_waits.exchange(0, std::memory_order_relaxed);
 	w.silent = c.silent.exchange(0, std::memory_order_relaxed);
+	w.fill_silent = c.fill_silent.exchange(0, std::memory_order_relaxed);
 	w.untouched_waits = c.untouched_waits.exchange(0, std::memory_order_relaxed);
 	w.wait_us = c.wait_us.exchange(0, std::memory_order_relaxed);
 	w.drops = c.drops.exchange(0, std::memory_order_relaxed);
@@ -211,7 +218,16 @@ void cell_audio_config::reset(bool backend_changed)
 		backend = g_emu_callbacks.get_audio();
 	}
 
+#ifdef RPCS3_PS4
+	const bool ps4_quiet = s_ps4_quiet_rebuild.load(std::memory_order_relaxed);
+
+	if (!ps4_quiet)
+	{
+		cellAudio.notice("cellAudio initializing. Backend: %s", backend->GetName());
+	}
+#else
 	cellAudio.notice("cellAudio initializing. Backend: %s", backend->GetName());
+#endif
 
 	const AudioFreq freq = AudioFreq::FREQ_48K;
 	const AudioSampleSize sample_size = raw.convert_to_s16 ? AudioSampleSize::S16 : AudioSampleSize::FLOAT;
@@ -226,11 +242,25 @@ void cell_audio_config::reset(bool backend_changed)
 		cb_frame_len = backend->GetCallbackFrameLen();
 		ch_cnt = backend->get_channels();
 		ch_layout = backend->get_channel_layout();
+#ifdef RPCS3_PS4
+		if (!ps4_quiet)
+		{
+			cellAudio.notice("Opened audio backend (sampling_rate=%d, sample_size=%d, channels=%d, layout=%s)", backend->get_sampling_rate(), backend->get_sample_size(), backend->get_channels(), backend->get_channel_layout());
+		}
+#else
 		cellAudio.notice("Opened audio backend (sampling_rate=%d, sample_size=%d, channels=%d, layout=%s)", backend->get_sampling_rate(), backend->get_sample_size(), backend->get_channels(), backend->get_channel_layout());
+#endif
 	}
 	else
 	{
+#ifdef RPCS3_PS4
+		if (!ps4_quiet)
+		{
+			cellAudio.error("Failed to open audio backend. Make sure that no other application is running that might block audio access (e.g. Netflix).");
+		}
+#else
 		cellAudio.error("Failed to open audio backend. Make sure that no other application is running that might block audio access (e.g. Netflix).");
+#endif
 	}
 
 	audio_downmix = downmix;
@@ -1078,23 +1108,33 @@ void cell_audio_thread::operator()()
 	thread_ctrl::scoped_priority high_prio(+1);
 
 #ifdef RPCS3_PS4
-	// Read once per boot.
+	// Read once per boot. The HR waits, the lateness policy and automatic continuity change the audio clock every game
+	// sees, so each is off by default (the 0.38 paths below) and comes on with its enable flag or features.txt name
+	// (util/ps4_safe_mode.hpp); the older kill flags (audio-poll-2ms, audio-upstream-skip, audio-no-stretch) still win.
+	namespace ps4_sm = utils::ps4::safe_mode;
 	const bool ps4_poll_2ms = fs::is_file("/data/rpcs3/audio-poll-2ms.flag");
 	const bool ps4_fine_poll = fs::is_file("/data/rpcs3/audio-fine-poll.flag");
-	// audio-upstream-skip.flag: upstream lateness handling (drop a block late by 10.7 ms, then silence without waiting).
-	const bool ps4_policy = !fs::is_file("/data/rpcs3/audio-upstream-skip.flag");
+	// Off: upstream lateness handling (drop a block late by 10.7 ms, then silence without waiting).
+	const bool ps4_policy = ps4_sm::enabled(ps4_sm::feature::audio_wait_policy);
 	// Automatic continuity: the rate-matched tempo engages by itself when the game cannot keep real time, and also
-	// serves a game's own Time Stretching setting. audio-no-stretch.flag: no automatic engage, upstream controller.
-	const bool ps4_continuity = !fs::is_file("/data/rpcs3/audio-no-stretch.flag");
+	// serves a game's own Time Stretching setting. Off: no automatic engage, upstream controller.
+	const bool ps4_continuity = ps4_sm::enabled(ps4_sm::feature::audio_continuity);
+	const bool ps4_hr_rule = ps4_sm::enabled(ps4_sm::feature::audio_hr_waits);
+	// Guards, on by default: the parked AudioOut thread (with it, the rebuild backoff of a failed backend below) and
+	// the unbuffered clock rebase. Their kill flags give the upstream paths.
+	const bool ps4_parked_out = ps4_sm::enabled(ps4_sm::feature::audio_out_parked);
+	const bool ps4_unbuffered_rebase = ps4_sm::enabled(ps4_sm::feature::audio_unbuffered_rebase);
 
-	// Orbis ends every timed wait (thread_ctrl::wait_for, sceKernelUsleep) on the next ~1 ms tick: wait_for(100) takes
-	// ~1.0 ms. The HR equeue timer ends ~30 us after its deadline (boot timer probe), so with it the period waits end
-	// on time and the polls for the game's block are real: 250 us untouched, 500 us in progress (the PC's quiet time).
-	// Each HR wait is at most 6.5 ms and not interruptible, so a stop is still seen within one period.
-	// audio-poll-2ms.flag: tick waits with 1000/500 us polls; HR timer off: tick waits with 100 us polls (~1 ms).
-	const bool ps4_hr = !ps4_poll_2ms && utils::ps4::hr_wait_enabled();
-	const u64 ps4_untouched_poll_us = ps4_hr ? 250 : ps4_poll_2ms ? 1000 : 100;
-	const u64 ps4_in_progress_poll_us = ps4_hr ? 500 : ps4_poll_2ms ? 500 : 100;
+	// Orbis ends every timed wait (thread_ctrl::wait_for, sceKernelUsleep) on the next ~1 ms tick: wait_for(1000) takes
+	// ~2.0 ms and wait_for(100) ~1.0 ms. Off (0.38): while cellAudio waits for the game's next block, 100 us gives the
+	// ~1 ms poll the PC gets from 1000 (untouched) and 500 (in progress); audio-poll-2ms.flag restores 1000/500.
+	// On: the HR equeue timer ends ~30 us after its deadline (boot timer probe), so the period waits end on time and the
+	// polls for the game's block are real: 250 us untouched, 500 us in progress (the PC's quiet time). Each HR wait is
+	// at most 6.5 ms and not interruptible, so a stop is still seen within one period.
+	const auto ps4_rules = utils::ps4::audio_policy::rules_for(ps4_hr_rule, ps4_poll_2ms, utils::ps4::hr_wait_enabled(), ps4_policy, ps4_continuity);
+	const bool ps4_hr = ps4_rules.hr;
+	const u64 ps4_untouched_poll_us = ps4_rules.untouched_poll_us;
+	const u64 ps4_in_progress_poll_us = ps4_rules.in_progress_poll_us;
 
 	const auto ps4_audio_wait = [&](u64 us)
 	{
@@ -1108,9 +1148,17 @@ void cell_audio_thread::operator()()
 		}
 	};
 
-	ps4_audio_checkpoint(ps4_hr ? "cellAudio: HR waits on (poll 250 us)"
-		: ps4_poll_2ms ? "cellAudio: HR waits off (audio-poll-2ms.flag): block poll 2 ms while waiting for the game"
-		: "cellAudio: HR waits off (HR timer disabled or its boot probe failed): block poll ~1 ms while waiting for the game");
+	if (!ps4_hr_rule)
+	{
+		ps4_audio_checkpoint(ps4_poll_2ms
+			? "cellAudio: block poll 2 ms while waiting for the game (audio-poll-2ms.flag)"
+			: "cellAudio: block poll ~1 ms while waiting for the game (audio-poll-2ms.flag restores 2 ms)");
+	}
+	else
+	{
+		ps4_audio_checkpoint(ps4_hr ? "cellAudio: HR waits on (poll 250 us)"
+			: "cellAudio: HR waits off (HR timer disabled or its boot probe failed): block poll ~1 ms while waiting for the game");
+	}
 
 	// Limits of the lateness policy: the upstream timeouts, then while the output holds more than 3 periods (16 ms),
 	// up to 64 ms from the last period.
@@ -1126,19 +1174,23 @@ void cell_audio_thread::operator()()
 
 	if (fs::is_file("/data/rpcs3/audio-auto-stretch.flag"))
 	{
-		ps4_audio_checkpoint("cellAudio: audio-auto-stretch.flag ignored: automatic continuity is the default (audio-no-stretch.flag turns it off)");
+		// The 0.34-0.38 opt-in. Its two-window engage is gone; the file is now an alias of audio-continuity.flag.
+		ps4_audio_checkpoint(ps4_continuity
+			? "cellAudio: audio-auto-stretch.flag: automatic continuity on (same as audio-continuity.flag; the two-window engage of 0.34-0.38 is gone)"
+			: "cellAudio: audio-auto-stretch.flag: automatic continuity stays off for this boot (audio-no-stretch.flag or safe mode)");
 	}
 
 	{
 		const auto l = ps4_limits();
-		ps4_audio_checkpoint(fmt::format("cellAudio: PS4 audio policy: HR waits %s, reserve %u ms, %s, %s",
+		ps4_audio_checkpoint(fmt::format("cellAudio: PS4 audio policy: HR waits %s, reserve %u ms, %s, %s%s",
 			ps4_hr ? "on" : "off", (cfg.desired_buffer_duration + 500) / 1000,
 			!cfg.buffering_enabled ? "buffering off: no waits for the game" :
 			ps4_policy ? fmt::format("wait up to %u ms while reserve > %u ms, idle after %u ms", l.wait_cap / 1000, (l.reserve_guard + 500) / 1000, utils::ps4::audio_policy::idle_after_us / 1000) :
-			fmt::format("upstream skip after %.1f ms (audio-upstream-skip.flag)", l.fully_untouched_timeout / 1000.0),
+			fmt::format("upstream skip after %.1f ms", l.fully_untouched_timeout / 1000.0),
 			!cfg.buffering_enabled ? "continuity off" :
-			!ps4_continuity ? "continuity off (audio-no-stretch.flag)" :
-			cfg.time_stretching_enabled ? "continuity on (Time Stretching set for this game)" : "continuity auto"));
+			!ps4_continuity ? (cfg.time_stretching_enabled ? "continuity off (upstream Time Stretching set for this game)" : "continuity off") :
+			cfg.time_stretching_enabled ? "continuity on (Time Stretching set for this game)" : "continuity auto",
+			!ps4_hr_rule && !ps4_policy && !ps4_continuity ? " (0.38 default)" : ""));
 	}
 
 	if (fs::is_file("/data/rpcs3/audio-high-priority.flag"))
@@ -1202,6 +1254,58 @@ void cell_audio_thread::operator()()
 	u64 ps4_untouched_since = 0;
 	// A wait of the current period went past the upstream timeout, allowed by the output reserve
 	bool ps4_reserve_waited = false;
+
+	// Backend rebuilds while it failed: time of the last one (same clock), rebuilds of the current failure episode,
+	// failure episodes of this boot
+	u64 ps4_last_rebuild = 0;
+	u32 ps4_rebuilds = 0;
+	u32 ps4_failures = 0;
+
+	// Unbuffered period clock: more than 8 periods behind (a boot wait, a pause or a host stall) it is rebased so the
+	// next period is due now, instead of firing every missed period back to back as MIX events (the unbuffered ring
+	// drops them, and the game gets a burst of events for audio nobody hears). At most one RPCS3.log line per 10 s; the
+	// first of the boot also goes to startup.log.
+	u64 ps4_rebase_line_at = 0;
+	u32 ps4_rebases_unlogged = 0;
+	bool ps4_rebase_noted = false;
+	const auto ps4_rebase_unbuffered = [&](u64 now)
+	{
+		namespace ap = utils::ps4::audio_policy;
+
+		if (!ps4_unbuffered_rebase)
+		{
+			return;
+		}
+
+		const u64 behind = ap::unbuffered_behind_us(m_counter, m_start_time, now, cfg.audio_block_period);
+
+		if (!ap::unbuffered_rebase_due(behind, cfg.audio_block_period))
+		{
+			return;
+		}
+
+		m_start_time = ap::unbuffered_rebased_start(m_counter, now, cfg.audio_block_period);
+
+		if (ps4_rebase_line_at && now - ps4_rebase_line_at < 10'000'000)
+		{
+			ps4_rebases_unlogged++;
+			return;
+		}
+
+		ps4_rebase_line_at = now;
+		const std::string line = fmt::format("cellAudio: unbuffered audio clock rebased after %u ms (boot wait, pause or stall); audio-unbuffered-catchup.flag keeps the catch-up%s",
+			behind / 1000, ps4_rebases_unlogged ? fmt::format(" (%u more rebase(s) since the last line)", ps4_rebases_unlogged) : std::string());
+		ps4_rebases_unlogged = 0;
+
+		if (!std::exchange(ps4_rebase_noted, true))
+		{
+			ps4_audio_checkpoint(line);
+		}
+		else
+		{
+			cellAudio.notice("%s", line);
+		}
+	};
 
 	// Set by the buffering branch for the period about to end: output fill against its target (now and averaged),
 	// untouched idle ports, and what a mix of it carries.
@@ -1527,6 +1631,13 @@ void cell_audio_thread::operator()()
 		// Handle audio restart
 		if (m_audio_should_restart)
 		{
+#ifdef RPCS3_PS4
+			// The first periods after the boot wait or a pause: the same rebase, before the alignment below
+			if (!cfg.buffering_enabled)
+			{
+				ps4_rebase_unbuffered(timestamp);
+			}
+#endif
 			// align to 5.(3)ms on global clock - some games seem to prefer this
 			const s64 audio_period_alignment_delta = (timestamp - m_start_time) % cfg.audio_block_period;
 			if (audio_period_alignment_delta > cfg.period_comparison_margin)
@@ -1558,11 +1669,30 @@ void cell_audio_thread::operator()()
 
 		bool operational = ringbuffer->get_operational_status();
 
+#ifdef RPCS3_PS4
+		// With the parked AudioOut thread a backend that failed (most often a refused output thread at the console's
+		// thread cap, which can last minutes) is rebuilt at most once per 2 s instead of every 128 loops, and the lines
+		// of a rebuild are logged for the first rebuild of a failure episode, then for every 64th.
+		// audio-thread-per-play.flag: the upstream rebuild.
+		if (!operational && loop_count % 128 == 0 && (!ps4_parked_out || utils::ps4::audio_rebuild_due(timestamp, ps4_last_rebuild)))
+		{
+			if (ps4_parked_out)
+			{
+				ps4_last_rebuild = timestamp;
+				s_ps4_quiet_rebuild.store(!utils::ps4::audio_recovery_line_due(++ps4_rebuilds), std::memory_order_relaxed);
+			}
+
+			update_config(true);
+			s_ps4_quiet_rebuild.store(false, std::memory_order_relaxed);
+			operational = ringbuffer->get_operational_status();
+		}
+#else
 		if (!operational && loop_count % 128 == 0)
 		{
 			update_config(true);
 			operational = ringbuffer->get_operational_status();
 		}
+#endif
 
 		if (ringbuffer->device_changed())
 		{
@@ -1575,6 +1705,33 @@ void cell_audio_thread::operator()()
 			}
 		}
 
+#ifdef RPCS3_PS4
+		if (!m_backend_failed && !operational)
+		{
+			// One failure episode: the first of the boot and every 64th are logged (a backend that keeps failing and
+			// recovering would otherwise print both lines every time)
+			if (!ps4_parked_out || ++ps4_failures == 1)
+			{
+				cellAudio.error("Backend stopped unexpectedly (likely device change). Attempting to recover...");
+			}
+			else if (utils::ps4::audio_recovery_line_due(ps4_failures))
+			{
+				cellAudio.error("Backend stopped unexpectedly (likely device change). Attempting to recover... (failure %u of this boot; logged for the first and every 64th)", ps4_failures);
+			}
+
+			m_backend_failed = true;
+		}
+		else if (m_backend_failed && operational)
+		{
+			if (!ps4_parked_out || utils::ps4::audio_recovery_line_due(ps4_failures))
+			{
+				cellAudio.success("Backend recovered");
+			}
+
+			ps4_rebuilds = 0;
+			m_backend_failed = false;
+		}
+#else
 		if (!m_backend_failed && !operational)
 		{
 			cellAudio.error("Backend stopped unexpectedly (likely device change). Attempting to recover...");
@@ -1585,6 +1742,7 @@ void cell_audio_thread::operator()()
 			cellAudio.success("Backend recovered");
 			m_backend_failed = false;
 		}
+#endif
 
 #ifdef RPCS3_PS4
 		if (m_backend_failed)
@@ -1600,6 +1758,9 @@ void cell_audio_thread::operator()()
 
 		if (!cfg.buffering_enabled)
 		{
+#ifdef RPCS3_PS4
+			ps4_rebase_unbuffered(timestamp);
+#endif
 			const u64 period_end = (m_counter * cfg.audio_block_period) + m_start_time;
 			const s64 time_left = period_end - timestamp;
 
@@ -1721,8 +1882,8 @@ void cell_audio_thread::operator()()
 			{
 				// Lateness policy (ps4_audio_policy.hpp): wait for a late block while the output still holds more than
 				// the guard, never fill an active port's period with silence without waiting for it, and mix the
-				// written ports of a period whatever a late sibling does. The upstream checks below stay for
-				// audio-upstream-skip.flag.
+				// written ports of a period whatever a late sibling does. With the policy off (the default) only the
+				// upstream checks below run.
 				namespace ap = utils::ps4::audio_policy;
 
 				ap::port_counts ps4_ports{};
@@ -1896,6 +2057,14 @@ void cell_audio_thread::operator()()
 				cellAudio.trace("enqueuing silence: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
 #ifdef RPCS3_PS4
 				ps4_audio_count(s_ps4_audio_counters.silent);
+
+				// Silence for a port the game wrote within the last 100 ms is a gap inside its audio (the upstream
+				// skip-then-silence burst), not an idle port: counted for the AudioOut line
+				if (m_ps4_untouched_idle < untouched)
+				{
+					ps4_audio_count(s_ps4_audio_counters.fill_silent);
+				}
+
 				ps4_win.silent++;
 				ps4_period_done(timestamp, ps4_period::silent);
 #endif
@@ -2478,6 +2647,12 @@ error_code cellAudioPortOpen(ppu_thread& ppu, vm::ptr<CellAudioPortParam> audioP
 	}
 	if (attr & CELL_AUDIO_PORTATTR_OUT_SECONDARY)
 	{
+#ifdef RPCS3_PS4
+		// Mortal Kombat Komplete opens and closes such a port every ~11 ms in a probe loop (19351 lines in one session);
+		// the first 3 per process say it all
+		static atomic_t<u32> s_ps4_n = 0;
+		if (s_ps4_n++ < 3)
+#endif
 		cellAudio.todo("cellAudioPortOpen(): CELL_AUDIO_PORTATTR_OUT_SECONDARY");
 	}
 	if (attr & CELL_AUDIO_PORTATTR_OUT_PERSONAL_0)

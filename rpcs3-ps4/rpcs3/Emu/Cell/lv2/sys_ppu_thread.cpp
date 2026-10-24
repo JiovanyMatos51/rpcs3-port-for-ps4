@@ -19,6 +19,7 @@
 
 #ifdef RPCS3_PS4
 #include "util/ps4_memory_governor.hpp" // retry_refused_create, refusal_line_due (also declares ps4_startup_checkpoint)
+#include "util/ps4_safe_mode.hpp"       // row ppu_start_nowait (thread_retry is read by the governor)
 #endif
 
 #include <thread>
@@ -28,27 +29,24 @@ LOG_CHANNEL(sys_ppu_thread);
 #ifdef RPCS3_PS4
 namespace
 {
-	// Read once: ppu-start-wait.flag restores the upstream wait of sys_ppu_thread_start for a lower or equal priority thread.
+	// Row ppu_start_nowait (opt-in: ppu-start-nowait.flag or features.txt; ppu-start-wait.flag forces the wait), read
+	// per call so a per-game safe-mode level switches it. Off: the upstream wait for a lower or equal priority thread,
+	// as in 0.38 (the 'features:' line names the row). On: logged once per process.
 	bool ps4_ppu_start_waits_for_child() noexcept
 	{
-		static const bool s_wait = []() noexcept
+		if (!utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::ppu_start_nowait))
 		{
-			bool wait = false;
+			return true;
+		}
 
-			try
-			{
-				wait = fs::is_file("/data/rpcs3/ppu-start-wait.flag");
-			}
-			catch (...)
-			{
-			}
+		static atomic_t<bool> s_logged{false};
 
-			ps4_startup_checkpoint(wait ? "PPU threads: sys_ppu_thread_start waits for a lower or equal priority thread to take its entry command (ppu-start-wait.flag)"
-			                            : "PPU threads: sys_ppu_thread_start returns at once for a lower or equal priority thread, as lv2 does (ppu-start-wait.flag restores the upstream wait)");
-			return wait;
-		}();
+		if (!s_logged.load() && !s_logged.exchange(true))
+		{
+			ps4_startup_checkpoint("PPU threads: sys_ppu_thread_start returns at once for a lower or equal priority thread, as lv2 does (ppu_start_nowait)");
+		}
 
-		return s_wait;
+		return false;
 	}
 }
 #endif
@@ -601,11 +599,13 @@ error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::p
 #ifdef RPCS3_PS4
 	// 0.39: a refused host thread gets up to 5 tries within 5 s (each after up to 50 ms of waiting for a thread slot to
 	// come back), outside idm's lock, before CELL_EAGAIN; games do not expect EAGAIN below their own limits.
+	// 0.40: row thread_retry (opt-in: thread-retry.flag or features.txt); off, CELL_EAGAIN at once, as in 0.38. The
+	// governor reads the row and writes the rule in force to startup.log at the first refusal.
 	const u64 ps4_since_us = utils::ps4::governor::detail::now_us();
 	u32 ps4_tries = 1;
 	u32 tid = idm::import<named_thread<ppu_thread>>(make_ppu);
 
-	while (!tid && ps4_host_thread_refused &&
+	while (!tid && ps4_host_thread_refused && !utils::ps4::governor::detail::thread_retry_disabled() &&
 		utils::ps4::governor::retry_refused_create(ps4_tries, 5, ps4_since_us, [&]() noexcept { return ppu.is_stopped() || Emu.IsStopped(); }))
 	{
 		ps4_host_thread_refused = false;
@@ -613,7 +613,44 @@ error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::p
 		tid = idm::import<named_thread<ppu_thread>>(make_ppu);
 	}
 
-	if (tid && ps4_tries > 1)
+	// 0.40: with that retry off, a refused create of one of the emulator's own HLE media threads (a game opening a
+	// codec) waits once, at most 250 ms in 10 ms sleeps, until fewer threads count than right after the refusal (the
+	// cap in force can sit above the count the console refused at), then is created once more. libsail reopens a
+	// refused video decoder within a fraction of a millisecond (a tight loop that builds and frees a decoder context
+	// per try) and never reopens a refused audio decoder. Game threads keep the immediate CELL_EAGAIN. Row
+	// media_open_pacing (media-open-nopace.flag turns it off); no lock is held here.
+	bool ps4_media_paced = false;
+
+	if (!tid && ps4_host_thread_refused && utils::ps4::governor::detail::thread_retry_disabled() &&
+		utils::ps4::governor::is_hle_media_thread(ppu_name) &&
+		utils::ps4::safe_mode::enabled(utils::ps4::safe_mode::feature::media_open_pacing))
+	{
+		const u32 load_at_refusal = ::ps4_thread_load_now().total;
+		const auto stopped = [&]() noexcept { return ppu.is_stopped() || Emu.IsStopped(); };
+		const u32 waited_ms = utils::ps4::governor::media_retry_pace(ps4_since_us, load_at_refusal, stopped);
+		const bool stopping = stopped();
+
+		if (!stopping)
+		{
+			ps4_media_paced = true;
+			ps4_host_thread_refused = false;
+			ps4_tries++;
+			tid = idm::import<named_thread<ppu_thread>>(make_ppu);
+		}
+
+		// The first 8 of the process, then every power of two (a game that keeps reopening is visible, not a flood)
+		static atomic_t<u32> s_paced{0};
+
+		if (const u32 n = ++s_paced; n <= 8 || (n & (n - 1)) == 0)
+		{
+			const std::string line = fmt::format("PS4 threads: media open '%s' refused at %u of %u; waited %u ms, retry %s (paced open #%u of this process)",
+				ppu_name, load_at_refusal, utils::ps4::governor::thread_cap(), waited_ms, stopping ? "skipped (stopping)" : tid ? "ok" : "refused", n);
+			sys_ppu_thread.warning("%s", line);
+			ps4_startup_checkpoint(line.c_str());
+		}
+	}
+
+	if (tid && ps4_tries > 1 && !ps4_media_paced)
 	{
 		const std::string line = fmt::format("PS4 threads: pthread_create refusal for PPU thread \"%s\" recovered after %u ms (%u tries)", ppu_name,
 			(utils::ps4::governor::detail::now_us() - ps4_since_us) / 1000, ps4_tries);
@@ -634,9 +671,17 @@ error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::p
 			// 0.39: the first 4 lines of a name, then every power of two (GT6 retried one name 15,193 times)
 			if (const u32 n = utils::ps4::governor::refusal_line_due(ppu_name))
 			{
-				sys_ppu_thread.error("_sys_ppu_thread_create(): PS4 refused the host thread for \"%s\" (thread resources exhausted, %u tries in %u ms, refusal #%u of this name); returning CELL_EAGAIN to the game",
-					ppu_name, ps4_tries, (utils::ps4::governor::detail::now_us() - ps4_since_us) / 1000, n);
+				// 0.40: what a tester hears or sees when one of the emulator's own codec threads is refused
+				const std::string_view effect = ppu_name == "HLE ATRAC3plus decoder" || ppu_name == "HLE LPCM decoder" ? "; the game's music or movie sound is not decoded"sv
+					: ppu_name == "HLE Video Decoder" || ppu_name == "HLE PAMF demuxer" ? "; the movie does not play and the game may wait for it"sv : ""sv;
+
+				sys_ppu_thread.error("_sys_ppu_thread_create(): PS4 refused the host thread for \"%s\" (thread resources exhausted, %u tries in %u ms, refusal #%u of this name); returning CELL_EAGAIN to the game%s",
+					ppu_name, ps4_tries, (utils::ps4::governor::detail::now_us() - ps4_since_us) / 1000, n, effect);
 			}
+
+			// 0.40: the game sees CELL_EAGAIN; its next boots use the lighter thread budget and the next safe-mode level
+			// (no lock is held here)
+			ps4_note_guest_thread_refused("a guest thread", ppu_name);
 		}
 #endif
 		return CELL_EAGAIN;

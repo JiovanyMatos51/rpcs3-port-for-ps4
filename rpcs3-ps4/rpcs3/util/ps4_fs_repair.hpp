@@ -50,10 +50,13 @@ inline constexpr char probe_name[] = ".rpcs3-write-probe";
 
 // Folders the emulator writes, parents first ("" is /data/rpcs3): probed for real, created 0777 when missing, opened
 // to 0777 when the app owns them (so the user's later FTP uploads into them work). The port has one user, 00000001:
-// its folder holds the user name every game reads and exdata the imported licences.
-inline constexpr std::array<const char*, 23> key_folders{"", "dev_hdd0", "dev_hdd0/game", "dev_hdd0/home", "dev_hdd0/home/00000001",
+// its folder holds the user name every game reads and exdata the imported licences. keys is the player's disc key
+// inbox: made 0777 so FTP uploads land in it, its contents never walked (inbox_folders).
+inline constexpr std::array<const char*, 24> key_folders{"", "dev_hdd0", "dev_hdd0/game", "dev_hdd0/home", "dev_hdd0/home/00000001",
     "dev_hdd0/home/00000001/exdata", "dev_hdd1", "cache", "cache/xmb", "games", "pkgs", "raps", "patches", "cheats", "import", "data",
-    "data/redump", "data/disc-lock", "log", "savestates", "custom_configs", "adapt", "exdata"};
+    "data/redump", "data/disc-lock", "log", "savestates", "custom_configs", "adapt", "exdata", "keys"};
+// The player's own files the app only reads (the disc key inbox): nothing below them is ever sent a SITE CHMOD
+inline constexpr std::array<const char*, 1> inbox_folders{"keys"};
 // A cache folder that stays closed is renamed "<name><blocked_suffix><unix time>" in its parent and made again (never
 // any other folder); such folders are not walked again
 inline constexpr std::string_view blocked_suffix = ".blocked-";
@@ -166,6 +169,15 @@ inline bool in_source_folder(std::string_view rel)
 inline bool is_key_folder(std::string_view rel)
 {
     return std::any_of(key_folders.begin(), key_folders.end(), [&](const char* name) { return rel == name; });
+}
+
+// An entry below an inbox folder ("keys/x"; the folder itself is not)
+inline bool in_inbox(std::string_view rel)
+{
+    const std::size_t slash = rel.find('/');
+    if (slash == std::string_view::npos) return false;
+    const std::string_view top = rel.substr(0, slash);
+    return std::any_of(inbox_folders.begin(), inbox_folders.end(), [&](const char* name) { return top == name; });
 }
 
 // "dev_hdd0/home/<user>/savedata" and the folders below it: a save file uploaded over FTP into an app's save folder is
@@ -833,6 +845,7 @@ private:
                 const std::string path = folder + "/" + child.name;
                 if (!allowed_path(path)) continue;
                 const std::string_view rel = relative(path);
+                if (in_inbox(rel)) continue; // the player's files: only read, never opened or walked
                 if (child.info.type == kind::directory)
                 {
                     m_real.insert(path);

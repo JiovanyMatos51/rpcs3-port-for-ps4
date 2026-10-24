@@ -23,7 +23,7 @@
 #include "util/asm.hpp"
 
 #ifdef RPCS3_PS4
-#include "util/ps4_memory_governor.hpp" // retry_refused_create, refusal_line_due (also declares ps4_startup_checkpoint)
+#include "util/ps4_memory_governor.hpp" // retry_refused_create, refusal_line_due, thread_retry_disabled (also declares ps4_startup_checkpoint)
 #endif
 
 LOG_CHANNEL(sys_spu);
@@ -882,12 +882,14 @@ error_code sys_spu_thread_initialize(ppu_thread& ppu, vm::ptr<u32> thread, u32 g
 	// thread resources, as _sys_ppu_thread_create); nothing in the group has been touched yet.
 	// 0.39: a refused host thread gets a second try after up to 50 ms of waiting for a thread slot to come back (no lock
 	// is held here). Refusal lines are rate limited per name.
+	// 0.40: row thread_retry (opt-in: thread-retry.flag or features.txt); off, CELL_EAGAIN at once, as in 0.38. The
+	// governor reads the row and writes the rule in force to startup.log at the first refusal.
 	bool ps4_refused = false;
 	const u64 ps4_since_us = utils::ps4::governor::detail::now_us();
 	u32 ps4_tries = 1;
 	auto spu_ptr = ps4_try_make_spu_thread(ps4_refused, group.get(), spu_num, thread_name, tid, false, option);
 
-	while (!spu_ptr && ps4_refused &&
+	while (!spu_ptr && ps4_refused && !utils::ps4::governor::detail::thread_retry_disabled() &&
 		utils::ps4::governor::retry_refused_create(ps4_tries, 2, ps4_since_us, [&]() noexcept { return ppu.is_stopped() || Emu.IsStopped(); }))
 	{
 		ps4_tries++;
@@ -911,6 +913,9 @@ error_code sys_spu_thread_initialize(ppu_thread& ppu, vm::ptr<u32> thread, u32 g
 				sys_spu.error("sys_spu_thread_initialize(): PS4 refused the host thread for \"%s\" (thread resources exhausted, %u tries, refusal #%u of this name); returning CELL_EAGAIN to the game",
 					thread_name, ps4_tries, n);
 			}
+
+			// 0.40: the next boots of this title use the lighter thread budget and the next safe-mode level
+			ps4_note_guest_thread_refused("a guest SPU thread", thread_name);
 		}
 		else
 		{
@@ -2627,6 +2632,14 @@ error_code sys_raw_spu_create(ppu_thread& ppu, vm::ptr<u32> id, vm::ptr<void> at
 			sys_spu.error("sys_raw_spu_create(): %s; returning CELL_EAGAIN to the game", ps4_refused ? "PS4 refused the host thread (thread resources exhausted)" : "no free SPU thread ID");
 		}
 
+		if (ps4_refused)
+		{
+			// 0.40: the next boots of this title use the lighter thread budget and the next safe-mode level; the first
+			// note of a session writes a file, so not under limits.mutex (everything it guards is given back above)
+			lock.unlock();
+			ps4_note_guest_thread_refused("a guest SPU thread", "RawSPU");
+		}
+
 		return CELL_EAGAIN;
 	}
 #else
@@ -2709,6 +2722,13 @@ error_code sys_isolated_spu_create(ppu_thread& ppu, vm::ptr<u32> id, vm::ptr<voi
 		if (!ps4_refused || utils::ps4::governor::refusal_line_due("IsolatedSPU"))
 		{
 			sys_spu.error("sys_isolated_spu_create(): %s; returning CELL_EAGAIN to the game", ps4_refused ? "PS4 refused the host thread (thread resources exhausted)" : "no free SPU thread ID");
+		}
+
+		if (ps4_refused)
+		{
+			// 0.40: as sys_raw_spu_create (outside limits.mutex)
+			lock.unlock();
+			ps4_note_guest_thread_refused("a guest SPU thread", "IsolatedSPU");
 		}
 
 		return CELL_EAGAIN;
